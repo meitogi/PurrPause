@@ -1,0 +1,98 @@
+[package]
+name = "purrpause"
+version = "0.9.1"
+edition = "2021"
+license = "MIT"
+description = "Break-reminder overlay for Windows — camouflaged Windows Session Health Service"
+publish = false
+
+[[bin]]
+name = "SystemHealthAgent"
+path = "src/main.rs"
+
+# Cross-platform deps — needed for the argv classifier + shared logic.
+[dependencies]
+anyhow = "1.0.103"
+tracing = "0.1.44"
+tracing-appender = "0.2.5"
+tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
+serde = { version = "1.0.228", features = ["derive"] }
+toml = "1.1.2"
+argon2 = "0.5.3"                   # Passcode hashing (pure Rust, no ring)
+rand = "0.9.5"                     # General-purpose RNG (tests, animation rotation)
+# argon2 0.5.3 pulls rand_core 0.6 via password-hash, but the transitive
+# feature set omits `getrandom` — force it here so `OsRng` is reachable
+# for salt generation.
+rand_core_06 = { package = "rand_core", version = "0.6", features = ["getrandom"] }
+base64 = "0.22.1"                  # Embed default Lottie as data URL
+# Filesystem watcher for hot-reload of state.dat. Confusing name : this is
+# NOT the OS toast notifications — it's inotify/FSEvents/ReadDirectoryChangesW.
+notify = "8.2.0"
+# JSON parsing for the Lottie sanitizer. `.lottie` = ZIP { manifest.json,
+# animations/*.json } and we mutate the animation JSON (strip full-canvas
+# white solid layers) before re-zipping.
+serde_json = "1.0.128"
+# ZIP read+write for the Lottie sanitizer. `deflate-flate2` picks the
+# pure-Rust miniz_oxide backend — cross-compiles cleanly under xwin and
+# keeps binary size in check. `.lottie` files use standard DEFLATE.
+zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2"] }
+# PNG decoder for the config UI's cat icon + bottom-right watermark. Only
+# PNG is needed (`png` feature) — skip jpeg/webp/gif to keep binary size
+# down.
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+
+# Windows-only deps — the actual UI + service layer. Gated so `cargo check`
+# on Linux doesn't pull GTK/WebKit through wry/eframe.
+[target.'cfg(windows)'.dependencies]
+tao = "0.35.3"
+wry = "0.55.1"
+egui = "0.35.0"
+eframe = { version = "0.35.0", default-features = false, features = ["default_fonts", "wgpu"] }
+raw-window-handle = "0.6"                # Extract HWND from eframe::Frame (countdown widget styling)
+windows-service = "0.8.1"
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Dwm",                # DwmSetWindowAttribute (disable NC shadow around transparent widget)
+    "Win32_Graphics_Gdi",                # MonitorFromPoint + MONITORINFO (countdown widget positioning)
+    "Win32_UI_HiDpi",                    # GetDpiForMonitor (DPI-aware widget positioning)
+    "Win32_Security",
+    "Win32_Security_Authorization",      # ConvertStringSecurityDescriptor, SetNamedSecurityInfoW
+    "Win32_Security_Cryptography",       # DPAPI CryptProtectData / CryptUnprotectData
+    "Win32_System_Com",                  # CoInitializeEx / CoCreateInstance
+    "Win32_System_Diagnostics_ToolHelp", # CreateToolhelp32Snapshot + PROCESSENTRY32W (orphan WebView2 sweep)
+    "Win32_System_Environment",          # CreateEnvironmentBlock / DestroyEnvironmentBlock
+    "Win32_System_IO",                   # OVERLAPPED + GetOverlappedResult (pipe accept)
+    "Win32_System_Pipes",                # CreateNamedPipeW + PIPE_* constants
+    "Win32_System_RemoteDesktop",        # WTSQueryUserToken
+    "Win32_System_Services",             # SCM helpers not covered by windows-service
+    "Win32_System_Registry",             # Runtime service ImagePath queries
+    "Win32_System_Time",                 # FileTimeToSystemTime + SystemTimeToTzSpecificLocalTime (Config UI anchor label)
+    "Win32_System_TaskScheduler",        # ITaskService COM watchdog registration
+    "Win32_System_Threading",            # CreateProcessAsUser
+    "Win32_System_Variant",              # VARIANT (Task Scheduler COM args)
+    "Win32_Storage_FileSystem",          # SetFileAttributesW
+    "Win32_UI_Input_KeyboardAndMouse",   # GetAsyncKeyState, VK_* constants
+    "Win32_UI_Shell",                    # ShellExecuteW
+    "Win32_UI_WindowsAndMessaging",      # SetWindowsHookEx, MessageBoxW
+] }
+webview2-com = "0.39.1"                  # WebView2 runtime detection
+# Native file picker for the config UI Animations tab. default-features=false
+# skips Linux-only backends (xdg-portal, wayland) and keeps the Win32
+# IFileDialog path.
+rfd = { version = "0.17.2", default-features = false }
+
+[dev-dependencies]
+# Scratch temp dirs for migration + tree-walk tests (Linux-runnable).
+tempfile = "3"
+# Walk src/ at test time for the em-dash guard test in tracing_lint.rs.
+walkdir = "2"
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"
+
+[profile.dev]
+opt-level = 0

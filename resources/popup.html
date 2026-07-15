@@ -1,0 +1,491 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>{{ WINDOW_TITLE }}</title>
+  <!--
+    ============================================================================
+    PurrPause popup — fullscreen transparent break reminder
+    ============================================================================
+
+    Placeholders (filled by Rust before loading in wry):
+      {{ WINDOW_TITLE }}      — <title> tag (leaks via Task Manager / a11y)
+      {{ POPUP_TITLE }}       — h1 text
+      {{ POPUP_SUBTITLE }}    — subtitle text
+      {{ DISMISS_LABEL }}     — dismiss button label
+      {{ COUNTDOWN_TEMPLATE }} — countdown format string (placeholders {mm},{ss})
+      {{ ANIMATION_PATH }}    — Lottie file path (relative) or data: URL
+      {{ COUNTDOWN_SECONDS }} — initial value for data-remaining-seconds
+      {{ POPUP_MODE }}        — "preview" or "live" (runtime flag, not user-visible)
+
+    Runtime contract:
+      - body.dataset.remainingSeconds is the source of truth for the countdown.
+      - body.dataset.countdownTemplate is the format string (JS substitutes
+        {mm} + {ss} with two-digit values). Fallback is "{mm}:{ss}".
+      - Rust may set them initially via {{ COUNTDOWN_SECONDS }} / {{ COUNTDOWN_TEMPLATE }}
+        and/or update them live via wry.evaluate_script(...).
+      - JS ticks every second, decrements the attribute, updates #countdown text.
+      - At 0: #dismiss.disabled = false, .pulse class added.
+      - Click #dismiss → window.ipc?.postMessage('dismiss') ?? console.log('dismiss').
+
+    Preview mode (browser, no Rust):
+      Append ?preview=1 to the URL. Optional flags:
+        &countdown=N     — override initial countdown seconds (default 300)
+        &bg=dim|blur     — pick backdrop variant (default dim)
+        &anim=N          — index into the hardcoded PREVIEW_ANIMS list (0-based)
+        &scale=N         — override the current anim's default --stage-scale
+        &offsety=N       — override the current anim's default --stage-offset-y (in vh)
+        &bake=multiply   — CSS mix-blend hack for Lotties with baked-in white bg
+      In-preview keyboard:
+        N          — cycle to the next animation (re-applies per-anim scale/offset)
+        + / -      — bump --stage-scale by ±0.1
+        Up / Down  — bump --stage-offset-y by ∓1vh (Up = raise cat)
+
+    Vendored deps (all local, no CDN at runtime):
+      - vendor/dotlottie-wc/index.js  — @lottiefiles/dotlottie-wc web
+        component. Registers <dotlottie-wc> and exposes setWasmUrl().
+      - vendor/dotlottie-wc/*.js      — code-split chunks the module
+        pulls in relative-imports (base-*, dist-*, dotlottie-*).
+      - vendor/dotlottie-wc/dotlottie-player.wasm — the renderer core
+        (software renderer, ~1.8MB, from @lottiefiles/dotlottie-web).
+        Pointed at via setWasmUrl() so no CDN fetch ever happens.
+  -->
+  <style>
+    :root {
+      --text: #ffffff;
+      --text-shadow: 0 2px 8px rgba(0, 0, 0, 0.6);
+      --accent: #ffb74d;
+      --accent-hover: #ffca6b;
+      --disabled: rgba(255, 255, 255, 0.35);
+      --muted: rgba(255, 255, 255, 0.85);
+      /* Per-anim in prod : Rust substitutes {{ STAGE_SCALE }} +
+         {{ STAGE_OFFSET_Y_VH }} at render time from the matching
+         AnimationEntry (or 1.0 / 0 defaults when no entry exists).
+         In preview, defaults live in PREVIEW_ANIMS and can be tuned
+         live via ?scale=N&offsety=N URL knobs or +/- and Arrow Up/Down. */
+      --stage-scale: {{ STAGE_SCALE }};
+      --stage-offset-y: {{ STAGE_OFFSET_Y_VH }}vh;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body {
+      width: 100vw;
+      height: 100vh;
+      overflow: hidden;
+      background: transparent;
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    /* Backdrop variants — one applied via body.classList (preview shim / Rust). */
+    body.backdrop-dim::before {
+      content: "";
+      position: fixed; inset: 0;
+      background: rgba(0, 0, 0, 0.15);
+      pointer-events: none;
+      z-index: 0;
+    }
+    body.backdrop-blur::before {
+      content: "";
+      position: fixed; inset: 0;
+      backdrop-filter: blur(4px);
+      -webkit-backdrop-filter: blur(4px);
+      pointer-events: none;
+      z-index: 0;
+    }
+
+    /* Cat fills the entire viewport as a background layer.
+       Native aspect ratio preserved via dotlottie-wc's default fit=contain.
+       Text sits on top as a floating overlay. */
+    .stage {
+      position: fixed;
+      inset: 0;
+      width: 100vw;
+      height: 100vh;
+      z-index: 1;
+      pointer-events: none;
+      /* Zoom + vertical offset the raw Lottie canvas. Applied bottom-up:
+         scale first, then translate (offset is in un-scaled viewport units).
+         Lets each anim declare its own framing (some cats sit lower in the
+         canvas than others, some need more scale). */
+      transform: translateY(var(--stage-offset-y)) scale(var(--stage-scale));
+      transform-origin: center;
+    }
+    /* Preview-only escape hatch for Lotties shipped with a baked-in white bg
+       (e.g. Cat is sleeping and rolling). Adds ?bake=multiply to activate.
+       In prod, don't ship this — pick source files with a transparent bg. */
+    body.bake-multiply .stage { mix-blend-mode: multiply; }
+
+    /* Bouncing text block — DVD-screensaver style, slow, translucent bg for readability.
+       Positioned at (0,0) and moved via transform:translate() by the JS bounce loop. */
+    .bouncer {
+      position: fixed;
+      top: 0; left: 0;
+      z-index: 2;
+      max-width: min(58vw, 1400px);
+      padding: 2.8vh 3.4vw;
+      background: rgba(0, 0, 0, 0.55);
+      backdrop-filter: blur(10px) saturate(120%);
+      -webkit-backdrop-filter: blur(10px) saturate(120%);
+      border-radius: clamp(18px, 1.5vmin, 32px);
+      text-align: center;
+      display: flex;
+      flex-direction: column;
+      gap: 0.9em;
+      pointer-events: none;
+      will-change: transform;
+    }
+
+    h1#title {
+      font-size: clamp(1.8rem, 3.2vw, 5.5rem);
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      text-align: center;
+      line-height: 1.15;
+    }
+
+    .subtitle {
+      font-size: clamp(1.05rem, 1.5vw, 2.4rem);
+      font-weight: 400;
+      color: var(--muted);
+      text-align: center;
+      line-height: 1.35;
+    }
+
+    .countdown {
+      font-size: clamp(1.5rem, 2.3vw, 3.5rem);
+      font-weight: 500;
+      font-variant-numeric: tabular-nums;
+      letter-spacing: 0.05em;
+      color: var(--muted);
+      min-height: 1.2em; /* Reserve line height so the block size doesn't jump when 0 → hidden. */
+    }
+
+    button#dismiss {
+      position: fixed;
+      bottom: 6vh;
+      left: 50%;
+      transform: translateX(-50%);
+      z-index: 4; /* above bouncer + stage */
+      font-family: inherit;
+      font-size: clamp(1.15rem, 1.6vw, 1.5rem);
+      font-weight: 700;
+      padding: 1.1em 2.8em;
+      border-radius: 999px;
+      border: 3px solid rgba(255, 255, 255, 0.75);
+      background: rgba(20, 20, 30, 0.65);
+      color: rgba(255, 255, 255, 0.95);
+      cursor: not-allowed;
+      backdrop-filter: blur(6px);
+      -webkit-backdrop-filter: blur(6px);
+      box-shadow: 0 6px 20px rgba(0, 0, 0, 0.45);
+      transition: background 0.2s, color 0.2s, border-color 0.2s, box-shadow 0.2s;
+    }
+    button#dismiss:not(:disabled) {
+      border-color: var(--accent);
+      color: #1a1a1a;
+      background: var(--accent);
+      box-shadow: 0 8px 26px rgba(0, 0, 0, 0.55);
+      cursor: pointer;
+    }
+    button#dismiss:not(:disabled):hover { background: var(--accent-hover); }
+    button#dismiss.pulse { animation: pulse 1.6s ease-in-out infinite; }
+    @keyframes pulse {
+      0%, 100% { box-shadow: 0 0 0 0 rgba(255, 183, 77, 0.55); }
+      50%      { box-shadow: 0 0 0 14px rgba(255, 183, 77, 0); }
+    }
+
+    /* Preview-only: animation switcher pill (hidden in prod, injected by shim). */
+    .preview-switcher {
+      position: fixed;
+      top: 12px; right: 12px;
+      z-index: 999;
+      background: rgba(0, 0, 0, 0.7);
+      color: #fff;
+      font: 12px/1.4 ui-monospace, "SF Mono", Menlo, monospace;
+      padding: 6px 10px;
+      border-radius: 6px;
+      cursor: pointer;
+      pointer-events: auto;
+      user-select: none;
+      max-width: 40vw;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .preview-switcher .hint { opacity: 0.55; margin-left: 6px; }
+
+    @media (orientation: portrait), (max-width: 900px) {
+      .bouncer { max-width: 80vw; padding: 1.5vh 2vw; }
+      h1#title { font-size: clamp(1.2rem, 4vw, 1.8rem); }
+    }
+  </style>
+</head>
+<body data-remaining-seconds="{{ COUNTDOWN_SECONDS }}"
+      data-animation-path="{{ ANIMATION_PATH }}"
+      data-countdown-template="{{ COUNTDOWN_TEMPLATE }}"
+      data-mode="{{ POPUP_MODE }}">
+  <!-- <dotlottie-wc> is mounted by JS in the module script below, AFTER
+       setWasmUrl() has pinned the vendored WASM URL. Putting the element
+       in the initial HTML races the constructor's _initWasm() against
+       setWasmUrl(), which fetches from cdn.jsdelivr / unpkg — flaky in
+       Chrome preview and always broken in the WebView2 no-internet sandbox. -->
+  <div class="bouncer" id="bouncer">
+    <h1 id="title">{{ POPUP_TITLE }}</h1>
+    <p class="subtitle" id="subtitle">{{ POPUP_SUBTITLE }}</p>
+    <p class="countdown" id="countdown"></p>
+  </div>
+  <button id="dismiss" disabled>{{ DISMISS_LABEL }}</button>
+
+  <!-- Preview shim: swaps {{ NAME }} placeholders with defaults when ?preview=1 is set. -->
+  <script>
+    (function () {
+      const params = new URLSearchParams(location.search);
+      if (!params.has('preview')) return;
+
+      // Hardcoded list — update when adding a new file to resources/animations/.
+      // Each entry: { file, scale, offsetY } — offsetY in vh (negative = raise cat).
+      // In prod, Rust will populate these from the config's AnimationEntry (session 6).
+      const PREVIEW_ANIMS = [
+        { file: 'dance-cat.lottie',         scale: 1.5, offsetY: 0 },
+        { file: 'cat-sleeping-no-bg.lottie', scale: 2.6, offsetY: -11 },
+      ];
+      const rawIdx = parseInt(params.get('anim') || '0', 10);
+      let currentAnim = ((rawIdx % PREVIEW_ANIMS.length) + PREVIEW_ANIMS.length) % PREVIEW_ANIMS.length;
+      const animPath = i => 'animations/' + encodeURIComponent(PREVIEW_ANIMS[i].file);
+      const applyAnimConfig = i => {
+        const a = PREVIEW_ANIMS[i];
+        document.documentElement.style.setProperty('--stage-scale', String(a.scale));
+        document.documentElement.style.setProperty('--stage-offset-y', a.offsetY + 'vh');
+      };
+      applyAnimConfig(currentAnim);
+
+      const defaults = {
+        WINDOW_TITLE: "Windows Session Health",
+        POPUP_TITLE: "C'est l'heure de la pause !",
+        POPUP_SUBTITLE: "Prends 5 minutes pour t'étirer, boire, regarder au loin.",
+        DISMISS_LABEL: "J'ai fait ma pause",
+        COUNTDOWN_TEMPLATE: "Pause dans {mm}:{ss}",
+        ANIMATION_PATH: animPath(currentAnim),
+        COUNTDOWN_SECONDS: params.get('countdown') || '300',
+        POPUP_MODE: 'live',
+      };
+      // (--stage-scale and --stage-offset-y were set above by applyAnimConfig
+      // and may be overridden below by URL params.)
+      const RE = /\{\{\s*([A-Z_]+)\s*\}\}/g;
+      const swap = s => s.replace(RE, (_, k) => defaults[k] ?? '');
+      const walker = document.createTreeWalker(
+        document.body,
+        NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT,
+      );
+      let n;
+      while ((n = walker.nextNode())) {
+        if (n.nodeType === Node.TEXT_NODE) n.nodeValue = swap(n.nodeValue);
+        else for (const a of n.attributes) a.value = swap(a.value);
+      }
+      for (const a of document.body.attributes) a.value = swap(a.value);
+      document.body.classList.add('backdrop-' + (params.get('bg') || 'dim'));
+
+      // Optional URL knobs (override the anim's per-file defaults on first load).
+      if (params.has('scale')) {
+        const s = parseFloat(params.get('scale'));
+        if (isFinite(s) && s > 0) document.documentElement.style.setProperty('--stage-scale', String(s));
+      }
+      if (params.has('offsety')) {
+        const o = parseFloat(params.get('offsety'));
+        if (isFinite(o)) document.documentElement.style.setProperty('--stage-offset-y', o + 'vh');
+      }
+      if (params.get('bake') === 'multiply') document.body.classList.add('bake-multiply');
+      const bs = params.get('bouncespeed');
+      if (bs) document.body.dataset.bounceSpeed = bs;
+      if (params.get('bounce') === '0') document.body.dataset.bounce = 'off';
+
+      // Live keyboard tuning (preview only).
+      //   +/-           : bump --stage-scale by ±0.1 (0.2 .. 5.0)
+      //   Arrow Up/Down : bump --stage-offset-y by ∓1vh (Up raises the cat)
+      // Dispatches a 'purrpause:tune' event so the switcher pill can re-render.
+      const emitTune = () => document.dispatchEvent(new CustomEvent('purrpause:tune'));
+      document.addEventListener('keydown', e => {
+        if (e.metaKey || e.ctrlKey || e.altKey) return;
+        const root = document.documentElement;
+        const style = getComputedStyle(root);
+        if (e.key === '+' || e.key === '=' || e.key === '-') {
+          const cur = parseFloat(style.getPropertyValue('--stage-scale')) || 1;
+          const next = Math.max(0.2, Math.min(5, cur + (e.key === '-' ? -0.1 : 0.1)));
+          root.style.setProperty('--stage-scale', next.toFixed(2));
+          emitTune();
+        } else if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
+          e.preventDefault();
+          const cur = parseFloat(style.getPropertyValue('--stage-offset-y')) || 0;
+          const next = Math.max(-50, Math.min(50, cur + (e.key === 'ArrowUp' ? -1 : 1)));
+          root.style.setProperty('--stage-offset-y', next + 'vh');
+          emitTune();
+        }
+      });
+
+      // Animation switcher pill (click or press N to cycle).
+      if (PREVIEW_ANIMS.length > 1) {
+        const sw = document.createElement('div');
+        sw.className = 'preview-switcher';
+        const render = () => {
+          const a = PREVIEW_ANIMS[currentAnim];
+          const style = getComputedStyle(document.documentElement);
+          const curScale = parseFloat(style.getPropertyValue('--stage-scale')).toFixed(2);
+          const curOff = parseFloat(style.getPropertyValue('--stage-offset-y')).toFixed(0);
+          sw.innerHTML = `[${currentAnim + 1}/${PREVIEW_ANIMS.length}] ${a.file}<span class="hint">· scale ${curScale} · offY ${curOff}vh · N/±/↑↓</span>`;
+        };
+        render();
+        document.addEventListener('purrpause:tune', render);
+        const cycle = () => {
+          currentAnim = (currentAnim + 1) % PREVIEW_ANIMS.length;
+          // Also keep body.dataset in sync so a browser reload picks up the current pick.
+          document.body.dataset.animationPath = animPath(currentAnim);
+          const el = document.getElementById('anim');
+          if (el) el.setAttribute('src', animPath(currentAnim));
+          applyAnimConfig(currentAnim);
+          render();
+        };
+        sw.addEventListener('click', cycle);
+        document.addEventListener('keydown', e => {
+          if (e.key.toLowerCase() === 'n' && !e.metaKey && !e.ctrlKey) cycle();
+        });
+        document.body.appendChild(sw);
+      }
+    })();
+  </script>
+
+  <!-- Countdown + dismiss wiring (works in both preview and prod). -->
+  <script>
+    (function () {
+      const dismiss = document.getElementById('dismiss');
+      const cdEl = document.getElementById('countdown');
+      // Format string is user-configurable via body.dataset.countdownTemplate
+      // (set from Config::countdown_template by Rust). Placeholders {mm} + {ss}
+      // are two-digit-zero-padded. Fallback matches the classical MM:SS shape.
+      const fmt = s => {
+        const m = Math.floor(s / 60).toString().padStart(2, '0');
+        const r = (s % 60).toString().padStart(2, '0');
+        const tpl = document.body.dataset.countdownTemplate || '{mm}:{ss}';
+        return tpl.replace(/\{mm\}/g, m).replace(/\{ss\}/g, r);
+      };
+      const render = () => {
+        const s = parseInt(document.body.dataset.remainingSeconds || '0', 10);
+        cdEl.textContent = s > 0 ? fmt(s) : '';
+        if (s <= 0) {
+          dismiss.disabled = false;
+          dismiss.classList.add('pulse');
+        }
+      };
+      // Preview mode unlocks dismiss immediately so a parent testing the
+      // popup from the config UI can close it without waiting the full
+      // countdown. Countdown text still ticks visibly.
+      if (document.body.dataset.mode === 'preview') {
+        dismiss.disabled = false;
+        dismiss.classList.add('pulse');
+      }
+      render();
+      setInterval(() => {
+        const s = parseInt(document.body.dataset.remainingSeconds || '0', 10);
+        if (s > 0) document.body.dataset.remainingSeconds = String(s - 1);
+        render();
+      }, 1000);
+      dismiss.addEventListener('click', () => {
+        if (window.ipc && typeof window.ipc.postMessage === 'function') {
+          window.ipc.postMessage('dismiss');
+        } else {
+          console.log('dismiss');
+        }
+      });
+    })();
+  </script>
+
+  <!--
+    Bouncing text block — DVD-screensaver style. Diagonal traversal,
+    reflects off viewport edges. Runs unconditionally (both preview + prod);
+    Rust can disable by setting document.body.dataset.bounce = "off".
+    Speed is tunable via body.dataset.bounceSpeed (px/s, default 150).
+  -->
+  <script>
+    (function () {
+      if (document.body.dataset.bounce === 'off') return;
+      const el = document.getElementById('bouncer');
+      const speedAttr = parseFloat(document.body.dataset.bounceSpeed || '150');
+      const SPEED = isFinite(speedAttr) && speedAttr > 0 ? speedAttr : 150;
+
+      let x = 0, y = 0, vx = 0, vy = 0, w = 0, h = 0;
+      const measure = () => {
+        w = el.offsetWidth;
+        h = el.offsetHeight;
+        // Clamp position inside new bounds after a resize.
+        x = Math.max(0, Math.min(x, window.innerWidth - w));
+        y = Math.max(0, Math.min(y, window.innerHeight - h));
+      };
+      const init = () => {
+        measure();
+        x = Math.random() * Math.max(1, window.innerWidth - w);
+        y = Math.random() * Math.max(1, window.innerHeight - h);
+        const angle = (Math.random() * 0.5 + 0.25) * Math.PI; // avoid pure axis moves
+        const flip = () => (Math.random() < 0.5 ? -1 : 1);
+        vx = Math.cos(angle) * SPEED * flip();
+        vy = Math.sin(angle) * SPEED * flip();
+      };
+
+      let lastT = performance.now();
+      const tick = t => {
+        const dt = Math.min(0.05, (t - lastT) / 1000); // clamp when tab was backgrounded
+        lastT = t;
+        x += vx * dt;
+        y += vy * dt;
+        const maxX = window.innerWidth - w;
+        const maxY = window.innerHeight - h;
+        if (x <= 0)    { x = 0;    vx = Math.abs(vx); }
+        if (x >= maxX) { x = maxX; vx = -Math.abs(vx); }
+        if (y <= 0)    { y = 0;    vy = Math.abs(vy); }
+        if (y >= maxY) { y = maxY; vy = -Math.abs(vy); }
+        el.style.transform = `translate(${x}px, ${y}px)`;
+        requestAnimationFrame(tick);
+      };
+
+      // Wait for layout so offsetWidth/Height are real, then start.
+      requestAnimationFrame(() => {
+        init();
+        lastT = performance.now();
+        requestAnimationFrame(tick);
+      });
+      window.addEventListener('resize', measure);
+    })();
+  </script>
+
+  <!--
+    dotlottie-wc web component + local WASM (fully vendored — no CDN fetch).
+
+    Order matters: setWasmUrl() must run BEFORE any <dotlottie-wc> constructor.
+    If the element is in the initial HTML, custom-element registration (triggered
+    by the module import) upgrades it synchronously, its constructor calls
+    _initWasm() with the default CDN URL, and setWasmUrl() runs too late.
+    Fix: mount the element from JS AFTER setWasmUrl().
+  -->
+  <script type="module">
+    const { setWasmUrl } = await import('./vendor/dotlottie-wc/index.js');
+    setWasmUrl(new URL('./vendor/dotlottie-wc/dotlottie-player.wasm', location.href).href);
+
+    const el = document.createElement('dotlottie-wc');
+    el.id = 'anim';
+    el.className = 'stage';
+    // Force devicePixelRatio: 1 so the WASM software renderer paints ~4× fewer
+    // pixels per frame on Retina displays. Lottie is vector, CSS upscale stays
+    // crisp — big perf win at large --stage-scale values.
+    el.setAttribute('renderconfig', JSON.stringify({ devicePixelRatio: 1 }));
+    el.setAttribute('src', document.body.dataset.animationPath || '');
+    el.setAttribute('autoplay', '');
+    el.setAttribute('loop', '');
+    // Surface load/error events so a silent WASM or fetch failure is visible.
+    el.addEventListener('ready', () => console.info('[dotlottie] ready'));
+    el.addEventListener('load', () => console.info('[dotlottie] loaded:', el.getAttribute('src')));
+    el.addEventListener('loadError', e => console.error('[dotlottie] load error:', e.detail || e));
+    // Prepend so it stays below the bouncer/dismiss by DOM order too (z-index also handles this).
+    document.body.prepend(el);
+  </script>
+</body>
+</html>
