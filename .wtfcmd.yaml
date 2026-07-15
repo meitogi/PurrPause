@@ -1,0 +1,30 @@
+# Task runner for PurrPause. Invoke from apps/purrpause/ (or any child dir) :
+#   wtf c                # all targets (default)
+#   wtf compile winarm   # aarch64 Windows only
+#   wtf c winx64         # x64 Windows only
+# Future targets : macarm, macx64.
+#
+# The wrapped `cargo run --bin pack --release [-- --aarch64|--x64]` produces
+# SystemHealthAgent-<version>-<arch>.zip in target/dist/ with the version
+# read from Cargo.toml.
+
+- name: [compile, c]
+  desc: |
+    Cross-compile release binaries + pack into shipping zips.
+    Default : all targets. Pass a specific target name to build only that one.
+    Valid targets : all, winarm, winx64. Future : macarm, macx64.
+  args:
+    - name: target
+      desc: |
+        Target to build. Valid : all, winarm, winx64.
+        Future : macarm, macx64.
+      default: all
+      test: ^(all|winarm|winx64)$
+  cmd: |
+    {{- if eq .target "all" -}}
+    cargo run --bin pack --release
+    {{- else if eq .target "winarm" -}}
+    cargo run --bin pack --release -- --aarch64
+    {{- else if eq .target "winx64" -}}
+    cargo run --bin pack --release -- --x64
+    {{- end }}
