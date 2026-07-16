@@ -1,3 +1,8 @@
+// On non-Windows targets the only callers of this kernel are behind
+// `#[cfg(windows)]` (service.rs, tabs.rs), so the whole public surface
+// looks dead to the compiler outside of `mod tests`. Silence on Linux dev.
+#![cfg_attr(not(windows), allow(dead_code))]
+
 // Pure scheduling logic — decides whether the service should fire a
 // popup, a countdown palier, or do nothing, given the current wall-clock
 // time and the last popup timestamp.
@@ -28,6 +33,13 @@ const DEFAULT_INTERVAL_HOURS: f32 = 2.0;
 /// killing the service.
 pub const COLD_START_GRACE: Duration = Duration::from_secs(60);
 
+/// Rule B window : a `popup_pending == true` runtime.dat coming out of
+/// `downtime < RESUME_WINDOW` triggers an immediate popup relaunch on
+/// boot. Beyond this the popup mid-fire is considered stale — Rule C
+/// resumes the cycle without relaunching, or Rule A resets it entirely
+/// depending on total elapsed.
+pub const RESUME_WINDOW: Duration = Duration::from_secs(30 * 60);
+
 /// Fresh-install grace window: `runtime.dat` missing AND
 /// `first_install_at` within this many seconds of now = "user just
 /// installed, respect the full interval, don't shorten to 60 s."
@@ -39,22 +51,31 @@ pub const FRESH_INSTALL_GRACE: Duration = Duration::from_secs(300);
 /// firing instantly on Save.
 pub const RELOAD_MIN_GRACE: Duration = Duration::from_secs(120);
 
-/// Inputs for [`resolve_last_popup`] - the decision that answers "what
-/// value should `last_popup` hold right now given cold-start context /
-/// reload / fresh-install detection".
+/// Inputs shared by [`resolve_last_popup`] (reload + fresh-install) and
+/// [`resolve_cold_start`] (cold-boot A/B/C).
 ///
 /// - `now` : wall clock at the decision moment.
 /// - `last_popup` : `None` when `runtime.dat` is missing, `Some(t)`
 ///   otherwise.
 /// - `first_install_at` : from `Config::first_install_at()`. Sentinel
 ///   `UNIX_EPOCH` means "unknown / migrated 0.6.x install."
-/// - `is_reload` : `true` only on IPC `Reload`. Switches the branch
-///   from cold-start decisions to the reduce-interval clamp.
+/// - `is_reload` : `true` only on IPC `Reload`. Switches
+///   [`resolve_last_popup`] to the reduce-interval clamp branch.
+/// - `paused_secs` : cumulative "not-active" seconds already banked
+///   into the current cycle (persisted).
+/// - `popup_pending` : a popup was mid-fire when the service last
+///   heartbeat'd. Rule B relaunches it if downtime is short enough.
+/// - `last_heartbeat` : the last tick's `SystemTime::now()`, persisted
+///   every ~30 s. `now - last_heartbeat` approximates cross-reboot
+///   downtime for step 0 of the cold-start rules.
 pub struct ResolveInputs {
     pub now: SystemTime,
     pub last_popup: Option<SystemTime>,
     pub first_install_at: SystemTime,
     pub is_reload: bool,
+    pub paused_secs: u64,
+    pub popup_pending: bool,
+    pub last_heartbeat: SystemTime,
 }
 
 /// Decide what `last_popup` should hold given cold-start / reload /
@@ -79,6 +100,11 @@ pub fn resolve_last_popup(inputs: ResolveInputs, config: &Config) -> SystemTime 
         last_popup,
         first_install_at,
         is_reload,
+        // Cold-start-only fields — the reload / fresh-install / legacy
+        // branches don't touch active-time counters.
+        paused_secs: _,
+        popup_pending: _,
+        last_heartbeat: _,
     } = inputs;
     let interval = interval(config);
 
@@ -128,6 +154,93 @@ pub fn resolve_last_popup(inputs: ResolveInputs, config: &Config) -> SystemTime 
         return now;
     }
     lp
+}
+
+/// Outcome of [`resolve_cold_start`] — everything the service tick loop
+/// needs to seed its in-memory state and decide whether to immediately
+/// respawn a popup that was mid-fire when the machine went down.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColdStartDecision {
+    pub last_popup: SystemTime,
+    pub paused_secs: u64,
+    pub popup_pending: bool,
+    pub relaunch_now: bool,
+}
+
+/// Cold-boot A / B / C rules for the active-time cycle. Pure ; no I/O.
+///
+/// Preconditions : `inputs.last_popup.is_some()` — the caller must have
+/// read a valid `runtime.dat`. On a missing / corrupt file the caller
+/// keeps using [`resolve_last_popup`] with `last_popup: None` for the
+/// fresh-install / legacy-shift branch.
+///
+/// Sequence :
+/// 1. **Step 0 (always)** — add `downtime = now - last_heartbeat` into
+///    `paused_secs`. Clock skew (`now < last_heartbeat`) is treated as
+///    zero downtime, never negative.
+/// 2. **Rule A** — `elapsed = now - last_popup >= 2 * interval`.
+///    Full reset : `last_popup = now`, `paused_secs = 0`,
+///    `popup_pending = false`, no relaunch even if one was pending.
+/// 3. **Rule B** — else if `popup_pending && downtime < RESUME_WINDOW`.
+///    Keep `last_popup`, carry the step-0 `paused_secs`, keep the
+///    pending flag, and set `relaunch_now = true` so the tick loop
+///    respawns the popup immediately.
+/// 4. **Rule C** — else. Keep `last_popup`, carry the step-0
+///    `paused_secs`, clear `popup_pending`, no relaunch. The cycle
+///    resumes in active-time exactly where it left off.
+pub fn resolve_cold_start(inputs: ResolveInputs, config: &Config) -> ColdStartDecision {
+    let ResolveInputs {
+        now,
+        last_popup,
+        paused_secs,
+        popup_pending,
+        last_heartbeat,
+        // Reload / fresh-install fields — unused on the cold-start path.
+        first_install_at: _,
+        is_reload: _,
+    } = inputs;
+
+    let last_popup = last_popup.expect(
+        "resolve_cold_start requires runtime.dat present; caller must \
+         route None to resolve_last_popup fresh-install branch",
+    );
+
+    let downtime = now
+        .duration_since(last_heartbeat)
+        .unwrap_or(Duration::ZERO);
+    let paused_after_step0 = paused_secs.saturating_add(downtime.as_secs());
+
+    let elapsed = now.duration_since(last_popup).unwrap_or(Duration::ZERO);
+    let interval = interval(config);
+
+    // Rule A : long-downtime full reset. Boundary is inclusive to match
+    // resolve_last_popup's existing branch-3 semantics.
+    if elapsed >= interval.saturating_mul(2) {
+        return ColdStartDecision {
+            last_popup: now,
+            paused_secs: 0,
+            popup_pending: false,
+            relaunch_now: false,
+        };
+    }
+
+    // Rule B : popup was mid-fire and downtime is short — relaunch.
+    if popup_pending && downtime < RESUME_WINDOW {
+        return ColdStartDecision {
+            last_popup,
+            paused_secs: paused_after_step0,
+            popup_pending: true,
+            relaunch_now: true,
+        };
+    }
+
+    // Rule C : resume cycle, absorb downtime into paused_secs.
+    ColdStartDecision {
+        last_popup,
+        paused_secs: paused_after_step0,
+        popup_pending: false,
+        relaunch_now: false,
+    }
 }
 
 /// Preview helper : given a candidate `proposed_interval` the user is
@@ -181,6 +294,11 @@ pub enum SchedulerDecision {
 /// Central decision : what should happen right now given the tick's
 /// current time, the config, and the recorded last-popup timestamp.
 ///
+/// `paused_secs` shifts the next popup forward by that many seconds,
+/// implementing the active-time cycle : time the user spent idle /
+/// asleep / booted-off is banked here and doesn't count against the
+/// interval.
+///
 /// `fired_paliers` tracks paliers already spawned in the current cycle.
 /// Reset it to empty after a popup fires ; re-derive it via
 /// [`derive_already_fired`] after service restart or config reload.
@@ -188,13 +306,14 @@ pub fn next_event(
     now: SystemTime,
     config: &Config,
     last_popup: SystemTime,
+    paused_secs: u64,
     fired_paliers: &HashSet<u32>,
 ) -> SchedulerDecision {
     if config.disabled {
         return SchedulerDecision::Nothing;
     }
 
-    let next = next_popup_at(last_popup, config);
+    let next = next_popup_at(last_popup, config, paused_secs);
 
     if now >= next {
         return SchedulerDecision::FirePopup;
@@ -232,8 +351,9 @@ pub fn derive_already_fired(
     now: SystemTime,
     config: &Config,
     last_popup: SystemTime,
+    paused_secs: u64,
 ) -> HashSet<u32> {
-    let next = next_popup_at(last_popup, config);
+    let next = next_popup_at(last_popup, config, paused_secs);
     let remaining = match next.duration_since(now) {
         Ok(d) => d,
         Err(_) => return sanitize_paliers(config).into_iter().collect(),
@@ -248,9 +368,15 @@ pub fn derive_already_fired(
         .collect()
 }
 
-/// Compute the next popup time from the last one plus the interval.
-pub fn next_popup_at(last_popup: SystemTime, config: &Config) -> SystemTime {
-    last_popup + interval(config)
+/// Compute the next popup time in active-time semantics : the wall-clock
+/// deadline is `last_popup + interval + paused_secs`, so time already
+/// banked as "not active" pushes the deadline further out.
+pub fn next_popup_at(
+    last_popup: SystemTime,
+    config: &Config,
+    paused_secs: u64,
+) -> SystemTime {
+    last_popup + interval(config) + Duration::from_secs(paused_secs)
 }
 
 /// Interval between popups, clamped to safe bounds. Out-of-range values
@@ -310,7 +436,7 @@ mod tests {
         let last = epoch_plus(0);
         let fired = HashSet::new();
         assert_eq!(
-            next_event(now, &cfg, last, &fired),
+            next_event(now, &cfg, last, 0, &fired),
             SchedulerDecision::Nothing
         );
     }
@@ -323,7 +449,7 @@ mod tests {
         let last = epoch_plus(0);
         let fired = HashSet::new();
         assert_eq!(
-            next_event(now, &cfg, last, &fired),
+            next_event(now, &cfg, last, 0, &fired),
             SchedulerDecision::Nothing
         );
     }
@@ -336,7 +462,7 @@ mod tests {
         let last = epoch_plus(0);
         let fired = HashSet::new();
         assert_eq!(
-            next_event(now, &cfg, last, &fired),
+            next_event(now, &cfg, last, 0, &fired),
             SchedulerDecision::FirePopup
         );
     }
@@ -348,7 +474,7 @@ mod tests {
         let last = epoch_plus(0);
         let fired = HashSet::new();
         assert_eq!(
-            next_event(now, &cfg, last, &fired),
+            next_event(now, &cfg, last, 0, &fired),
             SchedulerDecision::FirePopup
         );
     }
@@ -361,7 +487,7 @@ mod tests {
         let next_popup = 2 * 3600;
         let now = epoch_plus(next_popup - 15 * 60);
         let fired = HashSet::new();
-        match next_event(now, &cfg, last, &fired) {
+        match next_event(now, &cfg, last, 0, &fired) {
             SchedulerDecision::FireCountdown {
                 palier_minutes,
                 seconds_until_popup,
@@ -382,7 +508,7 @@ mod tests {
         let mut fired = HashSet::new();
         fired.insert(15);
         assert_eq!(
-            next_event(now, &cfg, last, &fired),
+            next_event(now, &cfg, last, 0, &fired),
             SchedulerDecision::Nothing
         );
     }
@@ -397,7 +523,7 @@ mod tests {
         let next_popup = 2 * 3600;
         let now = epoch_plus(next_popup - 9 * 60);
         let fired = HashSet::new();
-        match next_event(now, &cfg, last, &fired) {
+        match next_event(now, &cfg, last, 0, &fired) {
             SchedulerDecision::FireCountdown { palier_minutes, .. } => {
                 assert_eq!(palier_minutes, 15);
             }
@@ -412,7 +538,7 @@ mod tests {
         let last = epoch_plus(0);
         let now = epoch_plus(2 * 3600 - 15 * 60);
         let fired = HashSet::new();
-        match next_event(now, &cfg, last, &fired) {
+        match next_event(now, &cfg, last, 0, &fired) {
             SchedulerDecision::FireCountdown { palier_minutes, .. } => {
                 assert_eq!(palier_minutes, 15);
             }
@@ -462,7 +588,7 @@ mod tests {
         let cfg = config_with(2.0, vec![15, 10, 5], false);
         let last = epoch_plus(0);
         let now = epoch_plus(2 * 3600 - 8 * 60);
-        let fired = derive_already_fired(now, &cfg, last);
+        let fired = derive_already_fired(now, &cfg, last, 0);
         let expected: HashSet<u32> = vec![15, 10].into_iter().collect();
         assert_eq!(fired, expected);
     }
@@ -473,7 +599,7 @@ mod tests {
         let cfg = config_with(2.0, vec![15, 10, 5], false);
         let last = epoch_plus(0);
         let now = epoch_plus(60);
-        let fired = derive_already_fired(now, &cfg, last);
+        let fired = derive_already_fired(now, &cfg, last, 0);
         assert!(fired.is_empty());
     }
 
@@ -485,7 +611,7 @@ mod tests {
         let cfg = config_with(2.0, vec![20, 15, 10, 5], false);
         let last = epoch_plus(0);
         let now = epoch_plus(2 * 3600 - 4 * 60);
-        let fired = derive_already_fired(now, &cfg, last);
+        let fired = derive_already_fired(now, &cfg, last, 0);
         assert!(fired.contains(&20));
         assert!(fired.contains(&15));
         assert!(fired.contains(&10));
@@ -501,7 +627,7 @@ mod tests {
         let last = now;
         let fired = HashSet::new();
         assert_eq!(
-            next_event(now, &cfg, last, &fired),
+            next_event(now, &cfg, last, 0, &fired),
             SchedulerDecision::Nothing
         );
     }
@@ -521,6 +647,9 @@ mod tests {
                 last_popup: Some(lp),
                 first_install_at: epoch_plus(0),
                 is_reload: true,
+                paused_secs: 0,
+                popup_pending: false,
+                last_heartbeat: SystemTime::UNIX_EPOCH,
             },
             &cfg,
         );
@@ -540,6 +669,9 @@ mod tests {
                 last_popup: Some(lp),
                 first_install_at: epoch_plus(0),
                 is_reload: true,
+                paused_secs: 0,
+                popup_pending: false,
+                last_heartbeat: SystemTime::UNIX_EPOCH,
             },
             &cfg,
         );
@@ -560,6 +692,9 @@ mod tests {
                 last_popup: Some(lp),
                 first_install_at: epoch_plus(0),
                 is_reload: true,
+                paused_secs: 0,
+                popup_pending: false,
+                last_heartbeat: SystemTime::UNIX_EPOCH,
             },
             &cfg,
         );
@@ -578,6 +713,9 @@ mod tests {
                 last_popup: Some(lp),
                 first_install_at: epoch_plus(0),
                 is_reload: true,
+                paused_secs: 0,
+                popup_pending: false,
+                last_heartbeat: SystemTime::UNIX_EPOCH,
             },
             &cfg,
         );
@@ -596,6 +734,9 @@ mod tests {
                 last_popup: None,
                 first_install_at: first,
                 is_reload: false,
+                paused_secs: 0,
+                popup_pending: false,
+                last_heartbeat: SystemTime::UNIX_EPOCH,
             },
             &cfg,
         );
@@ -615,6 +756,9 @@ mod tests {
                 last_popup: None,
                 first_install_at: first,
                 is_reload: false,
+                paused_secs: 0,
+                popup_pending: false,
+                last_heartbeat: SystemTime::UNIX_EPOCH,
             },
             &cfg,
         );
@@ -633,6 +777,9 @@ mod tests {
                 last_popup: None,
                 first_install_at: SystemTime::UNIX_EPOCH,
                 is_reload: false,
+                paused_secs: 0,
+                popup_pending: false,
+                last_heartbeat: SystemTime::UNIX_EPOCH,
             },
             &cfg,
         );
@@ -652,6 +799,9 @@ mod tests {
                 last_popup: Some(lp),
                 first_install_at: epoch_plus(0),
                 is_reload: false,
+                paused_secs: 0,
+                popup_pending: false,
+                last_heartbeat: SystemTime::UNIX_EPOCH,
             },
             &cfg,
         );
@@ -671,6 +821,9 @@ mod tests {
                 last_popup: Some(lp),
                 first_install_at: epoch_plus(0),
                 is_reload: false,
+                paused_secs: 0,
+                popup_pending: false,
+                last_heartbeat: SystemTime::UNIX_EPOCH,
             },
             &cfg,
         );
@@ -690,6 +843,9 @@ mod tests {
                 last_popup: Some(lp),
                 first_install_at: epoch_plus(0),
                 is_reload: false,
+                paused_secs: 0,
+                popup_pending: false,
+                last_heartbeat: SystemTime::UNIX_EPOCH,
             },
             &cfg,
         );
@@ -708,6 +864,9 @@ mod tests {
                 last_popup: Some(lp),
                 first_install_at: epoch_plus(0),
                 is_reload: false,
+                paused_secs: 0,
+                popup_pending: false,
+                last_heartbeat: SystemTime::UNIX_EPOCH,
             },
             &cfg,
         );
@@ -727,6 +886,9 @@ mod tests {
                 last_popup: Some(lp),
                 first_install_at: epoch_plus(0),
                 is_reload: false,
+                paused_secs: 0,
+                popup_pending: false,
+                last_heartbeat: SystemTime::UNIX_EPOCH,
             },
             &cfg,
         );
@@ -744,6 +906,9 @@ mod tests {
                 last_popup: None,
                 first_install_at: epoch_plus(0),
                 is_reload: true,
+                paused_secs: 0,
+                popup_pending: false,
+                last_heartbeat: SystemTime::UNIX_EPOCH,
             },
             &cfg,
         );
@@ -879,5 +1044,236 @@ mod tests {
     fn preview_ceil_120_seconds_reads_as_2_minutes() {
         let now = epoch_plus(10_000);
         assert_eq!(preview_minutes(now, None, Duration::from_secs(120)), 2);
+    }
+
+    // -------- next_popup_at active-time shift --------
+
+    #[test]
+    fn next_popup_at_zero_paused_matches_wall_clock() {
+        // Regression guard : the pre-active-time behaviour must be
+        // reproducible with paused_secs = 0.
+        let cfg = config_with(2.0, vec![], false);
+        let lp = epoch_plus(1_000_000);
+        let got = next_popup_at(lp, &cfg, 0);
+        assert_eq!(got, lp + Duration::from_secs(2 * 3600));
+    }
+
+    #[test]
+    fn next_popup_at_shifts_by_paused_secs() {
+        // 1 h paused_secs pushes the deadline exactly 1 h out.
+        let cfg = config_with(2.0, vec![], false);
+        let lp = epoch_plus(1_000_000);
+        let got = next_popup_at(lp, &cfg, 3600);
+        assert_eq!(got, lp + Duration::from_secs(2 * 3600 + 3600));
+    }
+
+    #[test]
+    fn next_event_paused_secs_defers_fire_decision() {
+        // interval 2 h, elapsed 2 h + 1 s (would normally FirePopup),
+        // but paused_secs = 30 min pushes the deadline to lp + 2.5 h.
+        // Now we're still 29 min 59 s short → Nothing.
+        let cfg = config_with(2.0, vec![], false);
+        let last = epoch_plus(0);
+        let now = epoch_plus(2 * 3600 + 1);
+        let fired = HashSet::new();
+        assert_eq!(
+            next_event(now, &cfg, last, 30 * 60, &fired),
+            SchedulerDecision::Nothing,
+        );
+    }
+
+    // -------- resolve_cold_start : rules A / B / C matrix --------
+
+    fn cold_inputs(
+        now_secs: u64,
+        lp_secs: u64,
+        hb_secs: u64,
+        paused_secs: u64,
+        popup_pending: bool,
+    ) -> ResolveInputs {
+        ResolveInputs {
+            now: epoch_plus(now_secs),
+            last_popup: Some(epoch_plus(lp_secs)),
+            first_install_at: SystemTime::UNIX_EPOCH,
+            is_reload: false,
+            paused_secs,
+            popup_pending,
+            last_heartbeat: epoch_plus(hb_secs),
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Rule {
+        A,
+        B,
+        C,
+    }
+
+    #[test]
+    fn resolve_cold_start_rule_matrix() {
+        // interval × downtime × popup_pending × paused_pre → expected rule.
+        // Row shape : (interval_h, downtime_secs, pending, paused_pre_secs, expected).
+        let intervals_h: [f32; 3] = [0.75, 2.0, 6.0]; // 45 min, 2 h, 6 h.
+        let downtimes: [u64; 5] = [
+            5 * 60,      // 5 min
+            30 * 60,     // 30 min  == RESUME_WINDOW → Rule C when pending
+            60 * 60,     // 1 h
+            3 * 3600,    // 3 h
+            12 * 3600,   // 12 h
+        ];
+        let pendings = [false, true];
+        let paused_pres: [u64; 2] = [0, 30 * 60];
+
+        for &int_h in &intervals_h {
+            let interval_secs = (int_h * 3600.0) as u64;
+            let two_x = 2 * interval_secs;
+            for &downtime in &downtimes {
+                for &pending in &pendings {
+                    for &paused_pre in &paused_pres {
+                        // Fix elapsed at `interval + 10 min` so it's
+                        // above interval but not necessarily above 2×.
+                        let elapsed = interval_secs + 10 * 60;
+                        // lp anchored so that `now - lp = elapsed`.
+                        let now_secs = 10 * 24 * 3600; // safe base epoch.
+                        let lp_secs = now_secs - elapsed;
+                        let hb_secs = now_secs - downtime;
+
+                        let cfg = config_with(int_h, vec![], false);
+                        let inputs = cold_inputs(now_secs, lp_secs, hb_secs, paused_pre, pending);
+                        let dec = resolve_cold_start(inputs, &cfg);
+
+                        let expected = if elapsed >= two_x {
+                            Rule::A
+                        } else if pending && downtime < RESUME_WINDOW.as_secs() {
+                            Rule::B
+                        } else {
+                            Rule::C
+                        };
+
+                        let case = format!(
+                            "int={}h dt={}s pend={} pre={}s elapsed={}s -> {:?}",
+                            int_h, downtime, pending, paused_pre, elapsed, expected,
+                        );
+
+                        match expected {
+                            Rule::A => {
+                                assert_eq!(dec.last_popup, epoch_plus(now_secs), "A last_popup {}", case);
+                                assert_eq!(dec.paused_secs, 0, "A paused_secs {}", case);
+                                assert!(!dec.popup_pending, "A popup_pending {}", case);
+                                assert!(!dec.relaunch_now, "A relaunch_now {}", case);
+                            }
+                            Rule::B => {
+                                assert_eq!(dec.last_popup, epoch_plus(lp_secs), "B last_popup {}", case);
+                                assert_eq!(
+                                    dec.paused_secs,
+                                    paused_pre + downtime,
+                                    "B paused_secs {}",
+                                    case,
+                                );
+                                assert!(dec.popup_pending, "B popup_pending {}", case);
+                                assert!(dec.relaunch_now, "B relaunch_now {}", case);
+                            }
+                            Rule::C => {
+                                assert_eq!(dec.last_popup, epoch_plus(lp_secs), "C last_popup {}", case);
+                                assert_eq!(
+                                    dec.paused_secs,
+                                    paused_pre + downtime,
+                                    "C paused_secs {}",
+                                    case,
+                                );
+                                assert!(!dec.popup_pending, "C popup_pending {}", case);
+                                assert!(!dec.relaunch_now, "C relaunch_now {}", case);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_cold_start_rule_a_ignores_pending_and_paused_pre() {
+        // elapsed = 5 × interval → Rule A even with popup_pending=true and paused_pre=1h.
+        let cfg = config_with(2.0, vec![], false);
+        let now_secs = 100_000;
+        let lp_secs = now_secs - 5 * 2 * 3600;
+        let hb_secs = now_secs - 60; // 1 min downtime, well below RESUME_WINDOW.
+        let inputs = cold_inputs(now_secs, lp_secs, hb_secs, 3600, true);
+        let dec = resolve_cold_start(inputs, &cfg);
+        assert_eq!(dec.last_popup, epoch_plus(now_secs));
+        assert_eq!(dec.paused_secs, 0);
+        assert!(!dec.popup_pending);
+        assert!(!dec.relaunch_now);
+    }
+
+    #[test]
+    fn resolve_cold_start_rule_b_downtime_just_under_resume_window() {
+        // downtime = 30 min - 1 s → Rule B (strict `<`).
+        let cfg = config_with(2.0, vec![], false);
+        let now_secs = 100_000;
+        let lp_secs = now_secs - 3600; // elapsed 1 h, below 2× interval.
+        let hb_secs = now_secs - (30 * 60 - 1);
+        let inputs = cold_inputs(now_secs, lp_secs, hb_secs, 0, true);
+        let dec = resolve_cold_start(inputs, &cfg);
+        assert_eq!(dec.last_popup, epoch_plus(lp_secs));
+        assert_eq!(dec.paused_secs, 30 * 60 - 1);
+        assert!(dec.popup_pending);
+        assert!(dec.relaunch_now);
+    }
+
+    #[test]
+    fn resolve_cold_start_downtime_equal_resume_window_falls_to_rule_c() {
+        // downtime == RESUME_WINDOW exactly → NOT Rule B (strict `<`).
+        let cfg = config_with(2.0, vec![], false);
+        let now_secs = 100_000;
+        let lp_secs = now_secs - 3600;
+        let hb_secs = now_secs - RESUME_WINDOW.as_secs();
+        let inputs = cold_inputs(now_secs, lp_secs, hb_secs, 0, true);
+        let dec = resolve_cold_start(inputs, &cfg);
+        assert_eq!(dec.last_popup, epoch_plus(lp_secs));
+        assert_eq!(dec.paused_secs, RESUME_WINDOW.as_secs());
+        assert!(!dec.popup_pending);
+        assert!(!dec.relaunch_now);
+    }
+
+    #[test]
+    fn resolve_cold_start_elapsed_exactly_2x_interval_hits_rule_a() {
+        // Boundary : elapsed == 2 × interval exactly → Rule A (inclusive,
+        // matches resolve_last_popup branch 3).
+        let cfg = config_with(2.0, vec![], false);
+        let now_secs = 100_000;
+        let lp_secs = now_secs - 2 * 2 * 3600;
+        let hb_secs = now_secs - 60;
+        let inputs = cold_inputs(now_secs, lp_secs, hb_secs, 0, false);
+        let dec = resolve_cold_start(inputs, &cfg);
+        assert_eq!(dec.last_popup, epoch_plus(now_secs));
+        assert_eq!(dec.paused_secs, 0);
+    }
+
+    #[test]
+    fn resolve_cold_start_clock_skew_last_heartbeat_in_future_treats_downtime_as_zero() {
+        // last_heartbeat > now (NTP resync during boot) → downtime clamped
+        // to 0, no negative subtraction, paused_secs unchanged.
+        let cfg = config_with(2.0, vec![], false);
+        let now_secs = 100_000;
+        let lp_secs = now_secs - 3600;
+        let hb_secs = now_secs + 10_000; // future.
+        let inputs = cold_inputs(now_secs, lp_secs, hb_secs, 500, false);
+        let dec = resolve_cold_start(inputs, &cfg);
+        assert_eq!(dec.paused_secs, 500);
+    }
+
+    #[test]
+    fn resolve_cold_start_clock_skew_last_popup_in_future_elapsed_zero_hits_rule_c() {
+        // last_popup > now → elapsed clamped to 0, below 2× interval, so
+        // Rule A never fires. Falls to C (or B if pending).
+        let cfg = config_with(2.0, vec![], false);
+        let now_secs = 100_000;
+        let lp_secs = now_secs + 10_000; // future.
+        let hb_secs = now_secs - 60;
+        let inputs = cold_inputs(now_secs, lp_secs, hb_secs, 0, false);
+        let dec = resolve_cold_start(inputs, &cfg);
+        assert_eq!(dec.last_popup, epoch_plus(lp_secs));
+        assert!(!dec.relaunch_now);
     }
 }

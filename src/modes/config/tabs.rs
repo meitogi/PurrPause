@@ -279,14 +279,21 @@ fn write_preview_override(cfg: &Config) -> Option<std::path::PathBuf> {
 fn next_popup_preview_minutes(interval_hours: f32) -> u64 {
     let now = SystemTime::now();
     let interval = Duration::from_secs((interval_hours * 3600.0).round() as u64);
-    scheduler::preview_minutes(now, runtime_dat::read(), interval)
+    // Session-1 shim : runtime_dat::read() returns the v2 RuntimeState;
+    // the preview stays on wall-clock semantics for now, so only .last_popup
+    // is needed. Session 5 revisits when the idle-pause slider ships.
+    scheduler::preview_minutes(
+        now,
+        runtime_dat::read().map(|s| s.last_popup),
+        interval,
+    )
 }
 
 /// Builds the parenthesised suffix shown after "dans X min", explaining
 /// the schedule anchor. `runtime.dat` present → "(basé sur dernier popup
 /// à HH:MM)" ; absent → "(depuis l'installation)".
 fn preview_anchor_suffix() -> String {
-    match runtime_dat::read() {
+    match runtime_dat::read().map(|s| s.last_popup) {
         Some(lp) => match format_local_hhmm(lp) {
             Some(s) => format!("(basé sur dernier popup à {})", s),
             None => String::from("(basé sur dernier popup)"),

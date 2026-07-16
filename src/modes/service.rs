@@ -112,7 +112,13 @@ mod win {
         let state_path = PathBuf::from(STATE_DAT);
         let mut config = config::load_or_default(&state_path);
         let now = SystemTime::now();
-        let runtime_last = runtime_dat::read();
+        // Session-1 shim : runtime_dat::read() now returns the full v2
+        // RuntimeState. The scheduler's active-time fields (paused_secs,
+        // popup_pending, last_heartbeat) are session-3 wiring, so we
+        // extract only .last_popup and feed zero placeholders below —
+        // preserves wall-clock behaviour bit-for-bit.
+        let runtime_state = runtime_dat::read();
+        let runtime_last = runtime_state.as_ref().map(|s| s.last_popup);
         let had_runtime = runtime_last.is_some();
         let mut last_popup = scheduler::resolve_last_popup(
             scheduler::ResolveInputs {
@@ -120,15 +126,23 @@ mod win {
                 last_popup: runtime_last,
                 first_install_at: config.first_install_at(),
                 is_reload: false,
+                paused_secs: 0,
+                popup_pending: false,
+                last_heartbeat: SystemTime::UNIX_EPOCH,
             },
             &config,
         );
         // Persist the resolved timestamp so a mid-cycle restart doesn't
         // re-enter the migration branch and re-derive from scratch.
         if !had_runtime {
-            let _ = runtime_dat::write(last_popup);
+            let _ = runtime_dat::write(&runtime_dat::RuntimeState {
+                last_popup,
+                paused_secs: 0,
+                popup_pending: false,
+                last_heartbeat: SystemTime::UNIX_EPOCH,
+            });
         }
-        let mut fired = scheduler::derive_already_fired(now, &config, last_popup);
+        let mut fired = scheduler::derive_already_fired(now, &config, last_popup, 0);
         tracing::info!(
             initial_paliers_fired = ?fired,
             "scheduler initialised"
@@ -233,6 +247,9 @@ mod win {
                             last_popup: Some(*last_popup),
                             first_install_at: config.first_install_at(),
                             is_reload: true,
+                            paused_secs: 0,
+                            popup_pending: false,
+                            last_heartbeat: SystemTime::UNIX_EPOCH,
                         },
                         config,
                     );
@@ -243,9 +260,14 @@ mod win {
                             "reload: interval reduced, clamping last_popup forward",
                         );
                         *last_popup = clamped;
-                        let _ = runtime_dat::write(*last_popup);
+                        let _ = runtime_dat::write(&runtime_dat::RuntimeState {
+                            last_popup: *last_popup,
+                            paused_secs: 0,
+                            popup_pending: false,
+                            last_heartbeat: SystemTime::UNIX_EPOCH,
+                        });
                     }
-                    *fired = scheduler::derive_already_fired(now, config, *last_popup);
+                    *fired = scheduler::derive_already_fired(now, config, *last_popup, 0);
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     if let Err(e) = maybe_fire(
@@ -276,7 +298,7 @@ mod win {
         exe: &Path,
     ) -> Result<()> {
         let now = SystemTime::now();
-        match scheduler::next_event(now, config, *last_popup, fired) {
+        match scheduler::next_event(now, config, *last_popup, 0, fired) {
             SchedulerDecision::Nothing => Ok(()),
             SchedulerDecision::FirePopup => fire_popup(exe, last_popup, fired, last_popup_child),
             SchedulerDecision::FireCountdown {
@@ -319,7 +341,12 @@ mod win {
                 let now = SystemTime::now();
                 *last_popup = now;
                 fired.clear();
-                if let Err(e) = runtime_dat::write(now) {
+                if let Err(e) = runtime_dat::write(&runtime_dat::RuntimeState {
+                    last_popup: now,
+                    paused_secs: 0,
+                    popup_pending: false,
+                    last_heartbeat: SystemTime::UNIX_EPOCH,
+                }) {
                     tracing::warn!(error = ?e, "write runtime.dat failed");
                 }
                 *last_popup_child = Some(child);
