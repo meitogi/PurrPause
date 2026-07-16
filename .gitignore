@@ -1,5 +1,22 @@
+# Rust — build artefacts (target/dist/ zips live under target/)
 /target/
+debug/
+
+# rustfmt backups
+**/*.rs.bk
+
+# MSVC Windows debug symbols (produced by cargo-xwin)
+*.pdb
+
+# Cargo.lock stays tracked : this is a binary crate, not a library.
+
+# OS
 .DS_Store
-*.swp
+Thumbs.db
+
+# IDE / editor
 .vscode/
 .idea/
+*.swp
+*.swo
+*~
