@@ -329,11 +329,19 @@ mod win {
         // cold-boot has ≤30 s resolution (RESUME_WINDOW is 30 min, so
         // Rule B stays correct with ~60× headroom).
         const HEARTBEAT_EVERY_N_TICKS: u32 = 6;
+        // Periodic idle-state log cadence : every 12th timeout tick
+        // (~60 s at 5 s TICK_INTERVAL). Emits a `state snapshot` log
+        // line with all signals + counters even when no active↔inactive
+        // transition fired, so log-scraping can plot the paused_secs
+        // curve minute-by-minute. Bounded — one line per minute is ~1440
+        // lines/day, cheap compared to the 5-tick heartbeat.
+        const STATE_LOG_EVERY_N_TICKS: u32 = 12;
 
         let tick_delta_secs = TICK_INTERVAL.as_secs();
         let mut deferred_secs: u64 = 0;
         let mut suspended_at: Option<SystemTime> = None;
         let mut ticks_since_write: u32 = 0;
+        let mut ticks_since_state_log: u32 = 0;
         // `was_idle = None` means "never observed yet" — the first tick's
         // idle transition log will read as a seed. After that, every
         // active↔inactive flip emits a single log line with the three
@@ -484,6 +492,19 @@ mod win {
                             "idle state changed"
                         );
                         was_idle = Some(is_idle_now);
+                    }
+                    ticks_since_state_log += 1;
+                    if ticks_since_state_log >= STATE_LOG_EVERY_N_TICKS {
+                        tracing::info!(
+                            is_idle = is_idle_now,
+                            idle_secs,
+                            gamepad_seen,
+                            is_busy = is_busy_now,
+                            paused_secs = *paused_secs,
+                            count_active_time = config.count_active_time,
+                            "state snapshot"
+                        );
+                        ticks_since_state_log = 0;
                     }
 
                     // 4. Scheduler decision, with video / audio deferral
