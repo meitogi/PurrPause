@@ -27,12 +27,14 @@ use std::sync::Mutex;
 use anyhow::{Context, Result};
 use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, VK_0, VK_9, VK_CONTROL, VK_D, VK_ESCAPE, VK_F4, VK_LMENU, VK_LWIN, VK_MENU,
-    VK_NUMPAD0, VK_NUMPAD9, VK_RMENU, VK_RWIN, VK_TAB,
+    GetAsyncKeyState, GetKeyState, GetKeyboardLayout, ToUnicodeEx, VK_CAPITAL, VK_CONTROL, VK_D,
+    VK_ESCAPE, VK_F4, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_RCONTROL, VK_RMENU,
+    VK_RSHIFT, VK_RWIN, VK_SHIFT, VK_TAB,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, SetWindowsHookExW, UnhookWindowsHookEx, HHOOK, KBDLLHOOKSTRUCT, LLKHF_ALTDOWN,
-    WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    CallNextHookEx, GetForegroundWindow, GetWindowThreadProcessId, SetWindowsHookExW,
+    UnhookWindowsHookEx, HHOOK, KBDLLHOOKSTRUCT, LLKHF_ALTDOWN, WH_KEYBOARD_LL, WM_KEYDOWN,
+    WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
 };
 
 use crate::signals::{PincodeBuffer, Verdict};
@@ -131,20 +133,72 @@ impl Drop for KeyboardHookGuard {
     }
 }
 
-/// Map a virtual-key code to the ASCII digit it produces on the main
-/// keyboard row or the numpad. Returns `None` for any other key.
-fn digit_vk_to_char(vk: u16) -> Option<char> {
-    if (VK_0.0..=VK_9.0).contains(&vk) {
-        return Some((b'0' + (vk - VK_0.0) as u8) as char);
+/// Resolve the character the current keydown would produce *if Alt
+/// were not held*, using the active keyboard layout of the foreground
+/// window. Returns `Some('0'..'9')` when the resulting character is an
+/// ASCII digit, `None` otherwise (letter, symbol, dead key, or no
+/// mapping at all).
+///
+/// Layout-aware — works for QWERTY top-row `1`, AZERTY `Shift+1`,
+/// numpad `1` with NumLock on, and any exotic layout that produces a
+/// digit through some other combination. Deliberately avoids Alt in
+/// the synthesized key-state array : with Alt down, `ToUnicodeEx`
+/// suppresses most character output, so we ask "what would this key
+/// combo type in a normal editor, ignoring Alt?" and check that.
+///
+/// The `WM_KEYDOWN` scan code is taken directly from
+/// `KBDLLHOOKSTRUCT.scanCode`. `wFlags = 2` prevents dead-key state
+/// mutation so a partial pincode entry doesn't leave the layout in a
+/// half-typed diacritic state for the frontmost window.
+fn typed_digit(vk: u16, scan: u32) -> Option<char> {
+    unsafe {
+        let mut key_state = [0u8; 256];
+        if GetAsyncKeyState(VK_SHIFT.0 as i32) < 0 {
+            key_state[VK_SHIFT.0 as usize] = 0x80;
+            key_state[VK_LSHIFT.0 as usize] = 0x80;
+        }
+        if GetAsyncKeyState(VK_CONTROL.0 as i32) < 0 {
+            key_state[VK_CONTROL.0 as usize] = 0x80;
+            key_state[VK_LCONTROL.0 as usize] = 0x80;
+        }
+        if (GetKeyState(VK_CAPITAL.0 as i32) & 1) != 0 {
+            key_state[VK_CAPITAL.0 as usize] = 0x01;
+        }
+
+        let fg_thread = GetWindowThreadProcessId(GetForegroundWindow(), None);
+        let hkl = GetKeyboardLayout(fg_thread);
+
+        let mut buf = [0u16; 8];
+        let n = ToUnicodeEx(vk as u32, scan, &key_state, &mut buf, 2, Some(hkl));
+        if n == 1 {
+            if let Some(ch) = char::from_u32(buf[0] as u32) {
+                if ch.is_ascii_digit() {
+                    return Some(ch);
+                }
+            }
+        }
+        None
     }
-    if (VK_NUMPAD0.0..=VK_NUMPAD9.0).contains(&vk) {
-        return Some((b'0' + (vk - VK_NUMPAD0.0) as u8) as char);
-    }
-    None
 }
 
 fn is_alt_vk(vk: u16) -> bool {
     vk == VK_MENU.0 || vk == VK_LMENU.0 || vk == VK_RMENU.0
+}
+
+/// Modifier keys that must NOT count as "non-digit" input during
+/// Alt+pincode capture. On AZERTY / Mac keyboards the top-row digit
+/// keys require Shift, so a naive "any non-digit vkey cancels" rule
+/// would abort every pincode entry the moment Shift is pressed.
+/// Modifiers are pass-through — the following digit keydown (with
+/// LLKHF_ALTDOWN still set) is what carries the semantic input.
+fn is_modifier_vk(vk: u16) -> bool {
+    vk == VK_SHIFT.0
+        || vk == VK_LSHIFT.0
+        || vk == VK_RSHIFT.0
+        || vk == VK_CONTROL.0
+        || vk == VK_LCONTROL.0
+        || vk == VK_RCONTROL.0
+        || vk == VK_CAPITAL.0
 }
 
 unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -198,7 +252,22 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
                     // key (no longer inside capture).
                     return unsafe { CallNextHookEx(None, code, wparam, lparam) };
                 }
-                if let Some(digit) = digit_vk_to_char(vk) {
+                // B6 : ignore pure modifier keydowns (Shift, Ctrl,
+                // CapsLock). On AZERTY / Mac layouts Shift is required
+                // to reach the top-row digit keys, so a modifier
+                // keydown must NOT be treated as "non-digit → cancel"
+                // (which would kill the pincode before the digit
+                // arrives). Modifiers produce no character and are
+                // safe to pass through.
+                if is_modifier_vk(vk) {
+                    return unsafe { CallNextHookEx(None, code, wparam, lparam) };
+                }
+                // B6 : layout-aware digit resolution. Ask the active
+                // keyboard layout what character this vk+scan+modifier
+                // combo actually types. Handles top-row `1`, Shift+`&`
+                // on AZERTY, numpad `1`, and any other layout that
+                // routes to '0'..'9'.
+                if let Some(digit) = typed_digit(vk, info.scanCode) {
                     if let Some(idx) = state.buffer.on_digit(digit) {
                         (state.send)(PincodeEvent::Digit(idx));
                     }

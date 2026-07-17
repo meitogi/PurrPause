@@ -162,7 +162,10 @@ mod windows_impl {
     use windows::Win32::Foundation::HWND;
 
     use crate::modes::install::{DIAGNOSTICS_CACHE_DIR, STATE_DAT};
-    use crate::platform::win32::{fullscreen_detect, keyboard_hook, window_style};
+    use crate::platform::win32::{
+        fullscreen_detect, keyboard_hook, proc_kill::kill_orphan_webview2_workers,
+        window_style,
+    };
 
     use super::{animation_pick, render_html, resolve_animation_url, stage_params, FALLBACK_ANIM_PATH};
 
@@ -395,10 +398,6 @@ mod windows_impl {
         // background. Fullscreen + with_transparent(true) alone
         // suffices for the popup.
 
-        let proxy = event_loop.create_proxy();
-        let protocol_resources = resources_dir.clone();
-        let protocol_rendered = rendered.clone();
-
         // WebView2 user data folder under <exe_dir>/Data/WebView2/ so
         // Edge WebView2 workers write their cache alongside the exe
         // instead of at exe-dir root. Best-effort create ; wry falls
@@ -406,34 +405,84 @@ mod windows_impl {
         let webview2_data = std::env::current_exe()
             .ok()
             .and_then(|e| e.parent().map(|p| crate::modes::install::webview2_dir(p)));
-        if let Some(ref dir) = webview2_data {
-            let _ = std::fs::create_dir_all(dir);
+
+        // Nested helper : takes ownership of the values captured into
+        // the builder's closures so it can be called twice on the B3
+        // retry path (see the wipe-then-retry match below).
+        fn build_webview(
+            window: &tao::window::Window,
+            webview2_data: Option<PathBuf>,
+            resources_dir: PathBuf,
+            rendered: String,
+            proxy: tao::event_loop::EventLoopProxy<UserEvent>,
+        ) -> Result<(wry::WebView, wry::WebContext)> {
+            if let Some(ref dir) = webview2_data {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            // WebContext must outlive the builder (`'a` lifetime) — bind
+            // BEFORE the webview so drop order is correct.
+            let mut web_ctx = wry::WebContext::new(webview2_data);
+            let webview = wry::WebViewBuilder::new_with_web_context(&mut web_ctx)
+                .with_transparent(true)
+                .with_custom_protocol(
+                    "purrpause".to_string(),
+                    move |_webview_id, request| {
+                        serve_custom_protocol(
+                            request,
+                            &resources_dir,
+                            &rendered,
+                        )
+                    },
+                )
+                .with_url("purrpause://localhost/popup.html")
+                .with_ipc_handler(move |request| {
+                    if request.body() == "dismiss" {
+                        let _ = proxy.send_event(UserEvent::Dismiss);
+                    }
+                })
+                .build(window)
+                .context("build wry webview")?;
+            Ok((webview, web_ctx))
         }
-        // WebContext must outlive the builder (`'a` lifetime) — bind
-        // BEFORE the webview so drop order is correct.
-        let mut web_ctx = wry::WebContext::new(webview2_data);
 
         tracing::info!("popup: building wry webview");
-        let webview = wry::WebViewBuilder::new_with_web_context(&mut web_ctx)
-            .with_transparent(true)
-            .with_custom_protocol(
-                "purrpause".to_string(),
-                move |_webview_id, request| {
-                    serve_custom_protocol(
-                        request,
-                        &protocol_resources,
-                        &protocol_rendered,
-                    )
-                },
-            )
-            .with_url("purrpause://localhost/popup.html")
-            .with_ipc_handler(move |request| {
-                if request.body() == "dismiss" {
-                    let _ = proxy.send_event(UserEvent::Dismiss);
+        let first_attempt = build_webview(
+            &window,
+            webview2_data.clone(),
+            resources_dir.clone(),
+            rendered.clone(),
+            event_loop.create_proxy(),
+        );
+        // B3 : force-shutdown mid-popup can leave <exe_dir>/Data/WebView2/
+        // in a locked/partial state, surfacing on the next popup as
+        // HRESULT 0x80070490 ("Élément introuvable" / ERROR_NOT_FOUND).
+        // On any first-build failure : kill surviving workers, wipe the
+        // UserData folder, retry once. Latch is implicit (single retry),
+        // second failure surfaces to the service's B4 retry backoff.
+        let (webview, web_ctx) = match first_attempt {
+            Ok(pair) => pair,
+            Err(first_err) => {
+                let hresult_match = is_webview2_not_found_error(&first_err);
+                tracing::warn!(
+                    error = ?first_err,
+                    hresult_match,
+                    "webview2 build failed - wiping UserData and retrying once"
+                );
+                if let Some(ref dir) = webview2_data {
+                    kill_orphan_webview2_workers(dir);
+                    let _ = std::fs::remove_dir_all(dir);
+                    let _ = std::fs::create_dir_all(dir);
                 }
-            })
-            .build(&window)
-            .context("build wry webview")?;
+                build_webview(
+                    &window,
+                    webview2_data,
+                    resources_dir.clone(),
+                    rendered.clone(),
+                    event_loop.create_proxy(),
+                )
+                .context("build wry webview after WebView2 UserData wipe (retry-once)")?
+            }
+        };
         tracing::info!("popup: wry webview built");
 
         // webview + web_ctx must outlive the event loop (dropping
@@ -649,6 +698,21 @@ mod windows_impl {
                 _ => {}
             }
         });
+    }
+
+    /// Detects HRESULT `0x80070490` — HRESULT_FROM_WIN32(ERROR_NOT_FOUND)
+    /// — anywhere in the error chain's Debug representation. Surfaces
+    /// post-force-shutdown when the WebView2 UserData folder holds stale
+    /// locks. The hex literal is locale-independent (Debug printing of
+    /// `windows::core::Error` always includes `0x80070490`, unlike the
+    /// message which flips to "Élément introuvable" on FR systems).
+    /// Downcast-through-chain would be cleaner but our dependency graph
+    /// has two versions of `webview2_com` + `windows` (transitive via
+    /// wry 0.55 vs. our direct deps) so exact-type matching fails.
+    /// Used only for the retry log field ; the wipe path fires on any
+    /// first-build failure per the plan's wipe-once-per-lifetime latch.
+    fn is_webview2_not_found_error(err: &anyhow::Error) -> bool {
+        format!("{err:?}").contains("0x80070490")
     }
 
     fn serve_custom_protocol(

@@ -36,8 +36,9 @@ use windows::Win32::System::Environment::{CreateEnvironmentBlock, DestroyEnviron
 use windows::Win32::System::RemoteDesktop::{WTSGetActiveConsoleSessionId, WTSQueryUserToken};
 use windows::Win32::Foundation::WAIT_OBJECT_0;
 use windows::Win32::System::Threading::{
-    CreateProcessAsUserW, TerminateProcess, WaitForSingleObject, CREATE_NO_WINDOW,
-    CREATE_UNICODE_ENVIRONMENT, NORMAL_PRIORITY_CLASS, PROCESS_INFORMATION, STARTUPINFOW,
+    CreateProcessAsUserW, GetExitCodeProcess, TerminateProcess, WaitForSingleObject,
+    CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, NORMAL_PRIORITY_CLASS, PROCESS_INFORMATION,
+    STARTUPINFOW,
 };
 
 use crate::platform::argv::build_command_line;
@@ -74,15 +75,24 @@ impl SpawnedChild {
         }
     }
 
-    /// Non-blocking check for process termination. Wraps
-    /// `WaitForSingleObject(handle, 0)`. Returns true only on
-    /// `WAIT_OBJECT_0` (process signaled = exited) ; any other
-    /// outcome (`WAIT_TIMEOUT` = still running, `WAIT_FAILED`) is
-    /// treated as still-alive so a transient API failure never
-    /// causes the caller to spuriously clear popup_pending.
-    pub fn try_wait_exited(&self) -> bool {
+    /// Non-blocking check for process termination. Returns
+    /// `None` while the process is still running (or on a transient
+    /// `WAIT_FAILED` — defensive: caller keeps polling) and
+    /// `Some(exit_code)` once the process has exited. If
+    /// `GetExitCodeProcess` itself fails on an exited process (rare
+    /// — handle revoked, low-memory panic), returns `Some(0)` so
+    /// the caller treats it as a normal exit rather than leaking
+    /// the poll forever as `None`.
+    pub fn try_wait_exited(&self) -> Option<u32> {
         let r = unsafe { WaitForSingleObject(self.handle, 0) };
-        r == WAIT_OBJECT_0
+        if r != WAIT_OBJECT_0 {
+            return None;
+        }
+        let mut code: u32 = 0;
+        match unsafe { GetExitCodeProcess(self.handle, &mut code) } {
+            Ok(()) => Some(code),
+            Err(_) => Some(0),
+        }
     }
 }
 

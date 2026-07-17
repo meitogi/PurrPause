@@ -63,6 +63,22 @@ mod win {
     const TICK_INTERVAL: Duration = Duration::from_secs(5);
     const DEBOUNCE: Duration = Duration::from_millis(300);
     const SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
+    // B4 popup crash retry policy. 30/60/90 s backoff × 3 attempts caps
+    // the retry storm at 3 min post-crash and gives the B3 wipe path
+    // time to settle if the WebView2 folder was in a stale state.
+    const MAX_POPUP_RETRIES: u32 = 3;
+    const RETRY_BACKOFF_STEP_SECS: u64 = 30;
+
+    /// In-memory retry state armed when a popup exits with a non-zero
+    /// code. Not persisted to `runtime.dat` : if the service dies
+    /// mid-retry, the B5 cold-start gate clears `popup_pending` post-
+    /// unclean-shutdown and the next natural cycle fires the popup
+    /// cleanly. Cleared on exit-code=0 or on `attempts >= MAX_POPUP_RETRIES`.
+    #[derive(Debug, Clone)]
+    struct PopupRetryState {
+        attempts: u32,
+        next_retry_at: SystemTime,
+    }
 
     #[derive(Debug, Clone, Copy)]
     enum TickCommand {
@@ -147,11 +163,17 @@ mod win {
                         },
                         &config,
                     );
+                    // Fresh install → last_clean_shutdown_at = UNIX_EPOCH
+                    // ("we're running, next boot is unclean unless graceful
+                    // shutdown says otherwise"). Same treatment as every
+                    // other runtime write : only the shutdown path bumps
+                    // this field to `now`. See B5 fix.
                     let _ = runtime_dat::write(&runtime_dat::RuntimeState {
                         last_popup: lp,
                         paused_secs: 0,
                         popup_pending: false,
                         last_heartbeat: now,
+                        last_clean_shutdown_at: SystemTime::UNIX_EPOCH,
                     });
                     tracing::info!(
                         path = "no-runtime-dat",
@@ -160,11 +182,28 @@ mod win {
                     );
                     (lp, 0u64, false, false)
                 }
-                Some(state) => {
+                Some(mut state) => {
                     let downtime_secs = now
                         .duration_since(state.last_heartbeat)
                         .map(|d| d.as_secs())
                         .unwrap_or(0);
+                    // B5 : gate Rule B on clean shutdown. `was_clean_shutdown`
+                    // is true when the previous graceful shutdown stamped
+                    // last_clean_shutdown_at at or after the final heartbeat.
+                    // v2 migrations populate the field with UNIX_EPOCH →
+                    // always < heartbeat → treated as unclean (safe, fires
+                    // once per b.9→b.10 upgrade boot).
+                    let was_clean_shutdown =
+                        state.last_clean_shutdown_at >= state.last_heartbeat;
+                    let popup_pending_pre_gate = state.popup_pending;
+                    if !was_clean_shutdown && state.popup_pending {
+                        tracing::info!(
+                            last_heartbeat = ?state.last_heartbeat,
+                            last_clean_shutdown_at = ?state.last_clean_shutdown_at,
+                            "unclean shutdown detected - clearing popup_pending pre-Rule-B"
+                        );
+                        state.popup_pending = false;
+                    }
                     let d = scheduler::resolve_cold_start(
                         scheduler::ResolveInputs {
                             now,
@@ -197,6 +236,8 @@ mod win {
                         path = "with-runtime-dat",
                         rule,
                         downtime_secs,
+                        was_clean_shutdown,
+                        popup_pending_pre_gate,
                         prior_last_popup = ?state.last_popup,
                         prior_paused_secs = state.paused_secs,
                         prior_popup_pending = state.popup_pending,
@@ -206,6 +247,18 @@ mod win {
                         relaunch_now = d.relaunch_now,
                         "cold-start: A/B/C dispatch"
                     );
+                    // Immediately persist last_clean_shutdown_at = UNIX_EPOCH
+                    // so any crash from here until the next graceful shutdown
+                    // leaves the field zeroed. Uses the post-cold-start
+                    // resolved values (not the raw file contents) so the
+                    // next boot reads a coherent state.
+                    let _ = runtime_dat::write(&runtime_dat::RuntimeState {
+                        last_popup: d.last_popup,
+                        paused_secs: d.paused_secs,
+                        popup_pending: d.popup_pending,
+                        last_heartbeat: now,
+                        last_clean_shutdown_at: SystemTime::UNIX_EPOCH,
+                    });
                     (d.last_popup, d.paused_secs, d.popup_pending, d.relaunch_now)
                 }
             };
@@ -290,12 +343,17 @@ mod win {
             }
         }
 
+        // B4 popup retry state (in-memory only). See PopupRetryState
+        // docstring for why it isn't persisted.
+        let mut popup_retry: Option<PopupRetryState> = None;
+
         // Main tick loop.
         let loop_result = tick_loop(
             &mut config,
             &mut last_popup,
             &mut paused_secs,
             &mut popup_pending,
+            &mut popup_retry,
             &mut last_heartbeat,
             &mut fired,
             &mut last_popup_child,
@@ -317,6 +375,31 @@ mod win {
         // HANDLE-based terminate is immune to PID recycle.
         if let Some(probe) = input_probe_child.take() {
             probe.terminate();
+        }
+
+        // B5 graceful-shutdown marker : stamp `last_clean_shutdown_at`
+        // with the current time so the next boot can distinguish this
+        // clean SCM Stop from a force-kill. Only path in the codebase
+        // that writes a non-UNIX_EPOCH value into this field. If write
+        // fails, next boot treats it as unclean (safe default) — logged
+        // but not fatal.
+        let shutdown_now = SystemTime::now();
+        if let Err(e) = runtime_dat::write(&runtime_dat::RuntimeState {
+            last_popup,
+            paused_secs,
+            popup_pending,
+            last_heartbeat: shutdown_now,
+            last_clean_shutdown_at: shutdown_now,
+        }) {
+            tracing::warn!(
+                error = ?e,
+                "final clean-shutdown runtime.dat write failed - next boot will treat as unclean"
+            );
+        } else {
+            tracing::info!(
+                last_clean_shutdown_at = ?shutdown_now,
+                "graceful shutdown : runtime.dat stamped clean"
+            );
         }
 
         // Grace period + best-effort join. If a thread refuses to exit,
@@ -353,6 +436,7 @@ mod win {
         last_popup: &mut SystemTime,
         paused_secs: &mut u64,
         popup_pending: &mut bool,
+        popup_retry: &mut Option<PopupRetryState>,
         last_heartbeat: &mut SystemTime,
         fired: &mut std::collections::HashSet<u32>,
         last_popup_child: &mut Option<SpawnedChild>,
@@ -459,6 +543,7 @@ mod win {
                             paused_secs: *paused_secs,
                             popup_pending: *popup_pending,
                             last_heartbeat: *last_heartbeat,
+                            last_clean_shutdown_at: SystemTime::UNIX_EPOCH,
                         });
                     }
                     *fired = scheduler::derive_already_fired(
@@ -500,14 +585,87 @@ mod win {
 
                     // 2. Detect popup exit (Dismiss button OR the
                     //    countdown-then-close path both terminate the
-                    //    popup process).
+                    //    popup process). B4 : the exit code discriminates
+                    //    a normal dismiss (0) from a crash (≠ 0). Crash
+                    //    arms a retry backoff instead of clearing the
+                    //    cycle ; a following FirePopup attempt uses the
+                    //    B3 wipe-then-retry path in popup.rs to recover
+                    //    from a stale WebView2 UserData folder.
                     if *popup_pending {
                         if let Some(child) = last_popup_child.as_ref() {
-                            if child.try_wait_exited() {
-                                *popup_pending = false;
-                                tracing::info!(
-                                    paused_secs = *paused_secs,
-                                    "popup child exited - clearing popup_pending"
+                            if let Some(exit_code) = child.try_wait_exited() {
+                                if exit_code == 0 {
+                                    *popup_pending = false;
+                                    *popup_retry = None;
+                                    tracing::info!(
+                                        exit_code,
+                                        paused_secs = *paused_secs,
+                                        "popup child exited cleanly - clearing popup_pending"
+                                    );
+                                } else {
+                                    let attempts_prior =
+                                        popup_retry.as_ref().map(|r| r.attempts).unwrap_or(0);
+                                    if attempts_prior >= MAX_POPUP_RETRIES {
+                                        tracing::warn!(
+                                            exit_code,
+                                            attempts = attempts_prior,
+                                            max_retries = MAX_POPUP_RETRIES,
+                                            "popup gave up after N retries - clearing pending, next natural cycle"
+                                        );
+                                        *popup_pending = false;
+                                        *popup_retry = None;
+                                        fired.clear();
+                                    } else {
+                                        let attempts_next = attempts_prior + 1;
+                                        let backoff_secs =
+                                            RETRY_BACKOFF_STEP_SECS * (attempts_next as u64);
+                                        let next_retry_at = SystemTime::now()
+                                            + Duration::from_secs(backoff_secs);
+                                        tracing::warn!(
+                                            exit_code,
+                                            attempts = attempts_next,
+                                            max_retries = MAX_POPUP_RETRIES,
+                                            backoff_secs,
+                                            "popup exited abnormally - retry armed"
+                                        );
+                                        *popup_retry = Some(PopupRetryState {
+                                            attempts: attempts_next,
+                                            next_retry_at,
+                                        });
+                                        // Fire-set carries per-palier "already announced"
+                                        // state ; clear it so the next attempted popup
+                                        // re-considers the schedule cleanly.
+                                        fired.clear();
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // 2a. If a retry is armed and its backoff has
+                    //     elapsed, re-attempt fire_popup. Successful
+                    //     spawn resets popup_pending/last_popup via the
+                    //     fire path ; a subsequent crash re-arms with
+                    //     the incremented attempt count until MAX.
+                    if let Some(retry) = popup_retry.as_ref() {
+                        if SystemTime::now() >= retry.next_retry_at {
+                            tracing::info!(
+                                attempts = retry.attempts,
+                                "popup retry backoff elapsed - re-firing"
+                            );
+                            if let Err(e) = fire_popup(
+                                exe,
+                                last_popup,
+                                paused_secs,
+                                popup_pending,
+                                last_heartbeat,
+                                fired,
+                                last_popup_child,
+                                &config.passcode_hash,
+                            ) {
+                                tracing::warn!(
+                                    error = ?e,
+                                    "popup retry fire_popup failed - keeping retry armed"
                                 );
                             }
                         }
@@ -520,7 +678,7 @@ mod win {
                     //     probe would degrade kbd/mouse detection.
                     let probe_alive = input_probe_child
                         .as_ref()
-                        .map(|c| !c.try_wait_exited())
+                        .map(|c| c.try_wait_exited().is_none())
                         .unwrap_or(false);
                     if !probe_alive {
                         if input_probe_child.is_some() {
@@ -685,6 +843,7 @@ mod win {
                             paused_secs: *paused_secs,
                             popup_pending: *popup_pending,
                             last_heartbeat: *last_heartbeat,
+                            last_clean_shutdown_at: SystemTime::UNIX_EPOCH,
                         }) {
                             tracing::warn!(error = ?e, "heartbeat runtime.dat write failed");
                         }
@@ -753,6 +912,7 @@ mod win {
                     paused_secs: 0,
                     popup_pending: true,
                     last_heartbeat: now,
+                    last_clean_shutdown_at: SystemTime::UNIX_EPOCH,
                 }) {
                     tracing::warn!(error = ?e, "write runtime.dat failed");
                 }
