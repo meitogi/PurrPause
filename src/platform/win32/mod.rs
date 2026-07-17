@@ -1,9 +1,13 @@
 pub mod acl;
+pub mod busy_detector;
 pub mod dpapi;
 pub mod fullscreen_detect;
+pub mod gamepad;
 pub mod hidden_attrs;
+pub mod idle;
 pub mod itaskservice;
 pub mod keyboard_hook;
+pub mod power_notify;
 pub mod proc_kill;
 pub mod service_config;
 pub mod spawn_user;

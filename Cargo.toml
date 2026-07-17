@@ -59,20 +59,25 @@ windows = { version = "0.62.2", features = [
     "Win32_Security_Authorization",      # ConvertStringSecurityDescriptor, SetNamedSecurityInfoW
     "Win32_Security_Cryptography",       # DPAPI CryptProtectData / CryptUnprotectData
     "Win32_System_Com",                  # CoInitializeEx / CoCreateInstance
+    "Win32_System_Com_StructuredStorage", # PROPVARIANT (IMMDevice::Activate signature, busy detector)
     "Win32_System_Diagnostics_ToolHelp", # CreateToolhelp32Snapshot + PROCESSENTRY32W (orphan WebView2 sweep)
     "Win32_System_Environment",          # CreateEnvironmentBlock / DestroyEnvironmentBlock
     "Win32_System_IO",                   # OVERLAPPED + GetOverlappedResult (pipe accept)
     "Win32_System_Pipes",                # CreateNamedPipeW + PIPE_* constants
+    "Win32_System_Power",                # RegisterSuspendResumeNotification + HPOWERNOTIFY (suspend/resume broadcasts)
     "Win32_System_RemoteDesktop",        # WTSQueryUserToken
     "Win32_System_Services",             # SCM helpers not covered by windows-service
     "Win32_System_Registry",             # Runtime service ImagePath queries
+    "Win32_System_SystemInformation",    # GetTickCount64 (idle counter base)
     "Win32_System_Time",                 # FileTimeToSystemTime + SystemTimeToTzSpecificLocalTime (Config UI anchor label)
     "Win32_System_TaskScheduler",        # ITaskService COM watchdog registration
     "Win32_System_Threading",            # CreateProcessAsUser
     "Win32_System_Variant",              # VARIANT (Task Scheduler COM args)
     "Win32_Storage_FileSystem",          # SetFileAttributesW
-    "Win32_UI_Input_KeyboardAndMouse",   # GetAsyncKeyState, VK_* constants
-    "Win32_UI_Shell",                    # ShellExecuteW
+    "Win32_UI_Input_KeyboardAndMouse",   # GetAsyncKeyState, VK_* constants, GetLastInputInfo, LASTINPUTINFO
+    "Win32_UI_Input_XboxController",     # XInputGetState + XINPUT_STATE (gamepad activity poll)
+    "Win32_UI_Shell",                    # ShellExecuteW + SHQueryUserNotificationState (busy detector)
+    "Win32_Media_Audio",                 # WASAPI (IMMDeviceEnumerator + IAudioSessionEnumerator, busy detector)
     "Win32_UI_WindowsAndMessaging",      # SetWindowsHookEx, MessageBoxW
 ] }
 webview2-com = "0.39.1"                  # WebView2 runtime detection

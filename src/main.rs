@@ -19,6 +19,7 @@ mod password;
 mod platform;
 mod runtime_dat;
 mod scheduler;
+mod signals;
 #[cfg(test)]
 mod tracing_lint;
 #[cfg(test)]
