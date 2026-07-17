@@ -216,6 +216,45 @@
     }
     .preview-switcher .hint { opacity: 0.55; margin-left: 6px; }
 
+    /* Pincode asterisks — hidden until the first accepted digit fires
+       purrpauseOnEvent({kind:'digit',idx}). Sits above the dismiss
+       button so the parent's visual attention is close to the countdown
+       + unlock affordance. Colour + shadow reuse the popup's design
+       tokens ; tabular-nums keeps letter-spacing stable as the count
+       grows. Locked state greys the asterisks and reveals the message
+       row below. */
+    .pincode-asterisks {
+      position: fixed;
+      bottom: calc(6vh + 4.5em);
+      left: 50%;
+      transform: translateX(-50%);
+      z-index: 5;
+      font-family: ui-monospace, "SF Mono", Menlo, monospace;
+      font-size: clamp(1.5rem, 2.5vw, 3rem);
+      font-variant-numeric: tabular-nums;
+      letter-spacing: 0.3em;
+      color: var(--accent);
+      text-shadow: var(--text-shadow);
+      display: none;
+      pointer-events: none;
+      user-select: none;
+    }
+    .pincode-asterisks.visible { display: block; }
+    .pincode-asterisks.locked  { color: var(--disabled); }
+    .pincode-locked-msg {
+      position: fixed;
+      bottom: calc(6vh + 3em);
+      left: 50%;
+      transform: translateX(-50%);
+      z-index: 5;
+      color: var(--muted);
+      font-size: clamp(0.9rem, 1.2vw, 1.2rem);
+      text-shadow: var(--text-shadow);
+      display: none;
+      pointer-events: none;
+    }
+    .pincode-locked-msg.visible { display: block; }
+
     @media (orientation: portrait), (max-width: 900px) {
       .bouncer { max-width: 80vw; padding: 1.5vh 2vw; }
       h1#title { font-size: clamp(1.2rem, 4vw, 1.8rem); }
@@ -237,6 +276,50 @@
     <p class="countdown" id="countdown"></p>
   </div>
   <button id="dismiss" disabled>{{ DISMISS_LABEL }}</button>
+
+  <!-- Alt+pincode emergency unlock feedback. Both nodes start hidden and
+       are toggled from Rust via wry.evaluate_script() ; see the
+       window.purrpauseOnEvent bridge below. -->
+  <div class="pincode-asterisks" id="pincode-asterisks"></div>
+  <div class="pincode-locked-msg" id="pincode-locked-msg">
+    Pincode incorrect, patientez jusqu'&agrave; la fin du minuteur
+  </div>
+
+  <!-- Rust → WebView bridge for Alt+pincode capture. Rust calls
+       window.purrpauseOnEvent({kind, ...}) via wry's evaluate_script on
+       every accepted digit / cancel / failed verify / lockout. The
+       actual argon2id verify + dismiss happen on the Rust side ; this
+       handler only reflects state into the DOM. Guarded so it also
+       renders benign no-ops in preview mode where Rust never calls it. -->
+  <script>
+    (function () {
+      const ast = document.getElementById('pincode-asterisks');
+      const msg = document.getElementById('pincode-locked-msg');
+      window.purrpauseOnEvent = function (evt) {
+        if (!ast || !msg || !evt) return;
+        switch (evt.kind) {
+          case 'digit':
+            ast.classList.add('visible');
+            ast.textContent = '*'.repeat((evt.idx | 0) + 1);
+            break;
+          case 'cancel':
+          case 'fail':
+            ast.textContent = '';
+            ast.classList.remove('visible');
+            break;
+          case 'ok':
+            // Rust dismisses via ControlFlow::Exit — the popup process
+            // terminates within a frame, so no DOM update needed here.
+            break;
+          case 'locked':
+            ast.classList.add('visible', 'locked');
+            ast.textContent = '× × ×';
+            msg.classList.add('visible');
+            break;
+        }
+      };
+    })();
+  </script>
 
   <!-- Preview shim: swaps {{ NAME }} placeholders with defaults when ?preview=1 is set. -->
   <script>

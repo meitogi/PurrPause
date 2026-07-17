@@ -135,6 +135,86 @@ pub fn busy_defer_decision(
     }
 }
 
+// -- pincode buffer ---------------------------------------------------
+
+/// Outcome returned by `PincodeBuffer::on_alt_release`.
+///
+/// `Submit(chars)` carries a buffer that reached the configured `cap` —
+/// caller verifies against the argon2id hash. `Cancel` means the buffer
+/// was short (or empty) at Alt-release, so nothing to verify.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Verdict {
+    Submit(String),
+    Cancel,
+}
+
+/// Pure state machine backing the popup's Alt+pincode emergency unlock.
+///
+/// The Win32 low-level keyboard hook feeds digit / non-digit / Alt-release
+/// events into it ; the buffer decides accept / cap / verdict / lock.
+/// Isolating the invariants here keeps them Linux-testable (Win32 hook
+/// glue is `#[cfg(windows)]` and unreachable from CI).
+///
+/// Popup-scoped semantics per the design : the buffer lives only as long
+/// as the popup process. Lockout is triggered externally by the popup
+/// (via `force_lock` after 3 failed verifies) and lasts until the popup
+/// exits. This differs from `modes::config::lockout::Lockout` which has
+/// a 30 s wall-clock timer suited to the Config UI ; we do not share the
+/// struct because the 3-strike counter naturally lives in the popup's
+/// event loop where the verify happens.
+pub struct PincodeBuffer {
+    chars: Vec<char>,
+    cap: usize,
+    locked: bool,
+}
+
+impl PincodeBuffer {
+    pub fn new(cap: usize) -> Self {
+        Self { chars: Vec::with_capacity(cap), cap, locked: false }
+    }
+
+    /// Push a digit character. Returns the newly-added asterisk index
+    /// (0-based) when accepted, or `None` when : the buffer is locked,
+    /// `c` is not an ASCII digit, or the cap is already reached.
+    /// Silent absorption of over-cap input protects against a stuck Alt
+    /// + auto-repeat filling memory.
+    pub fn on_digit(&mut self, c: char) -> Option<u32> {
+        if self.locked || !c.is_ascii_digit() || self.chars.len() >= self.cap {
+            return None;
+        }
+        self.chars.push(c);
+        Some((self.chars.len() - 1) as u32)
+    }
+
+    /// Non-digit key seen while Alt is still held — clears the buffer
+    /// so accidental Alt+letter combinations don't leak into a later
+    /// verify. Does NOT return a verdict (Alt is still down).
+    pub fn on_non_digit(&mut self) {
+        self.chars.clear();
+    }
+
+    /// Alt released. Full-length buffer → `Submit(chars)` for verify ;
+    /// anything shorter → `Cancel`. Always clears the buffer so the
+    /// next Alt-press starts fresh regardless of verdict.
+    pub fn on_alt_release(&mut self) -> Verdict {
+        let verdict = if self.chars.len() == self.cap && self.cap > 0 {
+            Verdict::Submit(self.chars.iter().collect())
+        } else {
+            Verdict::Cancel
+        };
+        self.chars.clear();
+        verdict
+    }
+
+    /// External "you're locked now" signal — invoked when the popup's
+    /// verify counter hits 3 fails. Absorbs subsequent input silently
+    /// for the rest of this popup's lifetime.
+    pub fn force_lock(&mut self) {
+        self.locked = true;
+        self.chars.clear();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -346,5 +426,66 @@ mod tests {
             busy_defer_decision(true, u64::MAX, 5, 900),
             DeferOutcome::ForceFire
         );
+    }
+
+    // -- PincodeBuffer -----------------------------------------------
+
+    #[test]
+    fn pincode_digit_accepted_returns_incrementing_indices() {
+        let mut b = PincodeBuffer::new(4);
+        assert_eq!(b.on_digit('1'), Some(0));
+        assert_eq!(b.on_digit('2'), Some(1));
+        assert_eq!(b.on_digit('3'), Some(2));
+        assert_eq!(b.on_digit('4'), Some(3));
+    }
+
+    #[test]
+    fn pincode_cap_enforced_returns_none_after_limit() {
+        let mut b = PincodeBuffer::new(4);
+        for c in ['1', '2', '3', '4'] {
+            assert!(b.on_digit(c).is_some());
+        }
+        // Over-cap is silently absorbed — protects against stuck Alt
+        // + auto-repeat.
+        assert_eq!(b.on_digit('5'), None);
+        // Alt-release still resolves to Submit with the first 4 chars
+        // (not the over-cap 5th).
+        assert_eq!(b.on_alt_release(), Verdict::Submit("1234".to_string()));
+    }
+
+    #[test]
+    fn pincode_alt_release_full_buffer_returns_submit() {
+        let mut b = PincodeBuffer::new(6);
+        for c in ['4', '2', '4', '2', '4', '2'] {
+            b.on_digit(c);
+        }
+        assert_eq!(b.on_alt_release(), Verdict::Submit("424242".to_string()));
+        // Cleared afterwards — next Alt-press starts at idx 0.
+        assert_eq!(b.on_digit('9'), Some(0));
+    }
+
+    #[test]
+    fn pincode_alt_release_short_buffer_returns_cancel_and_clears() {
+        let mut b = PincodeBuffer::new(6);
+        b.on_digit('1');
+        b.on_digit('2');
+        b.on_digit('3');
+        assert_eq!(b.on_alt_release(), Verdict::Cancel);
+        // Cleared — next digit starts at idx 0, not 3.
+        assert_eq!(b.on_digit('4'), Some(0));
+    }
+
+    #[test]
+    fn pincode_force_lock_absorbs_all_input() {
+        let mut b = PincodeBuffer::new(4);
+        b.on_digit('1');
+        b.on_digit('2');
+        b.force_lock();
+        // Once locked, all input paths become no-ops : digits ignored,
+        // non-digit still safe to call, Alt-release yields Cancel with
+        // no leak of the pre-lock partial buffer.
+        assert_eq!(b.on_digit('3'), None);
+        b.on_non_digit();
+        assert_eq!(b.on_alt_release(), Verdict::Cancel);
     }
 }

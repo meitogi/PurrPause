@@ -128,8 +128,9 @@ pub fn run(
     anim_override: Option<String>,
     config_override: Option<String>,
     test_countdown_secs: Option<u32>,
+    passcode_hash: Option<String>,
 ) -> anyhow::Result<()> {
-    windows_impl::run(preview, debug, anim_override, config_override, test_countdown_secs)
+    windows_impl::run(preview, debug, anim_override, config_override, test_countdown_secs, passcode_hash)
 }
 
 #[cfg(not(windows))]
@@ -139,6 +140,7 @@ pub fn run(
     _anim_override: Option<String>,
     _config_override: Option<String>,
     _test_countdown_secs: Option<u32>,
+    _passcode_hash: Option<String>,
 ) -> anyhow::Result<()> {
     anyhow::bail!("popup mode is Windows-only")
 }
@@ -170,6 +172,19 @@ mod windows_impl {
     enum UserEvent {
         Dismiss,
         CountdownExpired,
+        /// One accepted digit — WebView should render one more asterisk.
+        /// Payload is the 0-based index of the newly-added asterisk.
+        PincodeDigitAccepted(u32),
+        /// Full-length buffer at Alt-release — verify against the
+        /// argon2id hash held in the popup's run scope.
+        PincodeSubmit(String),
+        /// Buffer cleared (short at Alt-release, non-digit while Alt
+        /// held) — WebView should hide the asterisk display.
+        PincodeCancel,
+        /// 3 wrong pincodes reached — WebView shows the locked visual,
+        /// hook silently absorbs further attempts for the rest of this
+        /// popup's lifetime.
+        PincodeVerdictLocked,
     }
 
     pub fn run(
@@ -178,6 +193,7 @@ mod windows_impl {
         anim_override: Option<String>,
         config_override: Option<String>,
         test_countdown_secs: Option<u32>,
+        passcode_hash: Option<String>,
     ) -> Result<()> {
         // Preview / test spawns from the config UI pass a per-PID
         // temp state file so uncommitted edits show up without an
@@ -420,12 +436,12 @@ mod windows_impl {
             .context("build wry webview")?;
         tracing::info!("popup: wry webview built");
 
-        // Silence the unused-var lint : the webview must live for the
-        // event loop's duration ; dropping it destroys the child hwnd.
-        let _webview = webview;
-        // web_ctx must outlive the event loop too (WebView2 keeps a
-        // handle to it) — hold on until the popup exits.
-        let _web_ctx = web_ctx;
+        // webview + web_ctx must outlive the event loop (dropping
+        // either destroys the child hwnd / WebView2 state). Both are
+        // captured by the `event_loop.run` closure below via `move`,
+        // which is also how the Rust→WebView `evaluate_script` bridge
+        // reaches the WebView from the pincode arms.
+        let web_ctx = web_ctx;
 
         // Install the low-level keyboard hook AFTER wry finished
         // WebView2 init. Order matters : if we install before wry
@@ -437,14 +453,50 @@ mod windows_impl {
         //
         // Debug mode leaves Alt+F4 / Alt+Tab / Win+D / Ctrl+Esc alone
         // so a developer can exit the popup during smoke without
-        // killing the process from Task Manager.
+        // killing the process from Task Manager. Alt+pincode capture
+        // is also disabled in debug for the same reason.
+        //
+        // Prod : if `passcode_hash` is present, install the pincode-
+        // capturing variant with a closure that maps hook events to
+        // tao proxy events. Empty / absent hash ⇒ install the plain
+        // hook (shortcut suppression only, no unlock path).
         let mut kb_guard = if debug {
             tracing::info!("popup: skipping keyboard hook (--debug)");
             None
         } else {
-            let guard = keyboard_hook::install_keyboard_hook()
-                .context("install keyboard hook")?;
-            tracing::info!("popup: keyboard hook installed (post-wry init)");
+            let hash_present = passcode_hash
+                .as_deref()
+                .map(|h| !h.is_empty())
+                .unwrap_or(false);
+            let cap = cfg.passcode_length as usize;
+            let guard = if hash_present && cap > 0 {
+                let proxy = event_loop.create_proxy();
+                let g = keyboard_hook::install_keyboard_hook_with_pincode(
+                    move |ev| {
+                        let ue = match ev {
+                            keyboard_hook::PincodeEvent::Digit(i) => {
+                                UserEvent::PincodeDigitAccepted(i)
+                            }
+                            keyboard_hook::PincodeEvent::Submit(s) => {
+                                UserEvent::PincodeSubmit(s)
+                            }
+                            keyboard_hook::PincodeEvent::Cancel => UserEvent::PincodeCancel,
+                        };
+                        let _ = proxy.send_event(ue);
+                    },
+                    cap,
+                )
+                .context("install keyboard hook (with pincode)")?;
+                tracing::info!(cap, "popup: keyboard hook installed with pincode capture");
+                g
+            } else {
+                let g = keyboard_hook::install_keyboard_hook()
+                    .context("install keyboard hook")?;
+                tracing::info!(
+                    "popup: keyboard hook installed (no pincode - passcode_hash empty)"
+                );
+                g
+            };
             Some(guard)
         };
 
@@ -461,14 +513,87 @@ mod windows_impl {
         });
 
         let mut countdown_expired = false;
+        // Popup-scoped 3-strike counter for Alt+pincode verifies.
+        // Semantics differ from `modes::config::lockout::Lockout` (which
+        // has a 30 s wall-clock timer) : here, lockout persists for the
+        // popup's lifetime and resets naturally when the process exits.
+        // Kept as a plain `u32` in the closure — no persistence, no timer.
+        let mut fail_count: u32 = 0;
+        let hash_for_verify = passcode_hash.clone().unwrap_or_default();
+        // Second proxy for the locked-verdict self-dispatch inside the
+        // Submit arm — the original event proxy was moved into the hook
+        // closure above.
+        let locked_proxy = event_loop.create_proxy();
         tracing::info!("popup: entering event loop");
 
         event_loop.run(move |event, _target, control_flow| {
             *control_flow = ControlFlow::Wait;
+            // Force the closure to also own `web_ctx` — it must outlive
+            // the event loop, but no branch reads it. Silences the
+            // move-into-closure unused warning without a top-level `_`
+            // rename that would obscure intent.
+            let _ = &web_ctx;
             match event {
                 Event::UserEvent(UserEvent::Dismiss) => {
                     tracing::info!("popup dismissed by user");
                     *control_flow = ControlFlow::Exit;
+                }
+                Event::UserEvent(UserEvent::PincodeDigitAccepted(idx)) => {
+                    let js = format!(
+                        "window.purrpauseOnEvent&&window.purrpauseOnEvent({{kind:'digit',idx:{idx}}})"
+                    );
+                    let _ = webview.evaluate_script(&js);
+                }
+                Event::UserEvent(UserEvent::PincodeSubmit(buf)) => {
+                    // Argon2id verify. On any error (malformed hash,
+                    // unlikely because we generated it via
+                    // `password::hash`), treat as a failure — never
+                    // dismiss on a doubt.
+                    let ok = if hash_for_verify.is_empty() {
+                        false
+                    } else {
+                        crate::password::verify(&buf, &hash_for_verify).unwrap_or(false)
+                    };
+                    if ok {
+                        tracing::info!("popup: Alt+pincode verify OK - dismissing");
+                        let _ = webview.evaluate_script(
+                            "window.purrpauseOnEvent&&window.purrpauseOnEvent({kind:'ok'})",
+                        );
+                        // Reuse the Dismiss termination path — the
+                        // service's try_wait_exited catches the exit
+                        // and clears popup_pending.
+                        *control_flow = ControlFlow::Exit;
+                    } else {
+                        fail_count = fail_count.saturating_add(1);
+                        tracing::info!(
+                            fail_count,
+                            "popup: Alt+pincode verify FAILED"
+                        );
+                        let js = format!(
+                            "window.purrpauseOnEvent&&window.purrpauseOnEvent({{kind:'fail',count:{fail_count}}})"
+                        );
+                        let _ = webview.evaluate_script(&js);
+                        if fail_count >= 3 {
+                            // Self-dispatch — handled below to keep the
+                            // "flip WebView + tell hook" logic in one
+                            // place. proxy.send_event is safe cross-arm
+                            // because the event loop consumes it FIFO.
+                            let _ = locked_proxy
+                                .send_event(UserEvent::PincodeVerdictLocked);
+                        }
+                    }
+                }
+                Event::UserEvent(UserEvent::PincodeCancel) => {
+                    let _ = webview.evaluate_script(
+                        "window.purrpauseOnEvent&&window.purrpauseOnEvent({kind:'cancel'})",
+                    );
+                }
+                Event::UserEvent(UserEvent::PincodeVerdictLocked) => {
+                    tracing::info!("popup: pincode locked (3 failed attempts)");
+                    let _ = webview.evaluate_script(
+                        "window.purrpauseOnEvent&&window.purrpauseOnEvent({kind:'locked'})",
+                    );
+                    keyboard_hook::mark_locked();
                 }
                 Event::UserEvent(UserEvent::CountdownExpired) => {
                     // Break-enforcement window over. Uninstall the LL

@@ -247,6 +247,7 @@ mod win {
                 &mut last_heartbeat,
                 &mut fired,
                 &mut last_popup_child,
+                &config.passcode_hash,
             ) {
                 tracing::warn!(error = ?e, "Rule B relaunch failed - will retry on next tick");
             }
@@ -354,6 +355,7 @@ mod win {
                         last_heartbeat,
                         fired,
                         last_popup_child,
+                        &config.passcode_hash,
                     ) {
                         tracing::warn!(error = ?e, "trigger popup failed");
                     }
@@ -527,6 +529,7 @@ mod win {
                                         last_heartbeat,
                                         fired,
                                         last_popup_child,
+                                        &config.passcode_hash,
                                     ) {
                                         tracing::warn!(error = ?e, "tick fire_popup failed");
                                     } else {
@@ -591,6 +594,7 @@ mod win {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn fire_popup(
         exe: &Path,
         last_popup: &mut SystemTime,
@@ -599,6 +603,7 @@ mod win {
         last_heartbeat: &mut SystemTime,
         fired: &mut std::collections::HashSet<u32>,
         last_popup_child: &mut Option<SpawnedChild>,
+        passcode_hash: &str,
     ) -> Result<()> {
         // Pre-spawn sweep : belt-and-braces. Startup already fires once ;
         // this catches workers leaked between our own popup lifetimes.
@@ -609,7 +614,22 @@ mod win {
         // mode : keyboard hook installed + force-minimize honoured.
         // Debug-default is only for developer manual invocations
         // from PowerShell during smoke.
-        let args: [&OsStr; 2] = [OsStr::new("--popup"), OsStr::new("--no-debug")];
+        //
+        // --passcode-hash <phc> forwards the argon2id hash so the popup
+        // can verify Alt+pincode unlock attempts. Empty hash (fresh
+        // install pre-passcode-set) → arg omitted, popup falls back to
+        // countdown-only. The PHC string is NOT the passcode itself
+        // and is not recoverable to one, so argv exposure is acceptable.
+        let args: Vec<&OsStr> = if passcode_hash.is_empty() {
+            vec![OsStr::new("--popup"), OsStr::new("--no-debug")]
+        } else {
+            vec![
+                OsStr::new("--popup"),
+                OsStr::new("--no-debug"),
+                OsStr::new("--passcode-hash"),
+                OsStr::new(passcode_hash),
+            ]
+        };
         // Spawn-first, kill-on-success. Predecessor left behind by an
         // Alt+Tab'd user (post-countdown unlock, 0.7.1 Track A) is
         // terminated only if the new spawn succeeded — better a stale

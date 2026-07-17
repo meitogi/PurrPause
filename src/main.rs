@@ -215,6 +215,11 @@ enum Mode {
         anim_override: Option<String>,
         config_override: Option<String>,
         test_countdown_secs: Option<u32>,
+        /// Argon2id PHC-format hash of the parent pincode. `None` when
+        /// the flag is absent (fresh install pre-passcode-set) — the
+        /// popup then skips the Alt+pincode capture path entirely and
+        /// only the natural countdown-then-dismiss path is available.
+        passcode_hash: Option<String>,
     },
     /// Small corner countdown widget for T-15 / T-10 / T-5 / T-1.
     /// `debug` skips force-minimize so the current window isn't lost.
@@ -255,6 +260,7 @@ fn classify_mode(args: &[String]) -> Mode {
             anim_override: parse_anim_override(args),
             config_override: parse_config_override(args),
             test_countdown_secs: parse_u32_after(args, "--test-countdown-secs"),
+            passcode_hash: parse_string_after(args, "--passcode-hash"),
         },
         Some("--countdown") => parse_countdown(args),
         Some("--config") => Mode::Config {
@@ -309,6 +315,16 @@ fn parse_u32_after(args: &[String], flag: &str) -> Option<u32> {
     args.get(idx + 1)?.parse::<u32>().ok()
 }
 
+/// Generic `--flag <string>` extractor. Returns the following argv
+/// value verbatim, or `None` when the flag is absent. Used for
+/// `--passcode-hash <phc>` — the value is an argon2id PHC string, which
+/// only uses base64 chars + `$` `=` `,` and round-trips through
+/// Windows argv without escaping.
+fn parse_string_after(args: &[String], flag: &str) -> Option<String> {
+    let idx = args.iter().position(|a| a == flag)?;
+    args.get(idx + 1).cloned()
+}
+
 fn parse_countdown(args: &[String]) -> Mode {
     // Shape: --countdown <secs> --palier <15|10|5|1> [--debug] [--config-override <path>]
     let seconds = args
@@ -337,8 +353,8 @@ fn dispatch(mode: Mode) -> anyhow::Result<()> {
         Mode::Config { first_run: true } => modes::config_first_run::run()?,
         Mode::Service => modes::service::run()?,
         Mode::Watchdog => modes::watchdog::run()?,
-        Mode::Popup { preview, debug, anim_override, config_override, test_countdown_secs } => {
-            modes::popup::run(preview, debug, anim_override, config_override, test_countdown_secs)?
+        Mode::Popup { preview, debug, anim_override, config_override, test_countdown_secs, passcode_hash } => {
+            modes::popup::run(preview, debug, anim_override, config_override, test_countdown_secs, passcode_hash)?
         }
         Mode::Countdown { seconds, palier, debug, config_override } => {
             modes::countdown::run(seconds, palier, debug, config_override)?
@@ -381,7 +397,7 @@ mod tests {
     fn popup_with_preview() {
         assert_eq!(
             classify_mode(&as_args(["--popup", "--preview"])),
-            Mode::Popup { preview: true, debug: false, anim_override: None, config_override: None, test_countdown_secs: None }
+            Mode::Popup { preview: true, debug: false, anim_override: None, config_override: None, test_countdown_secs: None, passcode_hash: None }
         );
     }
 
@@ -389,7 +405,7 @@ mod tests {
     fn popup_without_preview() {
         assert_eq!(
             classify_mode(&as_args(["--popup"])),
-            Mode::Popup { preview: false, debug: false, anim_override: None, config_override: None, test_countdown_secs: None }
+            Mode::Popup { preview: false, debug: false, anim_override: None, config_override: None, test_countdown_secs: None, passcode_hash: None }
         );
     }
 
@@ -397,7 +413,7 @@ mod tests {
     fn popup_default_has_no_debug() {
         assert_eq!(
             classify_mode(&as_args(["--popup"])),
-            Mode::Popup { preview: false, debug: false, anim_override: None, config_override: None, test_countdown_secs: None }
+            Mode::Popup { preview: false, debug: false, anim_override: None, config_override: None, test_countdown_secs: None, passcode_hash: None }
         );
     }
 
@@ -405,7 +421,7 @@ mod tests {
     fn popup_debug_opts_in() {
         assert_eq!(
             classify_mode(&as_args(["--popup", "--debug"])),
-            Mode::Popup { preview: false, debug: true, anim_override: None, config_override: None, test_countdown_secs: None }
+            Mode::Popup { preview: false, debug: true, anim_override: None, config_override: None, test_countdown_secs: None, passcode_hash: None }
         );
     }
 
@@ -413,7 +429,7 @@ mod tests {
     fn popup_legacy_no_debug_is_ignored() {
         assert_eq!(
             classify_mode(&as_args(["--popup", "--no-debug"])),
-            Mode::Popup { preview: false, debug: false, anim_override: None, config_override: None, test_countdown_secs: None }
+            Mode::Popup { preview: false, debug: false, anim_override: None, config_override: None, test_countdown_secs: None, passcode_hash: None }
         );
     }
 
@@ -429,6 +445,7 @@ mod tests {
                 anim_override: Some("dance-cat.lottie".to_string()),
                 config_override: None,
                 test_countdown_secs: None,
+                passcode_hash: None,
             }
         );
     }
@@ -437,7 +454,7 @@ mod tests {
     fn popup_anim_traversal_rejected() {
         assert_eq!(
             classify_mode(&as_args(["--popup", "--anim", "../etc/passwd"])),
-            Mode::Popup { preview: false, debug: false, anim_override: None, config_override: None, test_countdown_secs: None }
+            Mode::Popup { preview: false, debug: false, anim_override: None, config_override: None, test_countdown_secs: None, passcode_hash: None }
         );
     }
 
@@ -451,6 +468,7 @@ mod tests {
                 anim_override: None,
                 config_override: None,
                 test_countdown_secs: Some(10),
+                passcode_hash: None,
             }
         );
     }
@@ -459,7 +477,33 @@ mod tests {
     fn popup_anim_absolute_path_rejected() {
         assert_eq!(
             classify_mode(&as_args(["--popup", "--anim", "/etc/hosts"])),
-            Mode::Popup { preview: false, debug: false, anim_override: None, config_override: None, test_countdown_secs: None }
+            Mode::Popup { preview: false, debug: false, anim_override: None, config_override: None, test_countdown_secs: None, passcode_hash: None }
+        );
+    }
+
+    #[test]
+    fn popup_passcode_hash_captured() {
+        // The PHC value contains the argon2id sigil `$argon2id$…` — argv
+        // round-trips it verbatim on both Windows and *nix.
+        let hash = "$argon2id$v=19$m=19456,t=2,p=1$abcabcabcabcabcabc$xyzxyzxyzxyzxyzxyzxyzxyzxyzxyzxyzxyzxyzxyzxyz";
+        assert_eq!(
+            classify_mode(&as_args(["--popup", "--passcode-hash", hash])),
+            Mode::Popup {
+                preview: false,
+                debug: false,
+                anim_override: None,
+                config_override: None,
+                test_countdown_secs: None,
+                passcode_hash: Some(hash.to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn popup_passcode_hash_absent_is_none() {
+        assert_eq!(
+            classify_mode(&as_args(["--popup"])),
+            Mode::Popup { preview: false, debug: false, anim_override: None, config_override: None, test_countdown_secs: None, passcode_hash: None }
         );
     }
 
