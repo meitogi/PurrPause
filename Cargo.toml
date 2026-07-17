@@ -1,6 +1,6 @@
 [package]
 name = "purrpause"
-version = "1.1.0-b.6"
+version = "1.1.0-b.7"
 edition = "2021"
 license = "MIT"
 description = "Break-reminder overlay for Windows — camouflaged Windows Session Health Service"
@@ -76,7 +76,7 @@ windows = { version = "0.62.2", features = [
     "Win32_Storage_FileSystem",          # SetFileAttributesW
     "Win32_UI_Input_KeyboardAndMouse",   # GetAsyncKeyState, VK_* constants, GetLastInputInfo, LASTINPUTINFO
     "Win32_UI_Input_XboxController",     # XInputGetState + XINPUT_STATE (gamepad activity poll)
-    "Win32_UI_Shell",                    # ShellExecuteW + SHQueryUserNotificationState (busy detector)
+    "Win32_UI_Shell",                    # ShellExecuteW (webview2 runtime installer helper)
     "Win32_Media_Audio",                 # WASAPI (IMMDeviceEnumerator + IAudioSessionEnumerator, busy detector)
     "Win32_UI_WindowsAndMessaging",      # SetWindowsHookEx, MessageBoxW
 ] }

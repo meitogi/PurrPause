@@ -63,76 +63,23 @@ pub fn classify_wm_powerbroadcast(wparam: usize) -> Option<PowerEventKind> {
     }
 }
 
-// -- busy_detector -----------------------------------------------------
-
-/// True if the `QUERY_USER_NOTIFICATION_STATE` value indicates a busy
-/// context :
-///   - `QUNS_BUSY` = 2 — Direct3D exclusive full-screen mode / other busy.
-///   - `QUNS_RUNNING_D3D_FULL_SCREEN` = 3 — full-screen game.
-///   - `QUNS_PRESENTATION_MODE` = 4 — PowerPoint / equivalent.
-///
-/// Every other value (including `QUNS_NOT_PRESENT` = 1 and
-/// `QUNS_ACCEPTS_NOTIFICATIONS` = 5) is treated as not-busy.
-pub fn quns_state_is_busy(state: u32) -> bool {
-    matches!(state, 2..=4)
-}
-
 // -- tick decisions ----------------------------------------------------
 
 /// True when the current tick should accrue `paused_secs` : the user
 /// has been idle at least `threshold_secs`, no gamepad packet has
-/// bumped since the previous call, and the busy detector reports the
-/// context is not a full-screen game / presentation / active audio
-/// session.
+/// bumped since the previous call, and no WASAPI audio/video session
+/// is currently active.
 ///
-/// Ordering matters : short-circuit on gamepad and busy before
+/// Ordering matters : short-circuit on gamepad and playing before
 /// touching `idle_secs` in the caller is not required (the args are
 /// all evaluated), but the boolean AND short-circuits inside.
 pub fn idle_tick_should_pause(
     idle_secs: u64,
     threshold_secs: u64,
     gamepad_active: bool,
-    is_busy: bool,
+    playing_video_or_audio: bool,
 ) -> bool {
-    idle_secs >= threshold_secs && !gamepad_active && !is_busy
-}
-
-/// Decision returned by `busy_defer_decision`.
-#[derive(Debug, PartialEq, Eq)]
-pub enum DeferOutcome {
-    /// Not busy — fire the popup now. Reset `deferred_secs` to 0.
-    Fire,
-    /// Busy but under the cap — hold, and use the returned running
-    /// total as the new `deferred_secs`.
-    Defer(u64),
-    /// Busy but the cap has been reached — fire anyway. Reset
-    /// `deferred_secs` to 0.
-    ForceFire,
-}
-
-/// Popup-fire arbitration when the busy detector flags the current
-/// context. `deferred_secs` is the caller's running counter (reset
-/// on every actual fire). `tick_delta_secs` is what would be added
-/// this tick ; `cap_secs` is `MAX_DEFERRAL_SECS` (15 min in prod).
-///
-/// Saturating add keeps the arithmetic safe even at u64::MAX — cap
-/// comparison still works because saturation lands at u64::MAX ≥
-/// cap ⇒ ForceFire.
-pub fn busy_defer_decision(
-    is_busy: bool,
-    deferred_secs: u64,
-    tick_delta_secs: u64,
-    cap_secs: u64,
-) -> DeferOutcome {
-    if !is_busy {
-        return DeferOutcome::Fire;
-    }
-    let next = deferred_secs.saturating_add(tick_delta_secs);
-    if next >= cap_secs {
-        DeferOutcome::ForceFire
-    } else {
-        DeferOutcome::Defer(next)
-    }
+    idle_secs >= threshold_secs && !gamepad_active && !playing_video_or_audio
 }
 
 // -- pincode buffer ---------------------------------------------------
@@ -322,40 +269,6 @@ mod tests {
         assert_eq!(classify_wm_powerbroadcast(0x8013), None);
     }
 
-    // -- quns_state_is_busy -------------------------------------------
-
-    #[test]
-    fn quns_busy_value_2_is_busy() {
-        assert!(quns_state_is_busy(2));
-    }
-
-    #[test]
-    fn quns_d3d_fullscreen_value_3_is_busy() {
-        assert!(quns_state_is_busy(3));
-    }
-
-    #[test]
-    fn quns_presentation_mode_value_4_is_busy() {
-        assert!(quns_state_is_busy(4));
-    }
-
-    #[test]
-    fn quns_not_present_value_1_is_not_busy() {
-        assert!(!quns_state_is_busy(1));
-    }
-
-    #[test]
-    fn quns_accepts_notifications_value_5_is_not_busy() {
-        assert!(!quns_state_is_busy(5));
-    }
-
-    #[test]
-    fn quns_zero_and_out_of_range_are_not_busy() {
-        assert!(!quns_state_is_busy(0));
-        assert!(!quns_state_is_busy(99));
-        assert!(!quns_state_is_busy(u32::MAX));
-    }
-
     // -- idle_tick_should_pause ---------------------------------------
 
     #[test]
@@ -381,51 +294,6 @@ mod tests {
     #[test]
     fn idle_pause_all_conditions_ok_is_true() {
         assert!(idle_tick_should_pause(3600, 60, false, false));
-    }
-
-    // -- busy_defer_decision ------------------------------------------
-
-    #[test]
-    fn defer_not_busy_returns_fire() {
-        assert_eq!(
-            busy_defer_decision(false, 300, 5, 900),
-            DeferOutcome::Fire
-        );
-    }
-
-    #[test]
-    fn defer_busy_under_cap_returns_defer_with_running_total() {
-        assert_eq!(
-            busy_defer_decision(true, 300, 5, 900),
-            DeferOutcome::Defer(305)
-        );
-    }
-
-    #[test]
-    fn defer_busy_at_cap_returns_force_fire() {
-        // 895 + 5 = 900 → force-fire (>=).
-        assert_eq!(
-            busy_defer_decision(true, 895, 5, 900),
-            DeferOutcome::ForceFire
-        );
-    }
-
-    #[test]
-    fn defer_busy_over_cap_returns_force_fire() {
-        assert_eq!(
-            busy_defer_decision(true, 1_000, 5, 900),
-            DeferOutcome::ForceFire
-        );
-    }
-
-    #[test]
-    fn defer_saturating_add_never_panics_at_u64_max() {
-        // deferred_secs + tick_delta_secs would overflow ; saturating
-        // add caps at u64::MAX and cap comparison classifies as force.
-        assert_eq!(
-            busy_defer_decision(true, u64::MAX, 5, 900),
-            DeferOutcome::ForceFire
-        );
     }
 
     // -- PincodeBuffer -----------------------------------------------

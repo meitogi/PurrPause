@@ -319,10 +319,6 @@ mod win {
         // short-circuited to `is_idle_now = false` so the counter runs
         // on wall-clock time.
         const IDLE_THRESHOLD_SECS: u64 = 60;
-        // Cap for the video / fullscreen / audio deferral. Beyond this
-        // the popup fires regardless of busy state — the user has been
-        // "busy" for 15 min already, we're going to interrupt anyway.
-        const MAX_DEFERRAL_SECS: u64 = 15 * 60;
         // Heartbeat cadence : every 6th timeout tick (~30 s at 5 s
         // TICK_INTERVAL). Fire-path already persists eagerly ; this
         // covers pure-idle stretches so downtime detection at next
@@ -338,7 +334,6 @@ mod win {
         const STATE_LOG_EVERY_N_TICKS: u32 = 12;
 
         let tick_delta_secs = TICK_INTERVAL.as_secs();
-        let mut deferred_secs: u64 = 0;
         let mut suspended_at: Option<SystemTime> = None;
         let mut ticks_since_write: u32 = 0;
         let mut ticks_since_state_log: u32 = 0;
@@ -466,9 +461,7 @@ mod win {
                     // 3. Idle accumulation. Signals are read once and
                     //    reused by the fire-decision below.
                     let now = SystemTime::now();
-                    let (quns_state_now, quns_busy_now, audio_busy_now) =
-                        busy_detector::busy_snapshot();
-                    let is_busy_now = quns_busy_now || audio_busy_now;
+                    let playing_video_or_audio_now = busy_detector::playing_video_or_audio();
                     let gamepad_seen = gamepad::gamepad_active_since_last_call();
                     let idle_secs = idle::idle_seconds();
                     let is_idle_now = if config.count_active_time {
@@ -476,7 +469,7 @@ mod win {
                             idle_secs,
                             IDLE_THRESHOLD_SECS,
                             gamepad_seen,
-                            is_busy_now,
+                            playing_video_or_audio_now,
                         )
                     } else {
                         false
@@ -489,7 +482,7 @@ mod win {
                             transition = if is_idle_now { "active -> inactive" } else { "inactive -> active" },
                             idle_secs,
                             gamepad_seen,
-                            is_busy = is_busy_now,
+                            playing_video_or_audio = playing_video_or_audio_now,
                             paused_secs = *paused_secs,
                             "idle state changed"
                         );
@@ -501,10 +494,9 @@ mod win {
                         let remaining_secs =
                             next.duration_since(now).unwrap_or(Duration::ZERO).as_secs();
                         // Categorical reason so the log reader doesn't
-                        // have to correlate 4 booleans + a threshold by
-                        // eye. Priority order matches "most engaging
-                        // signal first" so a user watching YouTube while
-                        // typing shows as `kbd_mouse`, not `audio`.
+                        // have to correlate the raw booleans by eye.
+                        // Priority order : the most user-driven signal
+                        // wins (kbd/mouse > gamepad > media).
                         let active_reason = if !config.count_active_time {
                             "wall_clock_mode"
                         } else if is_idle_now {
@@ -513,10 +505,8 @@ mod win {
                             "kbd_or_mouse"
                         } else if gamepad_seen {
                             "gamepad"
-                        } else if quns_busy_now {
-                            "fullscreen_or_presentation"
-                        } else if audio_busy_now {
-                            "audio_playing"
+                        } else if playing_video_or_audio_now {
+                            "playing_video_or_audio"
                         } else {
                             "unknown"
                         };
@@ -525,9 +515,7 @@ mod win {
                             active_reason,
                             idle_secs,
                             gamepad_seen,
-                            quns_state = quns_state_now,
-                            quns_busy = quns_busy_now,
-                            audio_busy = audio_busy_now,
+                            playing_video_or_audio = playing_video_or_audio_now,
                             paused_secs = *paused_secs,
                             remaining_secs,
                             count_active_time = config.count_active_time,
@@ -536,8 +524,12 @@ mod win {
                         ticks_since_state_log = 0;
                     }
 
-                    // 4. Scheduler decision, with video / audio deferral
-                    //    when the fire lands during a busy stretch.
+                    // 4. Scheduler decision. Simplified in b.7 — popups
+                    //    fire the moment the active-time echelon is hit,
+                    //    with no busy-context deferral. Alt+pincode on
+                    //    the popup is the intended escape hatch for the
+                    //    rare "I'm mid-presentation, don't interrupt"
+                    //    case.
                     match scheduler::next_event(
                         now,
                         config,
@@ -547,11 +539,6 @@ mod win {
                     ) {
                         SchedulerDecision::Nothing => {}
                         SchedulerDecision::FirePopup => {
-                            // Fire-decision context. Elapsed_active is
-                            // the metric the scheduler used to decide
-                            // fire ; logging it alongside the interval
-                            // makes "why did the popup fire now ?" a
-                            // one-line answer in the service log.
                             let elapsed_wall_secs = now
                                 .duration_since(*last_popup)
                                 .map(|d| d.as_secs())
@@ -560,57 +547,25 @@ mod win {
                                 elapsed_wall_secs.saturating_sub(*paused_secs);
                             let interval_secs =
                                 scheduler::interval(config).as_secs();
-                            let decision = signals::busy_defer_decision(
-                                is_busy_now,
-                                deferred_secs,
-                                tick_delta_secs,
-                                MAX_DEFERRAL_SECS,
+                            tracing::info!(
+                                elapsed_wall_secs,
+                                paused_secs = *paused_secs,
+                                elapsed_active_secs,
+                                interval_secs,
+                                playing_video_or_audio = playing_video_or_audio_now,
+                                "scheduler said FirePopup - firing"
                             );
-                            match decision {
-                                signals::DeferOutcome::Fire
-                                | signals::DeferOutcome::ForceFire => {
-                                    // Actual fire — log once with full
-                                    // context so bug reports show why.
-                                    tracing::info!(
-                                        elapsed_wall_secs,
-                                        paused_secs = *paused_secs,
-                                        elapsed_active_secs,
-                                        interval_secs,
-                                        is_busy = is_busy_now,
-                                        deferred_secs,
-                                        verdict = if matches!(decision, signals::DeferOutcome::ForceFire) { "ForceFire (defer cap hit)" } else { "Fire" },
-                                        "scheduler said FirePopup - firing"
-                                    );
-                                    if let Err(e) = fire_popup(
-                                        exe,
-                                        last_popup,
-                                        paused_secs,
-                                        popup_pending,
-                                        last_heartbeat,
-                                        fired,
-                                        last_popup_child,
-                                        &config.passcode_hash,
-                                    ) {
-                                        tracing::warn!(error = ?e, "tick fire_popup failed");
-                                    } else {
-                                        deferred_secs = 0;
-                                    }
-                                }
-                                signals::DeferOutcome::Defer(next) => {
-                                    // Log only the FIRST defer tick of
-                                    // the stretch so long busy sessions
-                                    // don't spam ~180 lines over 15 min.
-                                    if deferred_secs == 0 {
-                                        tracing::info!(
-                                            elapsed_wall_secs,
-                                            paused_secs = *paused_secs,
-                                            elapsed_active_secs,
-                                            interval_secs,
-                                            "scheduler said FirePopup - deferring (busy)"
-                                        );
-                                    }
-                                    deferred_secs = next;
-                                }
+                            if let Err(e) = fire_popup(
+                                exe,
+                                last_popup,
+                                paused_secs,
+                                popup_pending,
+                                last_heartbeat,
+                                fired,
+                                last_popup_child,
+                                &config.passcode_hash,
+                            ) {
+                                tracing::warn!(error = ?e, "tick fire_popup failed");
                             }
                         }
                         SchedulerDecision::FireCountdown {
