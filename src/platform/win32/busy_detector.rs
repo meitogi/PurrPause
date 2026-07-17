@@ -24,7 +24,16 @@ use crate::signals::quns_state_is_busy;
 /// a busy QUNS state (full-screen game / presentation / D3D), OR any
 /// active WASAPI render session.
 pub fn is_busy() -> bool {
-    quns_busy() || audio_busy()
+    let (quns, audio) = busy_snapshot();
+    quns || audio
+}
+
+/// Same as [`is_busy`] but returns the two component signals
+/// separately (`(quns_busy, audio_busy)`). Useful for logs that need
+/// to distinguish "fullscreen game" from "audio playing in the
+/// background". One call — same COM init cost as `is_busy()`.
+pub fn busy_snapshot() -> (bool, bool) {
+    (quns_busy(), audio_busy())
 }
 
 fn quns_busy() -> bool {

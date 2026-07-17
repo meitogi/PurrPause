@@ -466,7 +466,8 @@ mod win {
                     // 3. Idle accumulation. Signals are read once and
                     //    reused by the fire-decision below.
                     let now = SystemTime::now();
-                    let is_busy_now = busy_detector::is_busy();
+                    let (quns_busy_now, audio_busy_now) = busy_detector::busy_snapshot();
+                    let is_busy_now = quns_busy_now || audio_busy_now;
                     let gamepad_seen = gamepad::gamepad_active_since_last_call();
                     let idle_secs = idle::idle_seconds();
                     let is_idle_now = if config.count_active_time {
@@ -498,11 +499,33 @@ mod win {
                         let next = scheduler::next_popup_at(*last_popup, config, *paused_secs);
                         let remaining_secs =
                             next.duration_since(now).unwrap_or(Duration::ZERO).as_secs();
+                        // Categorical reason so the log reader doesn't
+                        // have to correlate 4 booleans + a threshold by
+                        // eye. Priority order matches "most engaging
+                        // signal first" so a user watching YouTube while
+                        // typing shows as `kbd_mouse`, not `audio`.
+                        let active_reason = if !config.count_active_time {
+                            "wall_clock_mode"
+                        } else if is_idle_now {
+                            "idle"
+                        } else if idle_secs < IDLE_THRESHOLD_SECS {
+                            "kbd_or_mouse"
+                        } else if gamepad_seen {
+                            "gamepad"
+                        } else if quns_busy_now {
+                            "fullscreen_or_presentation"
+                        } else if audio_busy_now {
+                            "audio_playing"
+                        } else {
+                            "unknown"
+                        };
                         tracing::info!(
                             is_idle = is_idle_now,
+                            active_reason,
                             idle_secs,
                             gamepad_seen,
-                            is_busy = is_busy_now,
+                            quns_busy = quns_busy_now,
+                            audio_busy = audio_busy_now,
                             paused_secs = *paused_secs,
                             remaining_secs,
                             count_active_time = config.count_active_time,
