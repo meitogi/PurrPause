@@ -495,12 +495,16 @@ mod win {
                     }
                     ticks_since_state_log += 1;
                     if ticks_since_state_log >= STATE_LOG_EVERY_N_TICKS {
+                        let next = scheduler::next_popup_at(*last_popup, config, *paused_secs);
+                        let remaining_secs =
+                            next.duration_since(now).unwrap_or(Duration::ZERO).as_secs();
                         tracing::info!(
                             is_idle = is_idle_now,
                             idle_secs,
                             gamepad_seen,
                             is_busy = is_busy_now,
                             paused_secs = *paused_secs,
+                            remaining_secs,
                             count_active_time = config.count_active_time,
                             "state snapshot"
                         );
