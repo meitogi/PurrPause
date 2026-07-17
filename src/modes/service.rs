@@ -53,9 +53,11 @@ mod win {
     use crate::modes::install::{webview2_dir, DIAGNOSTICS_CACHE_DIR, SERVICE_NAME, STATE_DAT};
     use crate::platform::win32::proc_kill::kill_orphan_webview2_workers;
     use crate::platform::win32::spawn_user::{RealSpawner, SpawnedChild};
+    use crate::platform::win32::{busy_detector, gamepad, idle, power_notify};
     use crate::platform::{spawn_replacing, spawn_replacing_keyed};
     use crate::runtime_dat;
     use crate::scheduler::{self, SchedulerDecision};
+    use crate::signals;
 
     const TICK_INTERVAL: Duration = Duration::from_secs(5);
     const DEBOUNCE: Duration = Duration::from_millis(300);
@@ -112,39 +114,97 @@ mod win {
         let state_path = PathBuf::from(STATE_DAT);
         let mut config = config::load_or_default(&state_path);
         let now = SystemTime::now();
-        // Session-1 shim : runtime_dat::read() now returns the full v2
-        // RuntimeState. The scheduler's active-time fields (paused_secs,
-        // popup_pending, last_heartbeat) are session-3 wiring, so we
-        // extract only .last_popup and feed zero placeholders below —
-        // preserves wall-clock behaviour bit-for-bit.
-        let runtime_state = runtime_dat::read();
-        let runtime_last = runtime_state.as_ref().map(|s| s.last_popup);
-        let had_runtime = runtime_last.is_some();
-        let mut last_popup = scheduler::resolve_last_popup(
-            scheduler::ResolveInputs {
-                now,
-                last_popup: runtime_last,
-                first_install_at: config.first_install_at(),
-                is_reload: false,
-                paused_secs: 0,
-                popup_pending: false,
-                last_heartbeat: SystemTime::UNIX_EPOCH,
-            },
-            &config,
-        );
-        // Persist the resolved timestamp so a mid-cycle restart doesn't
-        // re-enter the migration branch and re-derive from scratch.
-        if !had_runtime {
-            let _ = runtime_dat::write(&runtime_dat::RuntimeState {
-                last_popup,
-                paused_secs: 0,
-                popup_pending: false,
-                last_heartbeat: SystemTime::UNIX_EPOCH,
-            });
-        }
-        let mut fired = scheduler::derive_already_fired(now, &config, last_popup, 0);
+        // Cold-start dispatch. No runtime.dat → fresh-install / migrated
+        // 0.6.x path via resolve_last_popup (anti-cheat shift). Present
+        // runtime.dat → active-time A/B/C via resolve_cold_start :
+        //   A (elapsed >= 2 × interval)     → full reset
+        //   B (popup_pending && downtime < 30 min) → relaunch immediately
+        //   C (else)                        → absorb downtime into
+        //                                    paused_secs, keep cycle
+        let (mut last_popup, mut paused_secs, mut popup_pending, relaunch_now) =
+            match runtime_dat::read() {
+                None => {
+                    let lp = scheduler::resolve_last_popup(
+                        scheduler::ResolveInputs {
+                            now,
+                            last_popup: None,
+                            first_install_at: config.first_install_at(),
+                            is_reload: false,
+                            paused_secs: 0,
+                            popup_pending: false,
+                            last_heartbeat: SystemTime::UNIX_EPOCH,
+                        },
+                        &config,
+                    );
+                    let _ = runtime_dat::write(&runtime_dat::RuntimeState {
+                        last_popup: lp,
+                        paused_secs: 0,
+                        popup_pending: false,
+                        last_heartbeat: now,
+                    });
+                    tracing::info!(
+                        path = "no-runtime-dat",
+                        seeded_last_popup = ?lp,
+                        "cold-start: fresh install or migrated 0.6.x"
+                    );
+                    (lp, 0u64, false, false)
+                }
+                Some(state) => {
+                    let downtime_secs = now
+                        .duration_since(state.last_heartbeat)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    let d = scheduler::resolve_cold_start(
+                        scheduler::ResolveInputs {
+                            now,
+                            last_popup: Some(state.last_popup),
+                            first_install_at: config.first_install_at(),
+                            is_reload: false,
+                            paused_secs: state.paused_secs,
+                            popup_pending: state.popup_pending,
+                            last_heartbeat: state.last_heartbeat,
+                        },
+                        &config,
+                    );
+                    // Rule identification for bug-report clarity. Derived
+                    // from the decision : Rule B is uniquely marked by
+                    // relaunch_now = true ; Rule A resets last_popup to
+                    // now AND clears both paused_secs and popup_pending ;
+                    // everything else is Rule C (kept cycle, absorbed
+                    // downtime).
+                    let rule = if d.relaunch_now {
+                        "B (relaunch pending popup, downtime < 30 min)"
+                    } else if d.last_popup >= now
+                        && d.paused_secs == 0
+                        && !d.popup_pending
+                    {
+                        "A (elapsed >= 2 x interval, full reset)"
+                    } else {
+                        "C (keep cycle, absorb downtime into paused_secs)"
+                    };
+                    tracing::info!(
+                        path = "with-runtime-dat",
+                        rule,
+                        downtime_secs,
+                        prior_last_popup = ?state.last_popup,
+                        prior_paused_secs = state.paused_secs,
+                        prior_popup_pending = state.popup_pending,
+                        new_last_popup = ?d.last_popup,
+                        new_paused_secs = d.paused_secs,
+                        new_popup_pending = d.popup_pending,
+                        relaunch_now = d.relaunch_now,
+                        "cold-start: A/B/C dispatch"
+                    );
+                    (d.last_popup, d.paused_secs, d.popup_pending, d.relaunch_now)
+                }
+            };
+        let mut last_heartbeat = now;
+        let mut fired = scheduler::derive_already_fired(now, &config, last_popup, paused_secs);
         tracing::info!(
             initial_paliers_fired = ?fired,
+            paused_secs,
+            popup_pending,
+            relaunch_now,
             "scheduler initialised"
         );
 
@@ -158,6 +218,13 @@ mod win {
         let notify_running_flag = Arc::new(AtomicBool::new(true));
         let notify_thread = spawn_notify(tx.clone(), notify_running_flag.clone());
 
+        // Suspend / resume broadcast listener. Guard is held for the
+        // lifetime of run_service ; Drop tears down the pump thread and
+        // unregisters the notification.
+        let (power_tx, power_rx) = mpsc::channel::<power_notify::PowerEvent>();
+        let _power_guard =
+            power_notify::install(power_tx).context("power_notify::install")?;
+
         // Track spawned children so we can TerminateProcess a stale
         // predecessor before spawning a replacement — the post-countdown
         // unlock (0.7.1 Track A) lets a user Alt+Tab away from a still-
@@ -167,15 +234,37 @@ mod win {
         let mut last_popup_child: Option<SpawnedChild> = None;
         let mut last_widget_children: HashMap<u32, SpawnedChild> = HashMap::new();
 
+        // Rule B : runtime.dat said popup_pending && downtime < 30 min
+        // when we cold-booted. Fire the popup before entering the tick
+        // loop so the user sees it as soon as the service is ready.
+        if relaunch_now {
+            tracing::info!("cold-start Rule B: relaunching pending popup");
+            if let Err(e) = fire_popup(
+                &exe,
+                &mut last_popup,
+                &mut paused_secs,
+                &mut popup_pending,
+                &mut last_heartbeat,
+                &mut fired,
+                &mut last_popup_child,
+            ) {
+                tracing::warn!(error = ?e, "Rule B relaunch failed - will retry on next tick");
+            }
+        }
+
         // Main tick loop.
         let loop_result = tick_loop(
             &mut config,
             &mut last_popup,
+            &mut paused_secs,
+            &mut popup_pending,
+            &mut last_heartbeat,
             &mut fired,
             &mut last_popup_child,
             &mut last_widget_children,
             &exe,
             &rx,
+            power_rx,
         );
 
         // Signal shutdown.
@@ -210,15 +299,45 @@ mod win {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn tick_loop(
         config: &mut Config,
         last_popup: &mut SystemTime,
+        paused_secs: &mut u64,
+        popup_pending: &mut bool,
+        last_heartbeat: &mut SystemTime,
         fired: &mut std::collections::HashSet<u32>,
         last_popup_child: &mut Option<SpawnedChild>,
         last_widget_children: &mut HashMap<u32, SpawnedChild>,
         exe: &Path,
         rx: &mpsc::Receiver<TickCommand>,
+        power_rx: mpsc::Receiver<power_notify::PowerEvent>,
     ) -> Result<()> {
+        // 60 s idle threshold is hard-coded for session 3 ; session 5
+        // replaces it with the `idle_pause_minutes` config field.
+        const IDLE_THRESHOLD_SECS: u64 = 60;
+        // Cap for the video / fullscreen / audio deferral. Beyond this
+        // the popup fires regardless of busy state — the user has been
+        // "busy" for 15 min already, we're going to interrupt anyway.
+        const MAX_DEFERRAL_SECS: u64 = 15 * 60;
+        // Heartbeat cadence : every 6th timeout tick (~30 s at 5 s
+        // TICK_INTERVAL). Fire-path already persists eagerly ; this
+        // covers pure-idle stretches so downtime detection at next
+        // cold-boot has ≤30 s resolution (RESUME_WINDOW is 30 min, so
+        // Rule B stays correct with ~60× headroom).
+        const HEARTBEAT_EVERY_N_TICKS: u32 = 6;
+
+        let tick_delta_secs = TICK_INTERVAL.as_secs();
+        let mut deferred_secs: u64 = 0;
+        let mut suspended_at: Option<SystemTime> = None;
+        let mut ticks_since_write: u32 = 0;
+        // `was_idle = None` means "never observed yet" — the first tick's
+        // idle transition log will read as a seed. After that, every
+        // active↔inactive flip emits a single log line with the three
+        // component signals so bug reports show why the counter did or
+        // didn't advance.
+        let mut was_idle: Option<bool> = None;
+
         loop {
             match rx.recv_timeout(TICK_INTERVAL) {
                 Ok(TickCommand::Shutdown) => {
@@ -227,7 +346,15 @@ mod win {
                 }
                 Ok(TickCommand::Trigger) => {
                     tracing::info!("TriggerPopupNow received");
-                    if let Err(e) = fire_popup(exe, last_popup, fired, last_popup_child) {
+                    if let Err(e) = fire_popup(
+                        exe,
+                        last_popup,
+                        paused_secs,
+                        popup_pending,
+                        last_heartbeat,
+                        fired,
+                        last_popup_child,
+                    ) {
                         tracing::warn!(error = ?e, "trigger popup failed");
                     }
                 }
@@ -247,9 +374,9 @@ mod win {
                             last_popup: Some(*last_popup),
                             first_install_at: config.first_install_at(),
                             is_reload: true,
-                            paused_secs: 0,
-                            popup_pending: false,
-                            last_heartbeat: SystemTime::UNIX_EPOCH,
+                            paused_secs: *paused_secs,
+                            popup_pending: *popup_pending,
+                            last_heartbeat: *last_heartbeat,
                         },
                         config,
                     );
@@ -260,25 +387,200 @@ mod win {
                             "reload: interval reduced, clamping last_popup forward",
                         );
                         *last_popup = clamped;
+                        *last_heartbeat = now;
                         let _ = runtime_dat::write(&runtime_dat::RuntimeState {
                             last_popup: *last_popup,
-                            paused_secs: 0,
-                            popup_pending: false,
-                            last_heartbeat: SystemTime::UNIX_EPOCH,
+                            paused_secs: *paused_secs,
+                            popup_pending: *popup_pending,
+                            last_heartbeat: *last_heartbeat,
                         });
                     }
-                    *fired = scheduler::derive_already_fired(now, config, *last_popup, 0);
+                    *fired = scheduler::derive_already_fired(
+                        now,
+                        config,
+                        *last_popup,
+                        *paused_secs,
+                    );
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
-                    if let Err(e) = maybe_fire(
+                    // 1. Drain power events. Suspend timestamps are
+                    //    captured wall-clock inside the pump thread's
+                    //    wndproc, so the delta is accurate regardless
+                    //    of receive latency.
+                    while let Ok(evt) = power_rx.try_recv() {
+                        match evt {
+                            power_notify::PowerEvent::Suspend(ts) => {
+                                suspended_at = Some(ts);
+                            }
+                            power_notify::PowerEvent::Resume(ts) => {
+                                if let Some(sus) = suspended_at.take() {
+                                    if let Ok(delta) = ts.duration_since(sus) {
+                                        let delta_secs = delta.as_secs();
+                                        *paused_secs += delta_secs;
+                                        tracing::info!(
+                                            sleep_secs = delta_secs,
+                                            paused_secs_after = *paused_secs,
+                                            "power resume: sleep duration absorbed into paused_secs"
+                                        );
+                                    }
+                                } else {
+                                    tracing::info!(
+                                        "power resume without matching suspend (service was down at suspend, cold-start absorbed downtime)"
+                                    );
+                                }
+                            }
+                        }
+                    }
+
+                    // 2. Detect popup exit (Dismiss button OR the
+                    //    countdown-then-close path both terminate the
+                    //    popup process).
+                    if *popup_pending {
+                        if let Some(child) = last_popup_child.as_ref() {
+                            if child.try_wait_exited() {
+                                *popup_pending = false;
+                                tracing::info!(
+                                    paused_secs = *paused_secs,
+                                    "popup child exited - clearing popup_pending"
+                                );
+                            }
+                        }
+                    }
+
+                    // 3. Idle accumulation. Signals are read once and
+                    //    reused by the fire-decision below.
+                    let now = SystemTime::now();
+                    let is_busy_now = busy_detector::is_busy();
+                    let gamepad_seen = gamepad::gamepad_active_since_last_call();
+                    let idle_secs = idle::idle_seconds();
+                    let is_idle_now = signals::idle_tick_should_pause(
+                        idle_secs,
+                        IDLE_THRESHOLD_SECS,
+                        gamepad_seen,
+                        is_busy_now,
+                    );
+                    if is_idle_now {
+                        *paused_secs += tick_delta_secs;
+                    }
+                    if was_idle != Some(is_idle_now) {
+                        tracing::info!(
+                            transition = if is_idle_now { "active -> inactive" } else { "inactive -> active" },
+                            idle_secs,
+                            gamepad_seen,
+                            is_busy = is_busy_now,
+                            paused_secs = *paused_secs,
+                            "idle state changed"
+                        );
+                        was_idle = Some(is_idle_now);
+                    }
+
+                    // 4. Scheduler decision, with video / audio deferral
+                    //    when the fire lands during a busy stretch.
+                    match scheduler::next_event(
+                        now,
                         config,
-                        last_popup,
+                        *last_popup,
+                        *paused_secs,
                         fired,
-                        last_popup_child,
-                        last_widget_children,
-                        exe,
                     ) {
-                        tracing::warn!(error = ?e, "tick maybe_fire failed");
+                        SchedulerDecision::Nothing => {}
+                        SchedulerDecision::FirePopup => {
+                            // Fire-decision context. Elapsed_active is
+                            // the metric the scheduler used to decide
+                            // fire ; logging it alongside the interval
+                            // makes "why did the popup fire now ?" a
+                            // one-line answer in the service log.
+                            let elapsed_wall_secs = now
+                                .duration_since(*last_popup)
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0);
+                            let elapsed_active_secs =
+                                elapsed_wall_secs.saturating_sub(*paused_secs);
+                            let interval_secs =
+                                scheduler::interval(config).as_secs();
+                            let decision = signals::busy_defer_decision(
+                                is_busy_now,
+                                deferred_secs,
+                                tick_delta_secs,
+                                MAX_DEFERRAL_SECS,
+                            );
+                            match decision {
+                                signals::DeferOutcome::Fire
+                                | signals::DeferOutcome::ForceFire => {
+                                    // Actual fire — log once with full
+                                    // context so bug reports show why.
+                                    tracing::info!(
+                                        elapsed_wall_secs,
+                                        paused_secs = *paused_secs,
+                                        elapsed_active_secs,
+                                        interval_secs,
+                                        is_busy = is_busy_now,
+                                        deferred_secs,
+                                        verdict = if matches!(decision, signals::DeferOutcome::ForceFire) { "ForceFire (defer cap hit)" } else { "Fire" },
+                                        "scheduler said FirePopup - firing"
+                                    );
+                                    if let Err(e) = fire_popup(
+                                        exe,
+                                        last_popup,
+                                        paused_secs,
+                                        popup_pending,
+                                        last_heartbeat,
+                                        fired,
+                                        last_popup_child,
+                                    ) {
+                                        tracing::warn!(error = ?e, "tick fire_popup failed");
+                                    } else {
+                                        deferred_secs = 0;
+                                    }
+                                }
+                                signals::DeferOutcome::Defer(next) => {
+                                    // Log only the FIRST defer tick of
+                                    // the stretch so long busy sessions
+                                    // don't spam ~180 lines over 15 min.
+                                    if deferred_secs == 0 {
+                                        tracing::info!(
+                                            elapsed_wall_secs,
+                                            paused_secs = *paused_secs,
+                                            elapsed_active_secs,
+                                            interval_secs,
+                                            "scheduler said FirePopup - deferring (busy)"
+                                        );
+                                    }
+                                    deferred_secs = next;
+                                }
+                            }
+                        }
+                        SchedulerDecision::FireCountdown {
+                            palier_minutes,
+                            seconds_until_popup,
+                        } => {
+                            if let Err(e) = fire_countdown(
+                                exe,
+                                palier_minutes,
+                                seconds_until_popup,
+                                fired,
+                                last_widget_children,
+                            ) {
+                                tracing::warn!(error = ?e, "tick fire_countdown failed");
+                            }
+                        }
+                    }
+
+                    // 5. Throttled heartbeat (~30 s cadence). The fire
+                    //    path persists eagerly so we don't double-write
+                    //    on the same tick.
+                    *last_heartbeat = now;
+                    ticks_since_write += 1;
+                    if ticks_since_write >= HEARTBEAT_EVERY_N_TICKS {
+                        ticks_since_write = 0;
+                        if let Err(e) = runtime_dat::write(&runtime_dat::RuntimeState {
+                            last_popup: *last_popup,
+                            paused_secs: *paused_secs,
+                            popup_pending: *popup_pending,
+                            last_heartbeat: *last_heartbeat,
+                        }) {
+                            tracing::warn!(error = ?e, "heartbeat runtime.dat write failed");
+                        }
                     }
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -289,34 +591,12 @@ mod win {
         }
     }
 
-    fn maybe_fire(
-        config: &Config,
-        last_popup: &mut SystemTime,
-        fired: &mut std::collections::HashSet<u32>,
-        last_popup_child: &mut Option<SpawnedChild>,
-        last_widget_children: &mut HashMap<u32, SpawnedChild>,
-        exe: &Path,
-    ) -> Result<()> {
-        let now = SystemTime::now();
-        match scheduler::next_event(now, config, *last_popup, 0, fired) {
-            SchedulerDecision::Nothing => Ok(()),
-            SchedulerDecision::FirePopup => fire_popup(exe, last_popup, fired, last_popup_child),
-            SchedulerDecision::FireCountdown {
-                palier_minutes,
-                seconds_until_popup,
-            } => fire_countdown(
-                exe,
-                palier_minutes,
-                seconds_until_popup,
-                fired,
-                last_widget_children,
-            ),
-        }
-    }
-
     fn fire_popup(
         exe: &Path,
         last_popup: &mut SystemTime,
+        paused_secs: &mut u64,
+        popup_pending: &mut bool,
+        last_heartbeat: &mut SystemTime,
         fired: &mut std::collections::HashSet<u32>,
         last_popup_child: &mut Option<SpawnedChild>,
     ) -> Result<()> {
@@ -340,12 +620,15 @@ mod win {
                 tracing::info!(pid = child.pid, "popup child spawned");
                 let now = SystemTime::now();
                 *last_popup = now;
+                *paused_secs = 0;
+                *popup_pending = true;
+                *last_heartbeat = now;
                 fired.clear();
                 if let Err(e) = runtime_dat::write(&runtime_dat::RuntimeState {
                     last_popup: now,
                     paused_secs: 0,
-                    popup_pending: false,
-                    last_heartbeat: SystemTime::UNIX_EPOCH,
+                    popup_pending: true,
+                    last_heartbeat: now,
                 }) {
                     tracing::warn!(error = ?e, "write runtime.dat failed");
                 }

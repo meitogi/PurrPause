@@ -1,8 +1,3 @@
-// Session 3 will install the guard from `modes::service` and drain
-// the `PowerEvent` channel ; until then the module has no production
-// caller. Remove this attribute at wire-up time.
-#![allow(dead_code)]
-
 // Suspend / resume broadcast listener. A hidden message-only window
 // registers for `WM_POWERBROADCAST` via
 // `RegisterSuspendResumeNotification` and forwards the two events the

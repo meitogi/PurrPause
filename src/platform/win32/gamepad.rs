@@ -1,8 +1,3 @@
-// Session 3 will call `gamepad_active_since_last_call()` from
-// `modes::service` ; until then the module has no production caller.
-// Remove this attribute at wire-up time.
-#![allow(dead_code)]
-
 // XInput poll + diff signal. `LASTINPUTINFO` only tracks keyboard +
 // mouse, so a couch-gaming session where the user only touches a pad
 // would appear idle without this. Called from the service tick (~30 s

@@ -1,8 +1,3 @@
-// Session 3 will call `is_busy()` from `modes::service` for the
-// deferral logic ; until then the module has no production caller.
-// Remove this attribute at wire-up time.
-#![allow(dead_code)]
-
 // Busy-context detector : `SHQueryUserNotificationState` covers
 // fullscreen game / presentation / QUNS_BUSY ; WASAPI covers "audio is
 // playing" (YouTube on the second monitor, Spotify in the background,

@@ -34,9 +34,10 @@ use windows::Win32::Security::{
 };
 use windows::Win32::System::Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock};
 use windows::Win32::System::RemoteDesktop::{WTSGetActiveConsoleSessionId, WTSQueryUserToken};
+use windows::Win32::Foundation::WAIT_OBJECT_0;
 use windows::Win32::System::Threading::{
-    CreateProcessAsUserW, TerminateProcess, CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT,
-    NORMAL_PRIORITY_CLASS, PROCESS_INFORMATION, STARTUPINFOW,
+    CreateProcessAsUserW, TerminateProcess, WaitForSingleObject, CREATE_NO_WINDOW,
+    CREATE_UNICODE_ENVIRONMENT, NORMAL_PRIORITY_CLASS, PROCESS_INFORMATION, STARTUPINFOW,
 };
 
 use crate::platform::argv::build_command_line;
@@ -71,6 +72,17 @@ impl SpawnedChild {
                 "TerminateProcess (best effort — process may already be dead)"
             ),
         }
+    }
+
+    /// Non-blocking check for process termination. Wraps
+    /// `WaitForSingleObject(handle, 0)`. Returns true only on
+    /// `WAIT_OBJECT_0` (process signaled = exited) ; any other
+    /// outcome (`WAIT_TIMEOUT` = still running, `WAIT_FAILED`) is
+    /// treated as still-alive so a transient API failure never
+    /// causes the caller to spuriously clear popup_pending.
+    pub fn try_wait_exited(&self) -> bool {
+        let r = unsafe { WaitForSingleObject(self.handle, 0) };
+        r == WAIT_OBJECT_0
     }
 }
 

@@ -1,8 +1,3 @@
-// Session 3 will call `idle_seconds()` from `modes::service` ; until
-// then the module has no production caller. Remove this attribute at
-// wire-up time.
-#![allow(dead_code)]
-
 // Keyboard + mouse idleness signal, feeding the mid-cycle
 // `paused_secs` bookkeeping. Does NOT detect gamepad activity —
 // `LASTINPUTINFO` only reflects HID keyboard + mouse input, not XInput
