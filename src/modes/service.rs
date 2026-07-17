@@ -466,7 +466,8 @@ mod win {
                     // 3. Idle accumulation. Signals are read once and
                     //    reused by the fire-decision below.
                     let now = SystemTime::now();
-                    let (quns_busy_now, audio_busy_now) = busy_detector::busy_snapshot();
+                    let (quns_state_now, quns_busy_now, audio_busy_now) =
+                        busy_detector::busy_snapshot();
                     let is_busy_now = quns_busy_now || audio_busy_now;
                     let gamepad_seen = gamepad::gamepad_active_since_last_call();
                     let idle_secs = idle::idle_seconds();
@@ -524,6 +525,7 @@ mod win {
                             active_reason,
                             idle_secs,
                             gamepad_seen,
+                            quns_state = quns_state_now,
                             quns_busy = quns_busy_now,
                             audio_busy = audio_busy_now,
                             paused_secs = *paused_secs,

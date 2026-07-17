@@ -24,24 +24,31 @@ use crate::signals::quns_state_is_busy;
 /// a busy QUNS state (full-screen game / presentation / D3D), OR any
 /// active WASAPI render session.
 pub fn is_busy() -> bool {
-    let (quns, audio) = busy_snapshot();
+    let (_, quns, audio) = busy_snapshot();
     quns || audio
 }
 
-/// Same as [`is_busy`] but returns the two component signals
-/// separately (`(quns_busy, audio_busy)`). Useful for logs that need
-/// to distinguish "fullscreen game" from "audio playing in the
-/// background". One call — same COM init cost as `is_busy()`.
-pub fn busy_snapshot() -> (bool, bool) {
-    (quns_busy(), audio_busy())
+/// Returns `(quns_state_raw, quns_busy, audio_busy)`. `quns_state_raw`
+/// is the exact `SHQueryUserNotificationState` return value (1..=7 per
+/// the QUERY_USER_NOTIFICATION_STATE enum, or 0 on API failure) so logs
+/// can distinguish `QUNS_BUSY` (2, Focus Assist / DND) from
+/// `QUNS_D3D_FULL_SCREEN` (3) from `QUNS_PRESENTATION_MODE` (4). All
+/// three collapse to `quns_busy = true` via
+/// [`crate::signals::quns_state_is_busy`], the boolean the scheduler
+/// consumes. `audio_busy` is any active WASAPI render session. One
+/// call — same COM init cost as `is_busy()`.
+pub fn busy_snapshot() -> (u32, bool, bool) {
+    let quns_raw = quns_state_raw();
+    (quns_raw, quns_state_is_busy(quns_raw), audio_busy())
 }
 
-fn quns_busy() -> bool {
-    // Failure treated as "not busy" — err on the side of firing the
-    // popup rather than silently deferring on a Shell API glitch.
+fn quns_state_raw() -> u32 {
+    // Failure treated as 0 (out-of-range → quns_state_is_busy returns
+    // false) so a Shell API glitch defaults to "not busy" and errs
+    // toward firing the popup rather than silently deferring forever.
     match unsafe { SHQueryUserNotificationState() } {
-        Ok(state) => quns_state_is_busy(state.0 as u32),
-        Err(_) => false,
+        Ok(state) => state.0 as u32,
+        Err(_) => 0,
     }
 }
 
