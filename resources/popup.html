@@ -264,7 +264,8 @@
 <body data-remaining-seconds="{{ COUNTDOWN_SECONDS }}"
       data-animation-path="{{ ANIMATION_PATH }}"
       data-countdown-template="{{ COUNTDOWN_TEMPLATE }}"
-      data-mode="{{ POPUP_MODE }}">
+      data-mode="{{ POPUP_MODE }}"
+      data-debug="{{ DEBUG_MODE }}">
   <!-- <dotlottie-wc> is mounted by JS in the module script below, AFTER
        setWasmUrl() has pinned the vendored WASM URL. Putting the element
        in the initial HTML races the constructor's _initWasm() against
@@ -285,7 +286,7 @@
     Pincode incorrect, patientez jusqu'&agrave; la fin du minuteur
   </div>
 
-  <!-- Rust → WebView bridge for Alt+pincode capture. Rust calls
+  <!-- Rust → WebView bridge for Ctrl+Shift+pincode capture. Rust calls
        window.purrpauseOnEvent({kind, ...}) via wry's evaluate_script on
        every accepted digit / cancel / failed verify / lockout. The
        actual argon2id verify + dismiss happen on the Rust side ; this
@@ -321,6 +322,252 @@
     })();
   </script>
 
+  <!-- WebView2-side keyboard capture. Primary pincode surface on
+       environments where the Win32 LL hook + tao WindowEvent both
+       come back empty (some hypervisor keyboard passthroughs route
+       keystrokes to the Chromium renderer without touching the guest
+       OS input queue). The renderer has its own IPC pipeline from
+       the WebContent process, which most passthroughs leave alone.
+       Live visible debug panel next to the capture logic so the
+       behaviour can be diagnosed without pulling widget.log. Every
+       keydown is posted as `pincode:web:<key>:<code>:<ctrl>:<shift>:<alt>:<meta>`
+       for the audit trail ; the buffer + submit trigger live in JS. -->
+  <style>
+    .keylog-panel {
+      position: fixed;
+      top: 8px; left: 8px;
+      z-index: 999;
+      max-width: 60vw;
+      max-height: 40vh;
+      overflow-y: auto;
+      background: rgba(0, 0, 0, 0.78);
+      color: #b6ffb6;
+      font: 11px/1.35 ui-monospace, "SF Mono", Menlo, monospace;
+      padding: 6px 10px;
+      border-radius: 6px;
+      pointer-events: none;
+      user-select: none;
+      white-space: pre-wrap;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+      display: none; /* hidden in prod ; opt-in below */
+    }
+    body[data-debug="true"] .keylog-panel { display: block; }
+    body[data-mode="preview"] .keylog-panel { display: block; }
+    .keylog-panel .header { color: #ffd966; font-weight: 700; margin-bottom: 4px; }
+    .keylog-panel .row-key { color: #b6ffb6; }
+    .keylog-panel .row-focus { color: #8ec7ff; }
+    .keylog-panel .row-vis { color: #ffaaff; }
+  </style>
+  <div class="keylog-panel" id="keylog-panel"><div class="header">pincode capture (WebView surface)</div></div>
+  <script>
+    (function () {
+      // Pincode emergency-unlock capture, JavaScript-side.
+      //
+      // The Rust process-wide LL keyboard hook is the intended capture
+      // surface, but on some VM keyboard passthroughs (notably Parallels
+      // on Apple Silicon) LL hook callbacks never fire — the hypervisor
+      // routes keystrokes to the Chromium renderer inside WebView2
+      // without touching the Windows guest input queue. Doing the
+      // capture here in JS bypasses that gap : keydowns land in the
+      // renderer, the buffer is built here, and only a completed
+      // pincode string is posted to Rust via `window.ipc.postMessage`
+      // for argon2id verification.
+      //
+      // Semantic — "hold a modifier to open a capture window ; press
+      // Enter inside the window to validate ; release the modifier or
+      // press Escape to abort" :
+      //
+      //   • modifier held (Ctrl / Shift / Alt) + digit keydown → buffer
+      //     grows one char, asterisks visible pincode row shows N stars
+      //   • Enter with buffer non-empty (modifier still held or not,
+      //     see release semantics below) → post `pincode:submit:XXXX`
+      //     to Rust, buffer cleared. Rust runs argon2id verify, either
+      //     ControlFlow::Exit's the popup or increments the popup-
+      //     scoped fail counter (3 fails → locked=true from Rust).
+      //   • modifier release with buffer still non-empty → SILENT
+      //     cancel + clear (no submit). Prevents accidental release
+      //     from wasting an attempt. Enter after release is a no-op
+      //     because the buffer is already empty.
+      //   • Escape any time → cancel + clear.
+      //   • locked flag from Rust `purrpauseOnEvent({kind:'locked'})`
+      //     absorbs subsequent digits silently for the rest of the
+      //     popup's lifetime (matches popup-scoped, non-time-based
+      //     lockout semantic used elsewhere in the popup).
+      //
+      // Length-hiding : Enter is the ONLY submit trigger. There is no
+      // auto-submit at any specific buffer length, and modifier release
+      // is uniformly silent regardless of how many digits were typed.
+      // Combined with argon2id::verify being constant-time on match
+      // vs mismatch, wrong-length attempts are indistinguishable from
+      // wrong-content ones — the passcode's actual length never leaks
+      // via popup behaviour. MAX_BUFFER is a memory-safety cap only.
+      // NO length gate : we deliberately submit any-length buffer on
+      // modifier release so the actual passcode length never leaks to
+      // an observer. argon2id::verify is constant-time on match vs
+      // mismatch and rejects both wrong-length and wrong-content
+      // uniformly. MAX_BUFFER is just an overflow guard against a
+      // stuck-modifier + repeat-key scenario.
+      const MAX_BUFFER = 32;
+      const panel = document.getElementById('keylog-panel');
+      const ast = document.getElementById('pincode-asterisks');
+      let buffer = '';
+      let locked = false;
+      const push = (cls, text) => {
+        if (!panel) return;
+        const row = document.createElement('div');
+        row.className = cls;
+        row.textContent = text;
+        panel.appendChild(row);
+        while (panel.childElementCount > 60) panel.removeChild(panel.children[1]);
+        panel.scrollTop = panel.scrollHeight;
+      };
+      const stamp = () => new Date().toISOString().slice(11, 23);
+      const post = m => {
+        try {
+          if (window.ipc && typeof window.ipc.postMessage === 'function') {
+            window.ipc.postMessage(m);
+          }
+        } catch (e) { push('row-key', stamp() + ' ipc-error: ' + e); }
+      };
+      const renderAsterisks = () => {
+        if (!ast) return;
+        if (buffer.length === 0) {
+          ast.textContent = '';
+          ast.classList.remove('visible');
+        } else {
+          ast.classList.add('visible');
+          ast.textContent = '*'.repeat(buffer.length);
+        }
+      };
+      const anyModifier = e => e.ctrlKey || e.shiftKey || e.altKey || e.metaKey;
+      const isModifierKey = e => (
+        e.key === 'Control' || e.key === 'Shift' ||
+        e.key === 'Alt' || e.key === 'Meta' ||
+        e.key === 'CapsLock'
+      );
+      const resetBuffer = (why) => {
+        if (buffer.length > 0) {
+          push('row-focus', stamp() + ' buffer cleared (' + why + ')');
+          buffer = '';
+          renderAsterisks();
+          post('pincode:cancel');
+        }
+      };
+      const submitBuffer = () => {
+        const s = buffer;
+        buffer = '';
+        // Keep asterisks visible during verify — Rust flips them via
+        // purrpauseOnEvent locked / cancel / ok when it decides.
+        push('row-focus', stamp() + ' submitting pincode len=' + s.length);
+        post('pincode:submit:' + s);
+      };
+
+      // Rust → WebView lock signal (already wired via purrpauseOnEvent
+      // in the original popup.html). We piggyback : mark locked=true
+      // when Rust dispatches 'locked' so we absorb subsequent digits
+      // silently. purrpauseOnEvent is defined earlier in this file.
+      const prev = window.purrpauseOnEvent;
+      window.purrpauseOnEvent = function (evt) {
+        if (evt && evt.kind === 'locked') {
+          locked = true;
+          buffer = '';
+        }
+        if (evt && (evt.kind === 'fail' || evt.kind === 'cancel')) {
+          buffer = '';
+          renderAsterisks();
+        }
+        if (typeof prev === 'function') prev(evt);
+      };
+
+      document.addEventListener('keydown', e => {
+        push('row-key', stamp() + ' keydown key=' + JSON.stringify(e.key) +
+             ' code=' + e.code +
+             ' ctrl=' + e.ctrlKey + ' shift=' + e.shiftKey +
+             ' alt=' + e.altKey + ' meta=' + e.metaKey +
+             (e.repeat ? ' repeat' : ''));
+        post('pincode:web:keydown:' + e.key + ':' + e.code + ':' +
+             (e.ctrlKey?1:0) + ':' + (e.shiftKey?1:0) + ':' +
+             (e.altKey?1:0) + ':' + (e.metaKey?1:0));
+        if (locked) return;
+        if (e.key === 'Escape') {
+          e.preventDefault();
+          resetBuffer('escape');
+          return;
+        }
+        // Enter with buffer non-empty is the sole submit trigger.
+        // Fires immediately on keydown regardless of whether Ctrl (or
+        // any other modifier) is still held — the user typed digits
+        // and then Enter, that's a complete intent. Empty buffer is a
+        // no-op (also the state after a prior modifier release wiped
+        // the buffer, so a bare Enter never accidentally submits).
+        if (e.key === 'Enter' && buffer.length > 0) {
+          e.preventDefault();
+          submitBuffer();
+          return;
+        }
+        // Digit while a modifier is held → push to buffer. Modifier
+        // requirement gates accidental digit-mashing from filling the
+        // buffer between explicit unlock attempts. MAX_BUFFER is a
+        // memory-safety guard against a stuck-modifier + auto-repeat
+        // scenario, never an intentional length limit.
+        if (typeof e.key === 'string' && e.key.length === 1 &&
+            e.key >= '0' && e.key <= '9' && anyModifier(e) && !e.repeat) {
+          if (buffer.length < MAX_BUFFER) {
+            buffer += e.key;
+            push('row-focus', stamp() + ' buffer += ' + e.key +
+                 ' len=' + buffer.length);
+            renderAsterisks();
+            post('pincode:digit:' + e.key);
+            e.preventDefault();
+          }
+          return;
+        }
+        // Any non-modifier non-digit non-Enter while a buffer is
+        // building → cancel. Kid types Ctrl+1+2+letter → the letter
+        // aborts the attempt, no wasted try.
+        if (buffer.length > 0 && !isModifierKey(e) &&
+            e.key !== 'Enter' &&
+            !(e.key.length === 1 && e.key >= '0' && e.key <= '9')) {
+          resetBuffer('non-digit non-modifier');
+        }
+      }, true);
+
+      document.addEventListener('keyup', e => {
+        push('row-key', stamp() + ' keyup   key=' + JSON.stringify(e.key) +
+             ' code=' + e.code +
+             ' ctrl=' + e.ctrlKey + ' shift=' + e.shiftKey +
+             ' alt=' + e.altKey + ' meta=' + e.metaKey);
+        post('pincode:web:keyup:' + e.key + ':' + e.code);
+        if (locked) return;
+        // Modifier release with no other modifier still held closes
+        // the capture window without validating. Silent cancel : an
+        // accidental Ctrl-release never consumes an attempt. Buffer
+        // must have content ; empty release is a no-op (typically the
+        // case right after a successful Enter submit cleared it).
+        if (isModifierKey(e) && !anyModifier(e) && buffer.length > 0) {
+          resetBuffer('modifier released without Enter');
+        }
+      }, true);
+
+      window.addEventListener('focus', () => {
+        push('row-focus', stamp() + ' window.focus');
+        post('pincode:web:focus');
+      });
+      window.addEventListener('blur', () => {
+        push('row-focus', stamp() + ' window.blur');
+        post('pincode:web:blur');
+      });
+      document.addEventListener('visibilitychange', () => {
+        push('row-vis', stamp() + ' visibility=' + document.visibilityState);
+        post('pincode:web:visibility:' + document.visibilityState);
+      });
+
+      push('row-focus', stamp() + ' JS pincode ready cap=' + CAP +
+           ' hasFocus=' + document.hasFocus());
+      post('pincode:web:boot:hasFocus=' + document.hasFocus());
+    })();
+  </script>
+
   <!-- Preview shim: swaps {{ NAME }} placeholders with defaults when ?preview=1 is set. -->
   <script>
     (function () {
@@ -353,6 +600,7 @@
         ANIMATION_PATH: animPath(currentAnim),
         COUNTDOWN_SECONDS: params.get('countdown') || '300',
         POPUP_MODE: 'live',
+        DEBUG_MODE: 'true',
       };
       // (--stage-scale and --stage-offset-y were set above by applyAnimConfig
       // and may be overridden below by URL params.)

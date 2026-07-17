@@ -82,10 +82,12 @@ pub fn render_html(
     animation_path: &str,
     countdown_seconds: u32,
     preview: bool,
+    debug: bool,
     stage_scale: f32,
     stage_offset_y_vh: i8,
 ) -> String {
     let mode = if preview { "preview" } else { "live" };
+    let debug_mode = if debug { "true" } else { "false" };
     // WebView2 propagates the HTML <title> to the parent HWND's OS
     // title, so if we only bumped the tao WindowBuilder title the
     // "(preview)" suffix would get overwritten seconds later. Apply
@@ -106,6 +108,7 @@ pub fn render_html(
         .replace("{{ ANIMATION_PATH }}", animation_path)
         .replace("{{ COUNTDOWN_SECONDS }}", &countdown_seconds.to_string())
         .replace("{{ POPUP_MODE }}", mode)
+        .replace("{{ DEBUG_MODE }}", debug_mode)
         .replace("{{ STAGE_SCALE }}", &format!("{stage_scale:.2}"))
         .replace("{{ STAGE_OFFSET_Y_VH }}", &stage_offset_y_vh.to_string())
 }
@@ -293,6 +296,7 @@ mod windows_impl {
             &anim_url,
             countdown,
             preview,
+            debug,
             scale,
             offset_y_vh,
         );
@@ -436,8 +440,39 @@ mod windows_impl {
                 )
                 .with_url("purrpause://localhost/popup.html")
                 .with_ipc_handler(move |request| {
-                    if request.body() == "dismiss" {
+                    let body = request.body().as_str();
+                    if body == "dismiss" {
                         let _ = proxy.send_event(UserEvent::Dismiss);
+                        return;
+                    }
+                    // WebView2 JS-side pincode capture, primary surface :
+                    // the LL keyboard hook + tao WindowEvent path both
+                    // fail on some virtualised guests (Parallels on
+                    // Apple Silicon in particular — the hypervisor
+                    // routes keystrokes to the Chromium renderer
+                    // without going through the Windows guest input
+                    // queue). JS in popup.html does the buffer + submit
+                    // trigger and posts a completed pincode string
+                    // here for argon2id verification. We also log every
+                    // pincode:* message for the widget.log audit trail.
+                    if let Some(rest) = body.strip_prefix("pincode:") {
+                        tracing::info!(msg = rest, "pincode.web: ipc message");
+                        // Message shapes :
+                        //   submit:<digits>   → argon2 verify path
+                        //   cancel            → clear asterisks visually
+                        //   digit:<char>      → JS already updated its
+                        //                       own display ; ignored on
+                        //                       the Rust side (kept in
+                        //                       the log for audit only)
+                        if let Some(s) = rest.strip_prefix("submit:") {
+                            let _ = proxy.send_event(UserEvent::PincodeSubmit(s.to_string()));
+                        } else if rest == "cancel" {
+                            let _ = proxy.send_event(UserEvent::PincodeCancel);
+                        } else if let Some(_d) = rest.strip_prefix("digit:") {
+                            // JS renders its own asterisks now — no
+                            // UserEvent dispatch needed. Message kept
+                            // for the widget.log audit trail.
+                        }
                     }
                 })
                 .build(window)
@@ -453,12 +488,13 @@ mod windows_impl {
             rendered.clone(),
             event_loop.create_proxy(),
         );
-        // B3 : force-shutdown mid-popup can leave <exe_dir>/Data/WebView2/
+        // Force-shutdown mid-popup can leave <exe_dir>/Data/WebView2/
         // in a locked/partial state, surfacing on the next popup as
         // HRESULT 0x80070490 ("Élément introuvable" / ERROR_NOT_FOUND).
         // On any first-build failure : kill surviving workers, wipe the
-        // UserData folder, retry once. Latch is implicit (single retry),
-        // second failure surfaces to the service's B4 retry backoff.
+        // UserData folder, retry once. Latch is implicit (single retry) ;
+        // a second failure surfaces to the service tick loop's crash-
+        // retry backoff.
         let (webview, web_ctx) = match first_attempt {
             Ok(pair) => pair,
             Err(first_err) => {
@@ -665,6 +701,44 @@ mod windows_impl {
                     ..
                 } => {
                     *control_flow = ControlFlow::Exit;
+                }
+                // Fallback pincode surface : tao's WindowEvent::KeyboardInput.
+                // Log every keystroke the tao event loop receives so
+                // future debugging on unfamiliar environments has a
+                // second independent trace next to the LL hook one.
+                // The tao pump reads WM_KEYDOWN/WM_KEYUP that landed on
+                // the popup HWND after normal message routing. If the
+                // OS input queue is intercepted upstream (e.g. some
+                // hypervisor keyboard passthroughs), both this and the
+                // LL hook see nothing — that's the signal to fall back
+                // to the WebView2 JS capture surface.
+                Event::WindowEvent {
+                    event: WindowEvent::KeyboardInput { event: ref kevt, .. },
+                    ..
+                } => {
+                    tracing::info!(
+                        state = ?kevt.state,
+                        physical = format!("{:?}", kevt.physical_key),
+                        logical = format!("{:?}", kevt.logical_key),
+                        text = ?kevt.text,
+                        repeat = kevt.repeat,
+                        "pincode.tao: keyboard_input"
+                    );
+                }
+                // Also log ReceivedCharacter — WM_CHAR-derived, layout-
+                // resolved character output. Sometimes fires when
+                // KeyboardInput doesn't (input methods, dead keys).
+                Event::WindowEvent {
+                    event: WindowEvent::ReceivedImeText(ref s),
+                    ..
+                } => {
+                    tracing::info!(text = %s, "pincode.tao: ime_text");
+                }
+                Event::WindowEvent {
+                    event: WindowEvent::ModifiersChanged(ref mods),
+                    ..
+                } => {
+                    tracing::info!(mods = format!("{:?}", mods), "pincode.tao: modifiers_changed");
                 }
                 Event::WindowEvent { event: WindowEvent::Focused(true), .. }
                     if !countdown_expired =>
@@ -903,6 +977,7 @@ mod tests {
             "animations/foo.lottie",
             300,
             false,
+            false,
             1.0,
             0,
         );
@@ -922,6 +997,7 @@ mod tests {
             "animations/foo.lottie",
             300,
             false,
+            false,
             1.0,
             0,
         );
@@ -937,6 +1013,7 @@ mod tests {
             "animations/foo.lottie",
             10,
             true,
+            false,
             1.0,
             0,
         );
@@ -953,6 +1030,7 @@ mod tests {
             &cfg,
             "animations/foo.lottie",
             60,
+            false,
             false,
             1.0,
             0,
@@ -976,6 +1054,7 @@ mod tests {
             "animations/foo.lottie",
             10,
             true,
+            false,
             1.0,
             0,
         );
@@ -987,7 +1066,7 @@ mod tests {
     fn stage_scale_and_offset_substituted() {
         let cfg = Config::default();
         let tpl = r#"<style>:root { --stage-scale: {{ STAGE_SCALE }}; --stage-offset-y: {{ STAGE_OFFSET_Y_VH }}vh; }</style>"#;
-        let out = render_html(tpl, &cfg, "animations/foo.lottie", 60, false, 1.5, -12);
+        let out = render_html(tpl, &cfg, "animations/foo.lottie", 60, false, false, 1.5, -12);
         assert!(out.contains("--stage-scale: 1.50"));
         assert!(out.contains("--stage-offset-y: -12vh"));
         assert!(!out.contains("{{ STAGE_SCALE }}"));

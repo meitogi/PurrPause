@@ -25,28 +25,26 @@
 // to the popup via the caller-supplied closure. The PincodeBuffer
 // semantics are covered by unit tests in `crate::signals`.
 //
-// **Ctrl over Alt (session 7 follow-up)** : the original design used
-// Alt as the capture prefix, but on AZERTY Windows AltGr = Right-Alt
-// participates in layout resolution (AltGr+digit produces `~#{[|`\^@`
-// on FR AZERTY). The Mac→VM keyboard driver can silently classify
-// Option as AltGr in some passthrough modes, and ToUnicodeEx then
-// returns the AltGr variant instead of the digit. Ctrl is a pure
-// command modifier — no Windows layout uses Ctrl+digit for a
-// printable char — so it doesn't collide with layout-shift chars.
+// The capture prefix is Ctrl, not Alt. AltGr = Right-Alt participates
+// in layout resolution on many EU layouts (on FR AZERTY, AltGr+digit
+// produces ~ # { [ | ` \ ^ @), and some Mac→VM keyboard drivers
+// classify the Option key as AltGr — in which case ToUnicodeEx returns
+// the AltGr variant instead of the digit and the capture buffer never
+// fills. Ctrl is a pure command modifier that no Windows layout binds
+// to a printable char, so it doesn't collide with layout-shift output.
 
 use std::sync::Mutex;
 
 use anyhow::{Context, Result};
 use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, GetKeyState, GetKeyboardLayout, ToUnicodeEx, VK_CAPITAL, VK_CONTROL, VK_D,
-    VK_ESCAPE, VK_F4, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_RCONTROL, VK_RMENU,
+    GetAsyncKeyState, VK_0, VK_9, VK_CAPITAL, VK_CONTROL, VK_D, VK_ESCAPE, VK_F4, VK_LCONTROL,
+    VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_NUMPAD0, VK_NUMPAD9, VK_RCONTROL, VK_RMENU,
     VK_RSHIFT, VK_RWIN, VK_SHIFT, VK_TAB,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, GetForegroundWindow, GetWindowThreadProcessId, SetWindowsHookExW,
-    UnhookWindowsHookEx, HHOOK, KBDLLHOOKSTRUCT, LLKHF_ALTDOWN, WH_KEYBOARD_LL, WM_KEYDOWN,
-    WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    CallNextHookEx, SetWindowsHookExW, UnhookWindowsHookEx, HHOOK, KBDLLHOOKSTRUCT, LLKHF_ALTDOWN,
+    WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
 };
 
 use crate::signals::{PincodeBuffer, Verdict};
@@ -145,57 +143,32 @@ impl Drop for KeyboardHookGuard {
     }
 }
 
-/// Resolve the character the current keydown would produce *if Alt
-/// were not held*, using the active keyboard layout of the foreground
-/// window. Returns `Some('0'..'9')` when the resulting character is an
-/// ASCII digit, `None` otherwise (letter, symbol, dead key, or no
-/// mapping at all).
+/// VK-based digit resolver — the ONLY reliable way to detect digit
+/// intent across every keyboard layout and NumLock state.
 ///
-/// Layout-aware — works for QWERTY top-row `1`, AZERTY `Shift+1`,
-/// numpad `1` with NumLock on, and any exotic layout that produces a
-/// digit through some other combination. Deliberately avoids Alt in
-/// the synthesized key-state array : with Alt down, `ToUnicodeEx`
-/// suppresses most character output, so we ask "what would this key
-/// combo type in a normal editor, ignoring Alt?" and check that.
+/// Windows names virtual-key codes by physical position for the digit
+/// rows, NOT by the character produced :
+///   - `VK_0..VK_9` (0x30..0x39) = the top-row digit keys, whatever
+///     layout is loaded. On FR AZERTY the top-row `1/&` key is still
+///     `VK_1` even though Shift is required to produce the digit char.
+///   - `VK_NUMPAD0..VK_NUMPAD9` (0x60..0x69) = numpad digit keys when
+///     NumLock is ON. NumLock OFF makes Windows send `VK_END`/`VK_HOME`
+///     etc. instead — user's own choice, not our problem.
 ///
-/// The `WM_KEYDOWN` scan code is taken directly from
-/// `KBDLLHOOKSTRUCT.scanCode`. `wFlags = 2` prevents dead-key state
-/// mutation so a partial pincode entry doesn't leave the layout in a
-/// half-typed diacritic state for the frontmost window.
-/// Diagnostic variant of the layout-aware digit resolver. Returns
-/// `(parsed_digit, raw ToUnicodeEx return count, first char if n == 1)`
-/// so the pincode capture branch can log distinguishable evidence of
-/// "layout returned no char" (n=0) vs. "layout returned a non-digit
-/// char" (n=1 with tu_ch=Some) vs. "dead key" (n=-1) vs. "multi-char
-/// sequence" (n>1) without needing separate instrumentation of
-/// ToUnicodeEx. Doc comment above `typed_digit` in the pre-diag
-/// version explains the layout-aware rationale.
-fn typed_digit_diag(vk: u16, scan: u32) -> (Option<char>, i32, Option<char>) {
-    unsafe {
-        let mut key_state = [0u8; 256];
-        if GetAsyncKeyState(VK_SHIFT.0 as i32) < 0 {
-            key_state[VK_SHIFT.0 as usize] = 0x80;
-            key_state[VK_LSHIFT.0 as usize] = 0x80;
-        }
-        // Deliberately do NOT set VK_CONTROL — Ctrl is the pincode
-        // capture prefix (session 7 b.11 switch), NOT part of the
-        // typed character. ToUnicodeEx with Ctrl held returns 0 or a
-        // control code (Ctrl+A → 0x01) for most keys, which would
-        // hide the digit intent. Same rationale that used to apply
-        // to VK_MENU under the old Alt-prefix design.
-        if (GetKeyState(VK_CAPITAL.0 as i32) & 1) != 0 {
-            key_state[VK_CAPITAL.0 as usize] = 0x01;
-        }
-
-        let fg_thread = GetWindowThreadProcessId(GetForegroundWindow(), None);
-        let hkl = GetKeyboardLayout(fg_thread);
-
-        let mut buf = [0u16; 8];
-        let n = ToUnicodeEx(vk as u32, scan, &key_state, &mut buf, 2, Some(hkl));
-        let ch = if n == 1 { char::from_u32(buf[0] as u32) } else { None };
-        let digit = ch.filter(|c| c.is_ascii_digit());
-        (digit, n, ch)
+/// A layout-aware detour via `ToUnicodeEx` would be strictly overkill :
+/// VK codes are stable, the char produced is irrelevant to us because
+/// we only care that the user intended a digit. Shift needs a separate
+/// pass-through in `is_modifier_vk` (top-row digit keys on AZERTY /
+/// German-style layouts require Shift to reach the digits, but Shift
+/// itself must not classify as "non-digit → cancel").
+fn typed_digit(vk: u16) -> Option<char> {
+    if (VK_0.0..=VK_9.0).contains(&vk) {
+        return Some((b'0' + (vk - VK_0.0) as u8) as char);
     }
+    if (VK_NUMPAD0.0..=VK_NUMPAD9.0).contains(&vk) {
+        return Some((b'0' + (vk - VK_NUMPAD0.0) as u8) as char);
+    }
+    None
 }
 
 fn is_ctrl_vk(vk: u16) -> bool {
@@ -241,12 +214,43 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
             || (win && vk == VK_D.0)
             || (ctrl && vk == VK_ESCAPE.0);
         if swallow {
+            // Log the swallow decision so debugging can confirm whether
+            // the LL hook is receiving these OS-level shortcuts at all.
+            // If Win+D reaches here → hook is alive on the OS input
+            // queue ; if it doesn't fire while the popup is up, the
+            // hook is either silently unhooked (LowLevelHooksTimeout)
+            // or the keystroke never reached the guest OS input queue
+            // (some hypervisor keyboard passthroughs intercept upstream).
+            tracing::info!(
+                vk = format!("0x{:02X}", vk),
+                alt,
+                ctrl,
+                win,
+                "pincode.raw: swallowed shortcut (Alt+F4/Alt+Tab/Win+D/Ctrl+Esc)"
+            );
             return LRESULT(1);
         }
 
         // Pincode capture — only fires when a HookState was installed
         // (i.e. install_keyboard_hook_with_pincode was used).
         if let Some(state) = HOOK_STATE.lock().unwrap().as_mut() {
+            // Unconditional per-keydown log while capture is active.
+            // Reveals what VK the OS actually delivers for each
+            // physical key on exotic setups (VM keyboard passthroughs
+            // can remap Ctrl / Option / etc. to unexpected VKs).
+            // Bounded — popup lifetime is ≤ 60s+dismiss, so a few
+            // thousand log lines max.
+            tracing::info!(
+                vk = format!("0x{:02X}", vk),
+                scan = info.scanCode,
+                extended = (info.flags.0 & 0x01) != 0,
+                syskey = msg == WM_SYSKEYDOWN,
+                ctrl_held = state.ctrl_held,
+                ctrl_async = unsafe { GetAsyncKeyState(VK_CONTROL.0 as i32) } < 0,
+                shift_async = unsafe { GetAsyncKeyState(VK_SHIFT.0 as i32) } < 0,
+                menu_async = unsafe { GetAsyncKeyState(VK_MENU.0 as i32) } < 0,
+                "pincode.raw: keydown seen"
+            );
             if is_ctrl_vk(vk) {
                 state.ctrl_held = true;
                 tracing::info!(
@@ -281,7 +285,7 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
                     // key (no longer inside capture).
                     return unsafe { CallNextHookEx(None, code, wparam, lparam) };
                 }
-                // B6 : ignore pure modifier keydowns (Shift, Ctrl,
+                // Ignore pure modifier keydowns (Shift, Ctrl,
                 // CapsLock). On AZERTY / Mac layouts Shift is required
                 // to reach the top-row digit keys, so a modifier
                 // keydown must NOT be treated as "non-digit → cancel"
@@ -295,17 +299,15 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
                     );
                     return unsafe { CallNextHookEx(None, code, wparam, lparam) };
                 }
-                // B6 : layout-aware digit resolution. Ask the active
-                // keyboard layout what character this vk+scan+modifier
-                // combo actually types. Handles top-row `1`, Shift+`&`
-                // on AZERTY, numpad `1`, and any other layout that
-                // routes to '0'..'9'.
-                let (typed, tu_n, tu_ch) = typed_digit_diag(vk, info.scanCode);
+                // VK-based digit resolution — VK codes are stable
+                // across every layout for the top-row (VK_0..VK_9) and
+                // numpad (VK_NUMPAD0..VK_NUMPAD9) digit keys. See
+                // `typed_digit` docstring for why we ripped out the
+                // ToUnicodeEx detour that a layout-aware approach would use.
+                let typed = typed_digit(vk);
                 tracing::info!(
                     vk = format!("0x{:02X}", vk),
                     scan = info.scanCode,
-                    tu_n,
-                    tu_ch = tu_ch.map(|c| format!("U+{:04X}", c as u32)),
                     typed = typed.map(|c| c.to_string()),
                     shift_down = unsafe { GetAsyncKeyState(VK_SHIFT.0 as i32) } < 0,
                     "pincode: keydown while ctrl (digit branch)"

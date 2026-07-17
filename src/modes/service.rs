@@ -63,17 +63,19 @@ mod win {
     const TICK_INTERVAL: Duration = Duration::from_secs(5);
     const DEBOUNCE: Duration = Duration::from_millis(300);
     const SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
-    // B4 popup crash retry policy. 30/60/90 s backoff × 3 attempts caps
-    // the retry storm at 3 min post-crash and gives the B3 wipe path
-    // time to settle if the WebView2 folder was in a stale state.
+    // Popup crash retry policy. 30/60/90 s backoff × 3 attempts caps
+    // the retry storm at 3 min post-crash and gives the popup-side
+    // WebView2 wipe path time to settle if the UserData folder was in
+    // a stale state.
     const MAX_POPUP_RETRIES: u32 = 3;
     const RETRY_BACKOFF_STEP_SECS: u64 = 30;
 
     /// In-memory retry state armed when a popup exits with a non-zero
     /// code. Not persisted to `runtime.dat` : if the service dies
-    /// mid-retry, the B5 cold-start gate clears `popup_pending` post-
-    /// unclean-shutdown and the next natural cycle fires the popup
-    /// cleanly. Cleared on exit-code=0 or on `attempts >= MAX_POPUP_RETRIES`.
+    /// mid-retry, the cold-start clean-shutdown gate clears
+    /// `popup_pending` post-unclean-shutdown and the next natural cycle
+    /// fires the popup cleanly. Cleared on exit-code=0 or on
+    /// `attempts >= MAX_POPUP_RETRIES`.
     #[derive(Debug, Clone)]
     struct PopupRetryState {
         attempts: u32,
@@ -167,7 +169,7 @@ mod win {
                     // ("we're running, next boot is unclean unless graceful
                     // shutdown says otherwise"). Same treatment as every
                     // other runtime write : only the shutdown path bumps
-                    // this field to `now`. See B5 fix.
+                    // this field to `now`.
                     let _ = runtime_dat::write(&runtime_dat::RuntimeState {
                         last_popup: lp,
                         paused_secs: 0,
@@ -187,12 +189,13 @@ mod win {
                         .duration_since(state.last_heartbeat)
                         .map(|d| d.as_secs())
                         .unwrap_or(0);
-                    // B5 : gate Rule B on clean shutdown. `was_clean_shutdown`
+                    // Gate Rule B on clean shutdown. `was_clean_shutdown`
                     // is true when the previous graceful shutdown stamped
-                    // last_clean_shutdown_at at or after the final heartbeat.
-                    // v2 migrations populate the field with UNIX_EPOCH →
-                    // always < heartbeat → treated as unclean (safe, fires
-                    // once per b.9→b.10 upgrade boot).
+                    // last_clean_shutdown_at at or after the final
+                    // heartbeat. v2 migrations populate the field with
+                    // UNIX_EPOCH → always < heartbeat → treated as
+                    // unclean (safe : fires once on any format-upgrade
+                    // boot, then converges to actual shutdown state).
                     let was_clean_shutdown =
                         state.last_clean_shutdown_at >= state.last_heartbeat;
                     let popup_pending_pre_gate = state.popup_pending;
@@ -343,7 +346,7 @@ mod win {
             }
         }
 
-        // B4 popup retry state (in-memory only). See PopupRetryState
+        // Popup crash retry state (in-memory only). See PopupRetryState
         // docstring for why it isn't persisted.
         let mut popup_retry: Option<PopupRetryState> = None;
 
@@ -377,7 +380,7 @@ mod win {
             probe.terminate();
         }
 
-        // B5 graceful-shutdown marker : stamp `last_clean_shutdown_at`
+        // Graceful-shutdown marker : stamp `last_clean_shutdown_at`
         // with the current time so the next boot can distinguish this
         // clean SCM Stop from a force-kill. Only path in the codebase
         // that writes a non-UNIX_EPOCH value into this field. If write
@@ -585,12 +588,12 @@ mod win {
 
                     // 2. Detect popup exit (Dismiss button OR the
                     //    countdown-then-close path both terminate the
-                    //    popup process). B4 : the exit code discriminates
-                    //    a normal dismiss (0) from a crash (≠ 0). Crash
+                    //    popup process). The exit code discriminates a
+                    //    normal dismiss (0) from a crash (≠ 0). Crash
                     //    arms a retry backoff instead of clearing the
                     //    cycle ; a following FirePopup attempt uses the
-                    //    B3 wipe-then-retry path in popup.rs to recover
-                    //    from a stale WebView2 UserData folder.
+                    //    popup-side wipe-then-retry path in popup.rs to
+                    //    recover from a stale WebView2 UserData folder.
                     if *popup_pending {
                         if let Some(child) = last_popup_child.as_ref() {
                             if let Some(exit_code) = child.try_wait_exited() {

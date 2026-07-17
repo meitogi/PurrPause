@@ -19,15 +19,15 @@
 // bad-magic / wrong-version file → read() returns None, which routes
 // the caller to the existing fresh-install / cold-start-shift path.
 //
-// v2 backward compatibility (session 7) : a v2 file (31 bytes) reads
-// successfully, populating `last_clean_shutdown_at` with UNIX_EPOCH
-// (the "never / unclean" sentinel). This forces the B5 clean-shutdown
-// gate to treat any first boot after a b.9 → b.10 upgrade as unclean
-// exactly once — safe by construction, popup_pending gets cleared
-// pre-Rule-B and the next natural cycle fires cleanly.
+// v2 backward compatibility : a v2 file (31 bytes) reads successfully,
+// populating `last_clean_shutdown_at` with UNIX_EPOCH (the "never /
+// unclean" sentinel). This forces the clean-shutdown gate to treat
+// the first boot after upgrade from a v2 install as unclean exactly
+// once — safe by construction, popup_pending gets cleared pre-Rule-B
+// and the next natural cycle fires cleanly.
 //
-// v1 files (raw u64, 8 bytes) still route to None — pre-v1 shipping,
-// no real users, no migration path needed.
+// v1 files (raw u64, 8 bytes) still route to None (no migration path
+// — the format long predates any real user install).
 
 use std::io::Write;
 use std::path::Path;
@@ -112,8 +112,8 @@ fn parse_v2_as_v3(bytes: &[u8]) -> Option<RuntimeState> {
         paused_secs,
         popup_pending,
         last_heartbeat: UNIX_EPOCH + Duration::from_secs(last_heartbeat_secs),
-        // No v2 clean-shutdown info — treat as unclean so the B5
-        // gate fires once on b.9 → b.10 upgrade boot. Safe.
+        // No v2 clean-shutdown info — treat as unclean so the
+        // pre-Rule-B gate fires once on the upgrade boot. Safe.
         last_clean_shutdown_at: UNIX_EPOCH,
     })
 }
@@ -309,10 +309,11 @@ mod tests {
 
     #[test]
     fn read_v2_migrates_to_v3_with_epoch_clean_shutdown() {
-        // A v2 file (31 bytes, version=2) surviving a b.9 → b.10 upgrade
+        // A v2 file (31 bytes, version=2) surviving a format upgrade
         // must parse cleanly and populate last_clean_shutdown_at with
         // UNIX_EPOCH — the unclean sentinel. That's the whole point of
-        // the B5 gate : any unclean boot clears popup_pending pre-Rule-B.
+        // the clean-shutdown gate : any unclean boot clears
+        // popup_pending pre-Rule-B.
         let (_dir, path) = tmp_dat();
         let mut bytes = [0u8; FILE_SIZE_V2];
         bytes[0..4].copy_from_slice(MAGIC);
