@@ -367,6 +367,23 @@ fn ui_general(ui: &mut egui::Ui, cfg: &mut Config, dirty: &mut bool) {
         }
     });
 
+    if ui
+        .checkbox(
+            &mut cfg.count_active_time,
+            "Décompter uniquement le temps d'activité",
+        )
+        .on_hover_text(
+            "Coché (défaut) : l'intervalle se compte en temps \
+             d'activité (clavier, souris, gamepad, vidéo/audio). \
+             L'inactivité ≥ 1 min met le compteur en pause.\n\
+             Décoché : l'intervalle se compte en temps calendaire \
+             pur, même quand tu ne fais rien.",
+        )
+        .changed()
+    {
+        *dirty = true;
+    }
+
     if ui.checkbox(&mut cfg.disabled, "Désactiver les pauses").changed() {
         *dirty = true;
     }

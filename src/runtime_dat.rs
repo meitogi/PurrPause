@@ -17,7 +17,7 @@
 // Written atomically via .tmp + rename. Missing / short / oversized /
 // bad-magic / wrong-version file → read() returns None, which routes
 // the caller to the existing fresh-install / cold-start-shift path.
-// No v1 migration: v1.0.0-b.1 has no real users yet.
+// No v1 migration: pre-v1 shipping, no real users yet.
 
 use std::io::Write;
 use std::path::Path;

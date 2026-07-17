@@ -314,8 +314,10 @@ mod win {
         rx: &mpsc::Receiver<TickCommand>,
         power_rx: mpsc::Receiver<power_notify::PowerEvent>,
     ) -> Result<()> {
-        // 60 s idle threshold is hard-coded for session 3 ; session 5
-        // replaces it with the `idle_pause_minutes` config field.
+        // 60 s idle threshold. Toggled at runtime via
+        // `config.count_active_time` — when false, the check below is
+        // short-circuited to `is_idle_now = false` so the counter runs
+        // on wall-clock time.
         const IDLE_THRESHOLD_SECS: u64 = 60;
         // Cap for the video / fullscreen / audio deferral. Beyond this
         // the popup fires regardless of busy state — the user has been
@@ -364,6 +366,10 @@ mod win {
                     tracing::info!("config reload triggered");
                     let state_path = PathBuf::from(STATE_DAT);
                     *config = config::load_or_default(&state_path);
+                    tracing::info!(
+                        count_active_time = config.count_active_time,
+                        "reload: active-time accounting effective mode"
+                    );
                     let now = SystemTime::now();
                     // If the user reduced interval_hours enough that
                     // `last_popup + new_interval` lands in the past
@@ -455,12 +461,16 @@ mod win {
                     let is_busy_now = busy_detector::is_busy();
                     let gamepad_seen = gamepad::gamepad_active_since_last_call();
                     let idle_secs = idle::idle_seconds();
-                    let is_idle_now = signals::idle_tick_should_pause(
-                        idle_secs,
-                        IDLE_THRESHOLD_SECS,
-                        gamepad_seen,
-                        is_busy_now,
-                    );
+                    let is_idle_now = if config.count_active_time {
+                        signals::idle_tick_should_pause(
+                            idle_secs,
+                            IDLE_THRESHOLD_SECS,
+                            gamepad_seen,
+                            is_busy_now,
+                        )
+                    } else {
+                        false
+                    };
                     if is_idle_now {
                         *paused_secs += tick_delta_secs;
                     }

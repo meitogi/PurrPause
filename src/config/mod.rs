@@ -65,6 +65,7 @@ mod tests {
         assert_eq!(cfg.duration_minutes, 5);
         assert_eq!(cfg.pre_notification_minutes, vec![15, 10, 5, 1]);
         assert_eq!(cfg.force_minimize_paliers, vec![1, 0]);
+        assert!(cfg.count_active_time);
         assert_eq!(cfg.rotation_mode, RotationMode::Random);
         assert_eq!(cfg.passcode_length, 6);
         assert_eq!(cfg.passcode_hash, "");
@@ -117,6 +118,17 @@ mod tests {
     fn empty_toml_deserializes_to_default() {
         let cfg: Config = toml::from_str("").unwrap();
         assert_eq!(cfg, Config::default());
+    }
+
+    #[test]
+    fn count_active_time_toml_roundtrip_preserves_both_values() {
+        for value in [true, false] {
+            let mut cfg = Config::default();
+            cfg.count_active_time = value;
+            let text = toml::to_string(&cfg).unwrap();
+            let back: Config = toml::from_str(&text).unwrap();
+            assert_eq!(back.count_active_time, value);
+        }
     }
 
     #[test]

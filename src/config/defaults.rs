@@ -43,6 +43,9 @@ pub mod d {
         // T-15/T-10/T-5, hard interruption at T-1 and the popup itself.
         vec![1, 0]
     }
+    pub const fn count_active_time() -> bool {
+        true
+    }
     pub fn rotation_mode() -> RotationMode {
         RotationMode::Random
     }

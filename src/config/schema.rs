@@ -28,6 +28,15 @@ pub struct Config {
     #[serde(default = "d::force_minimize_paliers")]
     pub force_minimize_paliers: Vec<u32>,
 
+    /// Quand `true` : le compteur pause-cycle décompte uniquement
+    /// le temps actif (clavier + souris + gamepad, ou vidéo/audio
+    /// en cours). L'inactivité ≥ 60 s incrémente `paused_secs` et
+    /// décale la prochaine popup d'autant. Quand `false` : le
+    /// compteur suit le temps calendaire pur, sans déduction.
+    /// Défaut : `true`.
+    #[serde(default = "d::count_active_time")]
+    pub count_active_time: bool,
+
     // --- Animations ---
     /// Populated from `d::animations()` with the two shipped assets
     /// when state.dat is fresh — user adds/removes via the config UI.
