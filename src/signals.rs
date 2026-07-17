@@ -70,7 +70,7 @@ pub fn idle_tick_should_pause(
 
 // -- pincode buffer ---------------------------------------------------
 
-/// Outcome returned by `PincodeBuffer::on_alt_release`.
+/// Outcome returned by `PincodeBuffer::on_capture_release`.
 ///
 /// `Submit(chars)` carries a buffer that reached the configured `cap` —
 /// caller verifies against the argon2id hash. `Cancel` means the buffer
@@ -81,9 +81,9 @@ pub enum Verdict {
     Cancel,
 }
 
-/// Pure state machine backing the popup's Alt+pincode emergency unlock.
+/// Pure state machine backing the popup's Ctrl+Shift+pincode emergency unlock.
 ///
-/// The Win32 low-level keyboard hook feeds digit / non-digit / Alt-release
+/// The Win32 low-level keyboard hook feeds digit / non-digit / capture-release
 /// events into it ; the buffer decides accept / cap / verdict / lock.
 /// Isolating the invariants here keeps them Linux-testable (Win32 hook
 /// glue is `#[cfg(windows)]` and unreachable from CI).
@@ -129,7 +129,7 @@ impl PincodeBuffer {
     /// Alt released. Full-length buffer → `Submit(chars)` for verify ;
     /// anything shorter → `Cancel`. Always clears the buffer so the
     /// next Alt-press starts fresh regardless of verdict.
-    pub fn on_alt_release(&mut self) -> Verdict {
+    pub fn on_capture_release(&mut self) -> Verdict {
         let verdict = if self.chars.len() == self.cap && self.cap > 0 {
             Verdict::Submit(self.chars.iter().collect())
         } else {
@@ -270,7 +270,7 @@ mod tests {
         assert_eq!(b.on_digit('5'), None);
         // Alt-release still resolves to Submit with the first 4 chars
         // (not the over-cap 5th).
-        assert_eq!(b.on_alt_release(), Verdict::Submit("1234".to_string()));
+        assert_eq!(b.on_capture_release(), Verdict::Submit("1234".to_string()));
     }
 
     #[test]
@@ -279,7 +279,7 @@ mod tests {
         for c in ['4', '2', '4', '2', '4', '2'] {
             b.on_digit(c);
         }
-        assert_eq!(b.on_alt_release(), Verdict::Submit("424242".to_string()));
+        assert_eq!(b.on_capture_release(), Verdict::Submit("424242".to_string()));
         // Cleared afterwards — next Alt-press starts at idx 0.
         assert_eq!(b.on_digit('9'), Some(0));
     }
@@ -290,7 +290,7 @@ mod tests {
         b.on_digit('1');
         b.on_digit('2');
         b.on_digit('3');
-        assert_eq!(b.on_alt_release(), Verdict::Cancel);
+        assert_eq!(b.on_capture_release(), Verdict::Cancel);
         // Cleared — next digit starts at idx 0, not 3.
         assert_eq!(b.on_digit('4'), Some(0));
     }
@@ -306,6 +306,6 @@ mod tests {
         // no leak of the pre-lock partial buffer.
         assert_eq!(b.on_digit('3'), None);
         b.on_non_digit();
-        assert_eq!(b.on_alt_release(), Verdict::Cancel);
+        assert_eq!(b.on_capture_release(), Verdict::Cancel);
     }
 }

@@ -604,7 +604,7 @@ mod windows_impl {
                         crate::password::verify(&buf, &hash_for_verify).unwrap_or(false)
                     };
                     if ok {
-                        tracing::info!("popup: Alt+pincode verify OK - dismissing");
+                        tracing::info!("popup: Ctrl+Shift+pincode verify OK - dismissing");
                         let _ = webview.evaluate_script(
                             "window.purrpauseOnEvent&&window.purrpauseOnEvent({kind:'ok'})",
                         );

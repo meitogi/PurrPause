@@ -15,12 +15,24 @@
 // and let the guard's Drop tear it down when the event loop exits.
 //
 // On top of the raw shortcut suppression, the hook also captures the
-// parent-side Alt+pincode emergency unlock (see `install_keyboard_hook_with_pincode`) :
-// while Alt is held, digit key-downs feed a `PincodeBuffer` and are
-// swallowed so they never reach the frontmost window. Non-digit keys
-// clear the buffer. On Alt-release the buffer's verdict (Submit / Cancel)
-// is dispatched to the popup via the caller-supplied closure. The
-// PincodeBuffer semantics are covered by unit tests in `crate::signals`.
+// parent-side Ctrl+Shift+pincode emergency unlock (see
+// `install_keyboard_hook_with_pincode`) : while Ctrl is held, digit
+// key-downs feed a `PincodeBuffer` and are swallowed so they never
+// reach the frontmost window. Non-digit non-modifier keys clear the
+// buffer ; Shift / Alt / CapsLock keydowns pass through (needed on
+// AZERTY where Shift is required to reach the top-row digits). On
+// Ctrl-release the buffer's verdict (Submit / Cancel) is dispatched
+// to the popup via the caller-supplied closure. The PincodeBuffer
+// semantics are covered by unit tests in `crate::signals`.
+//
+// **Ctrl over Alt (session 7 follow-up)** : the original design used
+// Alt as the capture prefix, but on AZERTY Windows AltGr = Right-Alt
+// participates in layout resolution (AltGr+digit produces `~#{[|`\^@`
+// on FR AZERTY). The Mac→VM keyboard driver can silently classify
+// Option as AltGr in some passthrough modes, and ToUnicodeEx then
+// returns the AltGr variant instead of the digit. Ctrl is a pure
+// command modifier — no Windows layout uses Ctrl+digit for a
+// printable char — so it doesn't collide with layout-shift chars.
 
 use std::sync::Mutex;
 
@@ -65,7 +77,7 @@ pub struct KeyboardHookGuard {
 struct HookState {
     send: Box<dyn Fn(PincodeEvent) + Send + Sync>,
     buffer: PincodeBuffer,
-    alt_held: bool,
+    ctrl_held: bool,
 }
 
 static HOOK_STATE: Mutex<Option<HookState>> = Mutex::new(None);
@@ -97,7 +109,7 @@ pub fn install_keyboard_hook_with_pincode(
     *HOOK_STATE.lock().unwrap() = Some(HookState {
         send: Box::new(send),
         buffer: PincodeBuffer::new(cap),
-        alt_held: false,
+        ctrl_held: false,
     });
     install_raw()
 }
@@ -150,17 +162,27 @@ impl Drop for KeyboardHookGuard {
 /// `KBDLLHOOKSTRUCT.scanCode`. `wFlags = 2` prevents dead-key state
 /// mutation so a partial pincode entry doesn't leave the layout in a
 /// half-typed diacritic state for the frontmost window.
-fn typed_digit(vk: u16, scan: u32) -> Option<char> {
+/// Diagnostic variant of the layout-aware digit resolver. Returns
+/// `(parsed_digit, raw ToUnicodeEx return count, first char if n == 1)`
+/// so the pincode capture branch can log distinguishable evidence of
+/// "layout returned no char" (n=0) vs. "layout returned a non-digit
+/// char" (n=1 with tu_ch=Some) vs. "dead key" (n=-1) vs. "multi-char
+/// sequence" (n>1) without needing separate instrumentation of
+/// ToUnicodeEx. Doc comment above `typed_digit` in the pre-diag
+/// version explains the layout-aware rationale.
+fn typed_digit_diag(vk: u16, scan: u32) -> (Option<char>, i32, Option<char>) {
     unsafe {
         let mut key_state = [0u8; 256];
         if GetAsyncKeyState(VK_SHIFT.0 as i32) < 0 {
             key_state[VK_SHIFT.0 as usize] = 0x80;
             key_state[VK_LSHIFT.0 as usize] = 0x80;
         }
-        if GetAsyncKeyState(VK_CONTROL.0 as i32) < 0 {
-            key_state[VK_CONTROL.0 as usize] = 0x80;
-            key_state[VK_LCONTROL.0 as usize] = 0x80;
-        }
+        // Deliberately do NOT set VK_CONTROL — Ctrl is the pincode
+        // capture prefix (session 7 b.11 switch), NOT part of the
+        // typed character. ToUnicodeEx with Ctrl held returns 0 or a
+        // control code (Ctrl+A → 0x01) for most keys, which would
+        // hide the digit intent. Same rationale that used to apply
+        // to VK_MENU under the old Alt-prefix design.
         if (GetKeyState(VK_CAPITAL.0 as i32) & 1) != 0 {
             key_state[VK_CAPITAL.0 as usize] = 0x01;
         }
@@ -170,34 +192,31 @@ fn typed_digit(vk: u16, scan: u32) -> Option<char> {
 
         let mut buf = [0u16; 8];
         let n = ToUnicodeEx(vk as u32, scan, &key_state, &mut buf, 2, Some(hkl));
-        if n == 1 {
-            if let Some(ch) = char::from_u32(buf[0] as u32) {
-                if ch.is_ascii_digit() {
-                    return Some(ch);
-                }
-            }
-        }
-        None
+        let ch = if n == 1 { char::from_u32(buf[0] as u32) } else { None };
+        let digit = ch.filter(|c| c.is_ascii_digit());
+        (digit, n, ch)
     }
 }
 
-fn is_alt_vk(vk: u16) -> bool {
-    vk == VK_MENU.0 || vk == VK_LMENU.0 || vk == VK_RMENU.0
+fn is_ctrl_vk(vk: u16) -> bool {
+    vk == VK_CONTROL.0 || vk == VK_LCONTROL.0 || vk == VK_RCONTROL.0
 }
 
 /// Modifier keys that must NOT count as "non-digit" input during
-/// Alt+pincode capture. On AZERTY / Mac keyboards the top-row digit
-/// keys require Shift, so a naive "any non-digit vkey cancels" rule
-/// would abort every pincode entry the moment Shift is pressed.
+/// Ctrl+Shift+pincode capture. On AZERTY / Mac keyboards the top-row
+/// digit keys require Shift, so a naive "any non-digit vkey cancels"
+/// rule would abort every pincode entry the moment Shift is pressed.
 /// Modifiers are pass-through — the following digit keydown (with
-/// LLKHF_ALTDOWN still set) is what carries the semantic input.
+/// Ctrl still held) is what carries the semantic input. Alt is
+/// included here (not the capture prefix any more) so a stray Alt-
+/// tap mid-entry doesn't cancel the buffer either.
 fn is_modifier_vk(vk: u16) -> bool {
     vk == VK_SHIFT.0
         || vk == VK_LSHIFT.0
         || vk == VK_RSHIFT.0
-        || vk == VK_CONTROL.0
-        || vk == VK_LCONTROL.0
-        || vk == VK_RCONTROL.0
+        || vk == VK_MENU.0
+        || vk == VK_LMENU.0
+        || vk == VK_RMENU.0
         || vk == VK_CAPITAL.0
 }
 
@@ -228,22 +247,32 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
         // Pincode capture — only fires when a HookState was installed
         // (i.e. install_keyboard_hook_with_pincode was used).
         if let Some(state) = HOOK_STATE.lock().unwrap().as_mut() {
-            if is_alt_vk(vk) {
-                state.alt_held = true;
-                // Swallow Alt-down so it doesn't open the menu of the
-                // frontmost window. The Alt-up path also swallows,
-                // keeping the pair symmetric.
+            if is_ctrl_vk(vk) {
+                state.ctrl_held = true;
+                tracing::info!(
+                    vk = format!("0x{:02X}", vk),
+                    scan = info.scanCode,
+                    "pincode: ctrl down (capture armed)"
+                );
+                // Swallow Ctrl-down so no downstream Ctrl+letter
+                // shortcut in the frontmost window fires while we're
+                // capturing. The Ctrl-up path also swallows, keeping
+                // the pair symmetric.
                 return LRESULT(1);
             }
-            if state.alt_held {
-                // Defensive re-check : if Alt-up was somehow missed
+            if state.ctrl_held {
+                // Defensive re-check : if Ctrl-up was somehow missed
                 // (LowLevelHooksTimeout kicked us momentarily), the
                 // OS's async key state is authoritative. Force a
-                // synthetic Alt-release before processing this event.
-                let alt_still_down = unsafe { GetAsyncKeyState(VK_MENU.0 as i32) } < 0;
-                if !alt_still_down {
-                    state.alt_held = false;
-                    let verdict = state.buffer.on_alt_release();
+                // synthetic Ctrl-release before processing this event.
+                let ctrl_still_down = unsafe { GetAsyncKeyState(VK_CONTROL.0 as i32) } < 0;
+                if !ctrl_still_down {
+                    tracing::info!(
+                        vk = format!("0x{:02X}", vk),
+                        "pincode: ctrl missed release - synthesizing release + processing key normally"
+                    );
+                    state.ctrl_held = false;
+                    let verdict = state.buffer.on_capture_release();
                     match verdict {
                         Verdict::Submit(s) => (state.send)(PincodeEvent::Submit(s)),
                         Verdict::Cancel => (state.send)(PincodeEvent::Cancel),
@@ -260,6 +289,10 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
                 // arrives). Modifiers produce no character and are
                 // safe to pass through.
                 if is_modifier_vk(vk) {
+                    tracing::info!(
+                        vk = format!("0x{:02X}", vk),
+                        "pincode: modifier held (pass-through, buffer preserved)"
+                    );
                     return unsafe { CallNextHookEx(None, code, wparam, lparam) };
                 }
                 // B6 : layout-aware digit resolution. Ask the active
@@ -267,7 +300,17 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
                 // combo actually types. Handles top-row `1`, Shift+`&`
                 // on AZERTY, numpad `1`, and any other layout that
                 // routes to '0'..'9'.
-                if let Some(digit) = typed_digit(vk, info.scanCode) {
+                let (typed, tu_n, tu_ch) = typed_digit_diag(vk, info.scanCode);
+                tracing::info!(
+                    vk = format!("0x{:02X}", vk),
+                    scan = info.scanCode,
+                    tu_n,
+                    tu_ch = tu_ch.map(|c| format!("U+{:04X}", c as u32)),
+                    typed = typed.map(|c| c.to_string()),
+                    shift_down = unsafe { GetAsyncKeyState(VK_SHIFT.0 as i32) } < 0,
+                    "pincode: keydown while ctrl (digit branch)"
+                );
+                if let Some(digit) = typed {
                     if let Some(idx) = state.buffer.on_digit(digit) {
                         (state.send)(PincodeEvent::Digit(idx));
                     }
@@ -282,15 +325,19 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
                 // Alt+Tab suppression above already handled the
                 // dangerous combinations, other Alt+letter combos
                 // should reach the frontmost window as usual.
+                tracing::info!(
+                    vk = format!("0x{:02X}", vk),
+                    "pincode: non-digit while ctrl - cancelling buffer"
+                );
                 state.buffer.on_non_digit();
                 (state.send)(PincodeEvent::Cancel);
             }
         }
     } else if msg == WM_KEYUP || msg == WM_SYSKEYUP {
         if let Some(state) = HOOK_STATE.lock().unwrap().as_mut() {
-            if state.alt_held && is_alt_vk(vk) {
-                state.alt_held = false;
-                let verdict = state.buffer.on_alt_release();
+            if state.ctrl_held && is_ctrl_vk(vk) {
+                state.ctrl_held = false;
+                let verdict = state.buffer.on_capture_release();
                 match verdict {
                     Verdict::Submit(s) => (state.send)(PincodeEvent::Submit(s)),
                     Verdict::Cancel => (state.send)(PincodeEvent::Cancel),
