@@ -275,18 +275,18 @@ fn write_preview_override(cfg: &Config) -> Option<std::path::PathBuf> {
 }
 
 /// Thin I/O wrapper : reads current wall clock + runtime.dat and calls
-/// the pure kernel [`scheduler::preview_minutes`].
+/// the pure kernel [`scheduler::preview_minutes`]. Reads `.paused_secs`
+/// alongside `.last_popup` so the preview reflects active-time
+/// accounting — a user idle for 10 min sees the deadline shifted 10 min
+/// further out, not the wall-clock deadline that would fire "on
+/// schedule" while the service is actually still counting down.
 fn next_popup_preview_minutes(interval_hours: f32) -> u64 {
     let now = SystemTime::now();
     let interval = Duration::from_secs((interval_hours * 3600.0).round() as u64);
-    // Session-1 shim : runtime_dat::read() returns the v2 RuntimeState;
-    // the preview stays on wall-clock semantics for now, so only .last_popup
-    // is needed. Session 5 revisits when the idle-pause slider ships.
-    scheduler::preview_minutes(
-        now,
-        runtime_dat::read().map(|s| s.last_popup),
-        interval,
-    )
+    let state = runtime_dat::read();
+    let last_popup = state.as_ref().map(|s| s.last_popup);
+    let paused_secs = state.as_ref().map(|s| s.paused_secs).unwrap_or(0);
+    scheduler::preview_minutes(now, last_popup, interval, paused_secs)
 }
 
 /// Builds the parenthesised suffix shown after "dans X min", explaining

@@ -245,16 +245,18 @@ pub fn resolve_cold_start(inputs: ResolveInputs, config: &Config) -> ColdStartDe
 
 /// Preview helper : given a candidate `proposed_interval` the user is
 /// dragging in the Config UI, return the wall-clock time at which the
-/// next popup would fire IF they clicked Save right now. Applies the
-/// same `RELOAD_MIN_GRACE` clamp as [`resolve_last_popup`]'s reload
-/// branch, so the preview stays truthful even when the user reduces
-/// the interval into the past.
+/// next popup would fire IF they clicked Save right now. Shifts the
+/// naive deadline by `paused_secs` (active-time accounting), then
+/// applies the same `RELOAD_MIN_GRACE` clamp as [`resolve_last_popup`]'s
+/// reload branch so the preview stays truthful even when the user
+/// reduces the interval into the past.
 pub fn next_popup_after_reload(
     now: SystemTime,
     last_popup: SystemTime,
     proposed_interval: Duration,
+    paused_secs: u64,
 ) -> SystemTime {
-    let naive = last_popup + proposed_interval;
+    let naive = last_popup + proposed_interval + Duration::from_secs(paused_secs);
     let floor = now + RELOAD_MIN_GRACE;
     if naive >= floor {
         naive
@@ -264,16 +266,19 @@ pub fn next_popup_after_reload(
 }
 
 /// Config UI live-preview kernel : ceil-minutes from `now` to the next
-/// popup fire, respecting the reload clamp when `last_popup` is known.
-/// Pure — no I/O — so it's Linux-testable. The tabs.rs wrapper injects
-/// `SystemTime::now()` + `runtime_dat::read()` at call time.
+/// popup fire, respecting the reload clamp when `last_popup` is known
+/// AND the accumulated `paused_secs` (idle / sleep / boot-off time
+/// deducted by the service). Pure — no I/O — so it's Linux-testable.
+/// The tabs.rs wrapper injects `SystemTime::now()` + `runtime_dat::read()`
+/// at call time.
 pub fn preview_minutes(
     now: SystemTime,
     last_popup: Option<SystemTime>,
     interval: Duration,
+    paused_secs: u64,
 ) -> u64 {
     let next = match last_popup {
-        Some(lp) => next_popup_after_reload(now, lp, interval),
+        Some(lp) => next_popup_after_reload(now, lp, interval, paused_secs),
         None => now + interval,
     };
     let delta = next.duration_since(now).unwrap_or(Duration::ZERO);
@@ -923,7 +928,7 @@ mod tests {
         // Above 2 min floor ⇒ return naive next.
         let now = epoch_plus(10_000);
         let lp = epoch_plus(10_000 - 30 * 60);
-        let got = next_popup_after_reload(now, lp, Duration::from_secs(45 * 60));
+        let got = next_popup_after_reload(now, lp, Duration::from_secs(45 * 60), 0);
         assert_eq!(got, lp + Duration::from_secs(45 * 60));
     }
 
@@ -933,7 +938,7 @@ mod tests {
         // Under 2 min floor ⇒ clamp to now + 2min.
         let now = epoch_plus(10_000);
         let lp = epoch_plus(10_000 - 44 * 60);
-        let got = next_popup_after_reload(now, lp, Duration::from_secs(45 * 60));
+        let got = next_popup_after_reload(now, lp, Duration::from_secs(45 * 60), 0);
         assert_eq!(got, now + RELOAD_MIN_GRACE);
     }
 
@@ -943,7 +948,7 @@ mod tests {
         // Clamp to now + RELOAD_MIN_GRACE.
         let now = epoch_plus(3 * 3600);
         let lp = epoch_plus(3600);
-        let got = next_popup_after_reload(now, lp, Duration::from_secs(45 * 60));
+        let got = next_popup_after_reload(now, lp, Duration::from_secs(45 * 60), 0);
         assert_eq!(got, now + RELOAD_MIN_GRACE);
     }
 
@@ -955,8 +960,19 @@ mod tests {
         let lp = (now + RELOAD_MIN_GRACE)
             .checked_sub(interval)
             .unwrap();
-        let got = next_popup_after_reload(now, lp, interval);
+        let got = next_popup_after_reload(now, lp, interval, 0);
         assert_eq!(got, lp + interval);
+    }
+
+    #[test]
+    fn next_popup_after_reload_shifts_by_paused_secs() {
+        // lp 30 min ago, interval 45 min, paused 10 min ⇒ next = lp + 55 min
+        // (well above the grace floor).
+        let now = epoch_plus(10_000);
+        let lp = epoch_plus(10_000 - 30 * 60);
+        let paused = 10 * 60;
+        let got = next_popup_after_reload(now, lp, Duration::from_secs(45 * 60), paused);
+        assert_eq!(got, lp + Duration::from_secs(45 * 60) + Duration::from_secs(paused));
     }
 
     // -------- preview_minutes (Track A-2) --------
@@ -967,7 +983,7 @@ mod tests {
         let lp = epoch_plus(9_400); // 10 min ago
         let interval = Duration::from_secs(60 * 60); // 1h
         // next = lp + 1h = epoch+13_000 ; delta = 3_000 s = 50 min.
-        assert_eq!(preview_minutes(now, Some(lp), interval), 50);
+        assert_eq!(preview_minutes(now, Some(lp), interval, 0), 50);
     }
 
     #[test]
@@ -977,21 +993,21 @@ mod tests {
         let interval = Duration::from_secs(60); // 1 min — well below grace
         // Naive next = lp + 60 = epoch+9_060, in the past.
         // Clamped to now + RELOAD_MIN_GRACE (120 s) → 2 min preview.
-        assert_eq!(preview_minutes(now, Some(lp), interval), 2);
+        assert_eq!(preview_minutes(now, Some(lp), interval, 0), 2);
     }
 
     #[test]
     fn preview_minutes_none_last_popup_uses_fresh_install_fallback() {
         let now = epoch_plus(10_000);
         let interval = Duration::from_secs(45 * 60); // 45 min
-        assert_eq!(preview_minutes(now, None, interval), 45);
+        assert_eq!(preview_minutes(now, None, interval, 0), 45);
     }
 
     #[test]
     fn preview_minutes_one_minute_interval_boundary() {
         // Fresh install, 1-min interval → exactly 1 min preview.
         let now = epoch_plus(10_000);
-        assert_eq!(preview_minutes(now, None, Duration::from_secs(60)), 1);
+        assert_eq!(preview_minutes(now, None, Duration::from_secs(60), 0), 1);
     }
 
     #[test]
@@ -999,7 +1015,7 @@ mod tests {
         // Fresh install, 720-min (12 h) interval → 720 min preview.
         let now = epoch_plus(10_000);
         assert_eq!(
-            preview_minutes(now, None, Duration::from_secs(720 * 60)),
+            preview_minutes(now, None, Duration::from_secs(720 * 60), 0),
             720
         );
     }
@@ -1012,9 +1028,33 @@ mod tests {
         let now = epoch_plus(1_000_000);
         let lp = epoch_plus(100_000); // 6 h ago
         let interval = Duration::from_secs(60 * 60); // 1 h — naive next is 5 h in past
-        let out = preview_minutes(now, Some(lp), interval);
+        let out = preview_minutes(now, Some(lp), interval, 0);
         // Clamped to RELOAD_MIN_GRACE = 120 s → 2 min preview.
         assert_eq!(out, 2);
+    }
+
+    #[test]
+    fn preview_minutes_shifts_forward_by_paused_secs() {
+        // User idle 10 min accumulated → preview shows deadline 10 min later
+        // than the wall-clock naive delta would suggest.
+        let now = epoch_plus(10_000);
+        let lp = epoch_plus(9_400); // 10 min ago
+        let interval = Duration::from_secs(60 * 60); // 1h
+        let paused = 10 * 60;
+        // Without paused_secs : 50 min. With paused_secs = 10 min : 60 min.
+        assert_eq!(preview_minutes(now, Some(lp), interval, paused), 60);
+    }
+
+    #[test]
+    fn preview_minutes_paused_secs_rescues_past_deadline() {
+        // Naive next in the past → would clamp to 2 min. Paused_secs pushes
+        // it back into the future, no clamping needed.
+        let now = epoch_plus(10_000);
+        let lp = epoch_plus(9_000); // 17 min ago
+        let interval = Duration::from_secs(60); // 1 min — naive next in past
+        let paused = 20 * 60; // 20 min of paused pushes next well ahead
+        // next = lp + 60 + 1200 = epoch+10_260 ; delta = 260 s → ceil 5 min.
+        assert_eq!(preview_minutes(now, Some(lp), interval, paused), 5);
     }
 
     // -------- ceil-boundary edges (Track A-3) --------
@@ -1025,25 +1065,25 @@ mod tests {
     fn preview_ceil_60_seconds_reads_as_1_minute() {
         let now = epoch_plus(10_000);
         // Fresh install + 60 s interval = delta 60 s exactly → 1 min.
-        assert_eq!(preview_minutes(now, None, Duration::from_secs(60)), 1);
+        assert_eq!(preview_minutes(now, None, Duration::from_secs(60), 0), 1);
     }
 
     #[test]
     fn preview_ceil_61_seconds_reads_as_2_minutes() {
         let now = epoch_plus(10_000);
-        assert_eq!(preview_minutes(now, None, Duration::from_secs(61)), 2);
+        assert_eq!(preview_minutes(now, None, Duration::from_secs(61), 0), 2);
     }
 
     #[test]
     fn preview_ceil_119_seconds_reads_as_2_minutes() {
         let now = epoch_plus(10_000);
-        assert_eq!(preview_minutes(now, None, Duration::from_secs(119)), 2);
+        assert_eq!(preview_minutes(now, None, Duration::from_secs(119), 0), 2);
     }
 
     #[test]
     fn preview_ceil_120_seconds_reads_as_2_minutes() {
         let now = epoch_plus(10_000);
-        assert_eq!(preview_minutes(now, None, Duration::from_secs(120)), 2);
+        assert_eq!(preview_minutes(now, None, Duration::from_secs(120), 0), 2);
     }
 
     // -------- next_popup_at active-time shift --------
