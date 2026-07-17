@@ -66,8 +66,8 @@ pub fn run(
 
 #[cfg(windows)]
 mod windows_impl {
-    use std::path::Path;
-    use std::time::{Duration, Instant};
+    use std::path::{Path, PathBuf};
+    use std::time::{Duration, Instant, SystemTime};
 
     use anyhow::{anyhow, Context, Result};
     use eframe::egui;
@@ -81,12 +81,18 @@ mod windows_impl {
 
     use crate::modes::install::STATE_DAT;
     use crate::platform::win32::{fullscreen_detect, window_style};
+    use crate::{runtime_dat, scheduler};
 
     use super::{format_countdown, resolve_palier_message};
 
     const WIDTH: f32 = 320.0;
     const HEIGHT: f32 = 90.0;
     const MARGIN: i32 = 20;
+
+    // Throttle for runtime.dat + config re-reads inside ui(). Repaint stays
+    // at 500ms for smooth countdown, disk sync gated to ~1s (~one read/sec
+    // on a DACL'd ProgramData path) — surfaced during ARM64 dogfood.
+    const SYNC_INTERVAL: Duration = Duration::from_secs(1);
 
     pub fn run(
         seconds: u64,
@@ -172,12 +178,31 @@ mod windows_impl {
             ..Default::default()
         };
 
-        let deadline = Instant::now() + Duration::from_secs(seconds);
+        let spawn_deadline = Instant::now() + Duration::from_secs(seconds);
         let message = resolve_palier_message(&cfg, palier);
         let template = cfg.widget_countdown_template.clone();
         let title = cfg.popup_window_title.clone();
 
-        tracing::info!(seconds, palier, monitor_mh = mh, "countdown widget starting");
+        // Sync is enabled in prod (widget spawned by service, well-known
+        // paths live). Preview mode from the Config UI passes
+        // config_override which is deleted right after the initial read
+        // above — subsequent re-reads would default the config and lie
+        // about interval, so preview keeps the frozen-Instant behaviour.
+        let sync = if config_override.is_none() {
+            Some(SyncState {
+                runtime_dat_path: PathBuf::from(runtime_dat::PATH),
+                config_path: PathBuf::from(STATE_DAT),
+                last_synced_deadline: None,
+                last_sync_at: None,
+            })
+        } else {
+            None
+        };
+
+        tracing::info!(
+            seconds, palier, monitor_mh = mh, sync_enabled = sync.is_some(),
+            "countdown widget starting"
+        );
 
         eframe::run_native(
             &title,
@@ -203,21 +228,89 @@ mod windows_impl {
                         }
                     }
                 }
-                Ok(Box::new(CountdownApp::new(deadline, message, template)))
+                Ok(Box::new(CountdownApp::new(spawn_deadline, message, template, sync)))
             }),
         )
         .map_err(|e| anyhow!("eframe: {e}"))
     }
 
+    // Per-tick disk-read state for the sync loop. Absent (`sync: None` on
+    // CountdownApp) → preview mode / no live sync → widget behaves as it
+    // did pre-b.17 (frozen wall-clock against spawn_deadline).
+    struct SyncState {
+        runtime_dat_path: PathBuf,
+        config_path: PathBuf,
+        // SystemTime deadline computed via scheduler::next_popup_at at the
+        // last successful sync. Held across subsequent sync misses so a
+        // transient runtime.dat unavailability (service restart, file
+        // rename during smoke) doesn't collapse the display back to
+        // spawn_deadline mid-widget.
+        last_synced_deadline: Option<SystemTime>,
+        // Instant of the last sync attempt (successful or not). Throttles
+        // disk reads to ~SYNC_INTERVAL cadence.
+        last_sync_at: Option<Instant>,
+    }
+
     struct CountdownApp {
-        deadline: Instant,
+        // Wall-clock fallback frozen at spawn. Used before the first
+        // successful sync, and forever in preview mode where sync is
+        // deliberately disabled.
+        spawn_deadline: Instant,
         message: String,
         template: String,
+        sync: Option<SyncState>,
     }
 
     impl CountdownApp {
-        fn new(deadline: Instant, message: String, template: String) -> Self {
-            Self { deadline, message, template }
+        fn new(
+            spawn_deadline: Instant,
+            message: String,
+            template: String,
+            sync: Option<SyncState>,
+        ) -> Self {
+            Self { spawn_deadline, message, template, sync }
+        }
+
+        // Re-read runtime.dat + config if the throttle allows. Any read
+        // miss (runtime.dat absent, unreadable, or config unreadable)
+        // leaves the last known synced deadline in place — the widget
+        // keeps counting against the last-authoritative decision rather
+        // than jumping back to spawn_deadline mid-display.
+        fn refresh_synced_deadline(&mut self) {
+            let Some(sync) = self.sync.as_mut() else {
+                return;
+            };
+            let should_read = match sync.last_sync_at {
+                None => true,
+                Some(t) => t.elapsed() >= SYNC_INTERVAL,
+            };
+            if !should_read {
+                return;
+            }
+            sync.last_sync_at = Some(Instant::now());
+            let Some(state) = runtime_dat::read_at(&sync.runtime_dat_path) else {
+                return;
+            };
+            let cfg = crate::config::load_or_default(&sync.config_path);
+            sync.last_synced_deadline = Some(scheduler::next_popup_at(
+                state.last_popup,
+                &cfg,
+                state.paused_secs,
+            ));
+        }
+
+        fn remaining_seconds(&self) -> u64 {
+            if let Some(sync) = self.sync.as_ref() {
+                if let Some(deadline) = sync.last_synced_deadline {
+                    return deadline
+                        .duration_since(SystemTime::now())
+                        .unwrap_or(Duration::ZERO)
+                        .as_secs();
+                }
+            }
+            self.spawn_deadline
+                .saturating_duration_since(Instant::now())
+                .as_secs()
         }
     }
 
@@ -231,10 +324,8 @@ mod windows_impl {
         }
 
         fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-            let remaining = self
-                .deadline
-                .saturating_duration_since(Instant::now())
-                .as_secs();
+            self.refresh_synced_deadline();
+            let remaining = self.remaining_seconds();
 
             if remaining == 0 {
                 ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
