@@ -234,6 +234,25 @@ mod win {
         let mut last_popup_child: Option<SpawnedChild> = None;
         let mut last_widget_children: HashMap<u32, SpawnedChild> = HashMap::new();
 
+        // User-session input probe. Spawned once here so the file at
+        // <exe_dir>/Data/lastinput.dat exists before the first
+        // idle::idle_seconds() call in the tick loop. Respawned by
+        // the tick loop if it dies. See modes::input_probe for the
+        // Session 0 rationale.
+        let mut input_probe_child: Option<SpawnedChild> = None;
+        match spawn_input_probe(&exe) {
+            Ok(child) => {
+                tracing::info!(pid = child.pid, "input-probe spawned");
+                input_probe_child = Some(child);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = ?e,
+                    "input-probe initial spawn failed - will retry on next tick"
+                );
+            }
+        }
+
         // Rule B : runtime.dat said popup_pending && downtime < 30 min
         // when we cold-booted. Fire the popup before entering the tick
         // loop so the user sees it as soon as the service is ready.
@@ -263,6 +282,7 @@ mod win {
             &mut fired,
             &mut last_popup_child,
             &mut last_widget_children,
+            &mut input_probe_child,
             &exe,
             &rx,
             power_rx,
@@ -271,6 +291,15 @@ mod win {
         // Signal shutdown.
         notify_running_flag.store(false, Ordering::Relaxed);
         unsafe { let _ = SetEvent(cancel_event); }
+
+        // Terminate the input probe explicitly. Without this the
+        // old probe would linger until user log-off and race a new
+        // probe spawned by the next service instance for the same
+        // lastinput.dat file. HANDLE-based terminate is immune to
+        // PID recycle.
+        if let Some(probe) = input_probe_child.take() {
+            probe.terminate();
+        }
 
         // Grace period + best-effort join. If a thread refuses to exit,
         // process shutdown will terminate it — no forced-kill from Rust.
@@ -310,6 +339,7 @@ mod win {
         fired: &mut std::collections::HashSet<u32>,
         last_popup_child: &mut Option<SpawnedChild>,
         last_widget_children: &mut HashMap<u32, SpawnedChild>,
+        input_probe_child: &mut Option<SpawnedChild>,
         exe: &Path,
         rx: &mpsc::Receiver<TickCommand>,
         power_rx: mpsc::Receiver<power_notify::PowerEvent>,
@@ -453,6 +483,33 @@ mod win {
                                 tracing::info!(
                                     paused_secs = *paused_secs,
                                     "popup child exited - clearing popup_pending"
+                                );
+                            }
+                        }
+                    }
+
+                    // 2b. Ensure the user-session input probe is alive.
+                    //     Cheap poll (HANDLE-based try_wait_exited). If
+                    //     dead, respawn — the probe writes the file
+                    //     idle::idle_seconds() reads, so a stale/absent
+                    //     probe would degrade kbd/mouse detection.
+                    let probe_alive = input_probe_child
+                        .as_ref()
+                        .map(|c| !c.try_wait_exited())
+                        .unwrap_or(false);
+                    if !probe_alive {
+                        if input_probe_child.is_some() {
+                            tracing::warn!("input-probe child exited - respawning");
+                        }
+                        match spawn_input_probe(exe) {
+                            Ok(child) => {
+                                tracing::info!(pid = child.pid, "input-probe respawned");
+                                *input_probe_child = Some(child);
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    error = ?e,
+                                    "input-probe respawn failed - will retry on next tick"
                                 );
                             }
                         }
@@ -675,6 +732,16 @@ mod win {
                 Err(e)
             }
         }
+    }
+
+    /// Spawn the user-session input probe (`--input-probe`). The
+    /// probe lives for the service's lifetime ; if it dies (crash,
+    /// user log-off, session change), the tick loop's respawn poll
+    /// catches it within one tick (~5 s). No spawn-replacing pattern
+    /// needed — the caller holds at most one handle at a time.
+    fn spawn_input_probe(exe: &Path) -> Result<SpawnedChild> {
+        use crate::platform::Spawner;
+        RealSpawner.spawn(exe, &[OsStr::new("--input-probe")])
     }
 
     fn fire_countdown(

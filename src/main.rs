@@ -94,6 +94,7 @@ fn mode_needs_webview2(mode: &Mode) -> bool {
         mode,
         Mode::Service
             | Mode::Watchdog
+            | Mode::InputProbe
             | Mode::RollbackFromFailedInstall
             | Mode::Uninstall
             | Mode::Countdown { .. }
@@ -147,6 +148,7 @@ fn init_tracing(mode: &Mode) {
             | Mode::Popup { .. }
             | Mode::Config { .. }
             | Mode::Sandbox { .. }
+            | Mode::InputProbe
     ) {
         if let Ok(exe) = std::env::current_exe() {
             if let Some(dir) = exe.parent() {
@@ -238,6 +240,13 @@ enum Mode {
     Config { first_run: bool },
     /// Health-check task run by Scheduled Task every minute.
     Watchdog,
+    /// User-session keyboard/mouse activity probe. Spawned by the
+    /// service via CreateProcessAsUserW, runs in the console user's
+    /// session, polls GetLastInputInfo, writes the last-input tick
+    /// timestamp to <exe_dir>/Data/lastinput.dat for the SYSTEM
+    /// service to read. See modes::input_probe for the Session 0
+    /// isolation rationale.
+    InputProbe,
     /// Passcode-gated uninstall flow.
     Uninstall,
     /// Rollback partial install if wizard was cancelled.
@@ -250,6 +259,7 @@ fn classify_mode(args: &[String]) -> Mode {
     match args.first().map(String::as_str) {
         None => Mode::InstallOrConfig,
         Some("--service") => Mode::Service,
+        Some("--input-probe") => Mode::InputProbe,
         Some("--popup") => Mode::Popup {
             preview: args.iter().any(|a| a == "--preview"),
             // Prod default : debug=false (keyboard hook + force-minimize
@@ -353,6 +363,7 @@ fn dispatch(mode: Mode) -> anyhow::Result<()> {
         Mode::Config { first_run: true } => modes::config_first_run::run()?,
         Mode::Service => modes::service::run()?,
         Mode::Watchdog => modes::watchdog::run()?,
+        Mode::InputProbe => modes::input_probe::run()?,
         Mode::Popup { preview, debug, anim_override, config_override, test_countdown_secs, passcode_hash } => {
             modes::popup::run(preview, debug, anim_override, config_override, test_countdown_secs, passcode_hash)?
         }

@@ -1,4 +1,5 @@
 pub mod countdown;
+pub mod input_probe;
 pub mod install;
 pub mod popup;
 pub mod rollback;

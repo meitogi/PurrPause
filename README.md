@@ -9,7 +9,7 @@ teenage-admin machines : the parent sets a passcode ; the child sees a
 generic `Windows Session Health Service` in `services.msc` and needs
 non-obvious steps to disable it.
 
-**Status** : v1.1.0-b.7 (beta). Windows 10 1607+ / Windows 11 (x64 +
+**Status** : v1.1.0-b.8 (beta). Windows 10 1607+ / Windows 11 (x64 +
 ARM64). Aligned with a « friction, not fort-knox » design — see
 [SECURITY-NOTES.md](docs/SECURITY-NOTES.md) for the honest attack surface.
 

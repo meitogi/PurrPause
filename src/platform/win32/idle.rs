@@ -1,88 +1,93 @@
-// Keyboard + mouse idleness signal, feeding the mid-cycle
-// `paused_secs` bookkeeping. Does NOT detect gamepad activity —
-// `LASTINPUTINFO` only reflects HID keyboard + mouse input, not XInput
-// pad state. See `platform::win32::gamepad` for the separate pad poll.
+// Keyboard + mouse idleness signal for the service tick loop.
+// Does NOT call `GetLastInputInfo` directly (see below for why) —
+// reads the timestamp written by the user-session input probe
+// (`crate::modes::input_probe`) at `<exe_dir>/Data/lastinput.dat`.
 //
-// # Session 0 pitfall (bugfix b.7)
+// # Session 0 pitfall
 //
-// `GetLastInputInfo` returns input-time for the CALLING thread's
-// session. A Windows service runs as SYSTEM in Session 0 which never
-// receives user input — a naive call returns `info.dwTime = 0`, so
-// `idle_seconds` == system uptime. The service would think the user
-// was idle since boot, breaking active-time accounting entirely.
+// A Windows service runs as SYSTEM in Session 0 which never receives
+// user input. `GetLastInputInfo` reads via a session-scoped window
+// station : Session 0's WinSta0 has no interactive input, so a direct
+// call from the service returns `info.dwTime = 0` forever. Naive
+// `ImpersonateLoggedOnUser` swaps the thread's security token but not
+// its window station (they're not scoped by token), so impersonation
+// is ineffective for this API.
 //
-// The workaround : query the active console session (`WTSGetActiveConsoleSessionId`),
-// grab that user's token (`WTSQueryUserToken`), impersonate briefly
-// (`ImpersonateLoggedOnUser`) for the `GetLastInputInfo` call, then
-// `RevertToSelf`. Costs one token round-trip per tick (~5 s cadence) —
-// negligible next to the WASAPI enum in `busy_detector`.
+// The workaround (b.8) : a lightweight `--input-probe` child process
+// spawned in the interactive user session polls `GetLastInputInfo` on
+// its own turf and writes the absolute u64 tick of the last input to
+// a shared file. This module reads it and computes idle seconds
+// against the current tick. See `crate::modes::input_probe` for the
+// probe side.
 //
-// Failure modes (no active session at login screen, permission glitch)
-// return 0 to err toward "assume active" rather than propagating up
-// the tick — a Shell / SCM handshake never blocks a scheduled popup.
+// # Fallbacks
+//
+// File missing / short read / older than `MAX_PROBE_STALENESS_MS` →
+// return 0 (assume active). Any probe glitch errs toward firing the
+// popup rather than silently deferring forever.
 
-use windows::Win32::Foundation::{CloseHandle, HANDLE};
-use windows::Win32::Security::{ImpersonateLoggedOnUser, RevertToSelf};
-use windows::Win32::System::RemoteDesktop::{WTSGetActiveConsoleSessionId, WTSQueryUserToken};
+use std::fs;
+use std::path::PathBuf;
+
 use windows::Win32::System::SystemInformation::GetTickCount64;
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
 
-use crate::signals::ms_delta_to_seconds;
+use crate::modes::input_probe::LASTINPUT_FILE;
+
+/// Beyond this staleness we treat the probe as dead. 30 s = 6× the
+/// probe's 5 s poll cadence, so a healthy probe never hits the
+/// threshold and a crashed one is detected within one service tick.
+const MAX_PROBE_STALENESS_MS: u64 = 30_000;
 
 /// Seconds since the last keyboard or mouse input on the interactive
-/// user session. Wraps `GetLastInputInfo` inside an impersonation
-/// round-trip so the SYSTEM service reads the console user's input
-/// state, not Session 0's (which is always empty).
-///
-/// Returns 0 on any failure — no active console session, token query
-/// denied, impersonate fails — so the tick errs toward "assume active".
+/// user session, sourced from the user-session probe file. Returns 0
+/// on any file-read / staleness failure so the tick errs toward
+/// "assume active".
 pub fn idle_seconds() -> u64 {
-    let session_id = unsafe { WTSGetActiveConsoleSessionId() };
-    if session_id == 0xFFFF_FFFF {
-        // No console session (e.g. secure desktop between login and
-        // user logon). Assume active.
-        return 0;
-    }
-
-    let mut token = HANDLE::default();
-    let query_ok = unsafe { WTSQueryUserToken(session_id, &mut token) }.is_ok();
-    if !query_ok || token.is_invalid() {
-        return 0;
-    }
-
-    let idle_secs = unsafe { with_impersonation(token, query_lastinput_secs) };
-
-    unsafe {
-        let _ = CloseHandle(token);
-    }
-    idle_secs
-}
-
-/// Impersonate `token`, run `f`, then RevertToSelf regardless of
-/// panic-free outcome. Caller retains ownership of `token`.
-unsafe fn with_impersonation<F: FnOnce() -> u64>(token: HANDLE, f: F) -> u64 {
-    if ImpersonateLoggedOnUser(token).is_err() {
-        return 0;
-    }
-    let out = f();
-    let _ = RevertToSelf();
-    out
-}
-
-/// Actual `GetLastInputInfo` + tick-delta math. Runs under the
-/// impersonated user context so `info.dwTime` reflects real kbd/mouse
-/// activity in the console session.
-fn query_lastinput_secs() -> u64 {
-    let mut info = LASTINPUTINFO {
-        cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32,
-        dwTime: 0,
+    let path = probe_file_path();
+    let buf = match fs::read(&path) {
+        Ok(b) if b.len() == 16 => b,
+        Ok(b) => {
+            tracing::warn!(
+                len = b.len(),
+                path = %path.display(),
+                "lastinput.dat wrong size - assuming active"
+            );
+            return 0;
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                path = %path.display(),
+                "lastinput.dat read failed - assuming active (probe may be respawning)"
+            );
+            return 0;
+        }
     };
-    unsafe {
-        if GetLastInputInfo(&mut info).as_bool() {
-            let tick = GetTickCount64();
-            ms_delta_to_seconds(tick, info.dwTime)
-        } else {
-            0
+
+    let last_input_tick = u64::from_be_bytes(buf[0..8].try_into().unwrap());
+    let written_at_tick = u64::from_be_bytes(buf[8..16].try_into().unwrap());
+    let current_tick = unsafe { GetTickCount64() };
+    let staleness_ms = current_tick.saturating_sub(written_at_tick);
+    if staleness_ms > MAX_PROBE_STALENESS_MS {
+        tracing::warn!(
+            staleness_ms,
+            "input-probe stale - assuming active (probe may have crashed)"
+        );
+        return 0;
+    }
+    let idle_ms = current_tick.saturating_sub(last_input_tick);
+    idle_ms / 1000
+}
+
+fn probe_file_path() -> PathBuf {
+    // Same convention as `modes::input_probe` : <exe_dir>/Data/lastinput.dat.
+    // Both service (SYSTEM, current_exe = registered ImagePath) and
+    // probe (console user session, current_exe = same ImagePath via
+    // CreateProcessAsUserW) resolve to the same absolute path.
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            return parent.join("Data").join(LASTINPUT_FILE);
         }
     }
+    PathBuf::from("Data").join(LASTINPUT_FILE)
 }

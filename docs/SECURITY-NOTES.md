@@ -1,4 +1,4 @@
-# SECURITY NOTES — Attack surface (PurrPause v1.1.0-b.7)
+# SECURITY NOTES — Attack surface (PurrPause v1.1.0-b.8)
 
 > Companion document to the design constitution. Enumerates every known
 > avenue for a child with admin privileges to disable PurrPause on their

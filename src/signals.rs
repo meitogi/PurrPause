@@ -9,20 +9,6 @@
 // it after unpacking the Win32 types (LASTINPUTINFO, XINPUT_STATE,
 // WPARAM, QUERY_USER_NOTIFICATION_STATE).
 
-// -- idle --------------------------------------------------------------
-
-/// Seconds elapsed between the current `GetTickCount64` tick (ms since
-/// boot, u64) and `LASTINPUTINFO::dwTime` (ms since boot, u32 wrapped
-/// on the Win32 side after 49.7 days of uptime).
-///
-/// Uses `saturating_sub` to floor at 0 rather than underflow — defensive
-/// against the impossible-in-practice case where `dwTime` reads a value
-/// higher than the current tick (would require clock drift between the
-/// two syscalls on the same monotonic counter).
-pub fn ms_delta_to_seconds(tick_ms: u64, last_input_ms: u32) -> u64 {
-    tick_ms.saturating_sub(last_input_ms as u64) / 1000
-}
-
 // -- gamepad -----------------------------------------------------------
 
 /// Per-slot XInput packet number, or None if the slot is disconnected.
@@ -165,40 +151,6 @@ impl PincodeBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // -- ms_delta_to_seconds ------------------------------------------
-
-    #[test]
-    fn ms_delta_normal_case_rounds_down() {
-        // 12_500 ms delta → 12 s (integer division truncates).
-        assert_eq!(ms_delta_to_seconds(20_000, 7_500), 12);
-    }
-
-    #[test]
-    fn ms_delta_zero_when_ticks_equal() {
-        assert_eq!(ms_delta_to_seconds(1_234_567, 1_234_567), 0);
-    }
-
-    #[test]
-    fn ms_delta_saturates_when_tick_behind_last_input() {
-        // Impossible in practice, but defensive : must not underflow.
-        assert_eq!(ms_delta_to_seconds(5_000, 10_000), 0);
-    }
-
-    #[test]
-    fn ms_delta_exact_second_boundary() {
-        // 60_000 ms delta = 60 s exactly.
-        assert_eq!(ms_delta_to_seconds(60_000, 0), 60);
-    }
-
-    #[test]
-    fn ms_delta_with_u32_near_max_last_input() {
-        // last_input near u32::MAX still fits after the widening cast.
-        // u32::MAX = 4_294_967_295 ms ≈ 49.7 days of uptime.
-        let last_input = u32::MAX;
-        let tick = u32::MAX as u64 + 30_000; // 30 s after last input
-        assert_eq!(ms_delta_to_seconds(tick, last_input), 30);
-    }
 
     // -- snapshot_differs ---------------------------------------------
 
