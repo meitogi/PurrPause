@@ -242,10 +242,9 @@ enum Mode {
     Watchdog,
     /// User-session keyboard/mouse activity probe. Spawned by the
     /// service via CreateProcessAsUserW, runs in the console user's
-    /// session, polls GetLastInputInfo, writes the last-input tick
-    /// timestamp to <exe_dir>/Data/lastinput.dat for the SYSTEM
-    /// service to read. See modes::input_probe for the Session 0
-    /// isolation rationale.
+    /// session, polls GetLastInputInfo, pushes the last-input tick
+    /// to the SYSTEM service over the named-pipe IPC every ~5 s. See
+    /// modes::input_probe for the Session 0 isolation rationale.
     InputProbe,
     /// Passcode-gated uninstall flow.
     Uninstall,

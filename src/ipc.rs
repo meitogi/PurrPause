@@ -1,17 +1,29 @@
-// Named-pipe IPC server. One-way (inbound-only) : the config UI writes
-// single-byte commands, the service reads and dispatches them. Message
-// framing is trivial (one byte = one command) so we skip serde/JSON.
+// Named-pipe IPC server. Inbound-only : clients write framed commands,
+// the service reads and dispatches them. Framing is a leading tag byte
+// followed by an optional fixed-size payload — no serde/JSON.
+//
+// Wire format :
+//   0x01                             TriggerPopupNow
+//   0x02                             Reload
+//   0x03                             Shutdown
+//   0x04 + 8 LE bytes (u64 tick_ms)  InputStamp
 //
 // Pipe name blends into native Windows-service pipe conventions
 // (`SystemEventsBroker-*`, `TrustedInstaller-Rpc`, ...). Explicit SDDL
 // grants BUILTIN\Users the minimum access needed to CreateFile the pipe
-// as a write client (GW+FR), so the future user-mode config UI can
-// signal us without needing SYSTEM.
+// as a write client (GW+FR), so both the user-mode config UI and the
+// user-session input probe can signal without needing SYSTEM.
 
 pub const PIPE_NAME: &str = r"\\.\pipe\SystemHealthAgent-Signal";
 
 #[cfg(windows)]
 const PIPE_SDDL: &str = "D:(A;;GWFR;;;BU)(A;;FA;;;SY)";
+
+/// Upper bound on a single message payload. 9 bytes is the max we
+/// currently write (0x04 tag + u64 tick) ; the extra headroom is
+/// cheap and covers future variants without touching the pipe.
+#[cfg(windows)]
+const MAX_MESSAGE_BYTES: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Message {
@@ -21,31 +33,41 @@ pub enum Message {
     Reload,
     /// Graceful shutdown of the service (rare — SCM stop is the normal path).
     Shutdown,
+    /// Absolute `GetTickCount64` tick of the last user input, pushed
+    /// by the user-session input probe every ~5 s. Replaces the b.8
+    /// file-based transport at `<exe_dir>/Data/lastinput.dat`.
+    InputStamp { tick_ms: u64 },
 }
 
 impl Message {
-    /// Parse one framed message. Only single-byte messages are accepted ;
-    /// anything else returns `None` and the caller closes the connection.
+    /// Parse one framed message. Rejects any shape not matching the
+    /// wire format ; `None` means the caller drops the connection.
     pub fn parse(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() != 1 {
-            return None;
-        }
-        match bytes[0] {
-            0x01 => Some(Message::TriggerPopupNow),
-            0x02 => Some(Message::Reload),
-            0x03 => Some(Message::Shutdown),
+        match bytes {
+            [0x01] => Some(Message::TriggerPopupNow),
+            [0x02] => Some(Message::Reload),
+            [0x03] => Some(Message::Shutdown),
+            [0x04, b0, b1, b2, b3, b4, b5, b6, b7] => {
+                let tick_ms = u64::from_le_bytes([*b0, *b1, *b2, *b3, *b4, *b5, *b6, *b7]);
+                Some(Message::InputStamp { tick_ms })
+            }
             _ => None,
         }
     }
 
-    #[allow(dead_code)]
-    pub fn to_byte(self) -> u8 {
-        // Consumed by tests here and by the future config-UI client that
-        // writes to the pipe. Not called in the production service path.
+    /// Encode a message to its wire bytes. Unit variants are 1 byte ;
+    /// `InputStamp` is 9 bytes (tag + LE u64).
+    pub fn to_bytes(self) -> Vec<u8> {
         match self {
-            Message::TriggerPopupNow => 0x01,
-            Message::Reload => 0x02,
-            Message::Shutdown => 0x03,
+            Message::TriggerPopupNow => vec![0x01],
+            Message::Reload => vec![0x02],
+            Message::Shutdown => vec![0x03],
+            Message::InputStamp { tick_ms } => {
+                let mut v = Vec::with_capacity(9);
+                v.push(0x04);
+                v.extend_from_slice(&tick_ms.to_le_bytes());
+                v
+            }
         }
     }
 }
@@ -111,9 +133,9 @@ mod win {
                     PIPE_ACCESS_INBOUND | FILE_FLAG_OVERLAPPED,
                     PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
                     PIPE_UNLIMITED_INSTANCES,
-                    0,   // out buffer size ignored for inbound-only
-                    16,  // in buffer size (we only read 1 byte, keep small)
-                    0,   // default timeout
+                    0,                       // out buffer size ignored for inbound-only
+                    MAX_MESSAGE_BYTES as u32, // in buffer size (max frame: 9 bytes InputStamp, 16 for headroom)
+                    0,                       // default timeout
                     Some(sa_holder.as_ptr()),
                 )
             };
@@ -225,9 +247,10 @@ mod win {
             }
         }
 
-        // Read one message byte, again with overlapped semantics so we
-        // can honour the cancel event mid-read.
-        let mut buf = [0u8; 1];
+        // Read one framed message, again with overlapped semantics so
+        // we can honour the cancel event mid-read. Buffer sized for
+        // the largest known variant plus headroom.
+        let mut buf = [0u8; MAX_MESSAGE_BYTES];
         let mut read_overlap = OVERLAPPED::default();
         read_overlap.hEvent = connect_event; // reuse : manual-reset, cleared here
         unsafe { let _ = ResetEvent(connect_event); }
@@ -329,20 +352,22 @@ mod win {
         }
     }
 
-    /// User-mode client that writes a single-byte `Message` to the
-    /// service's IPC pipe. Called from the config UI's Général tab
-    /// (« Déclencher une pause maintenant ») and after any save
-    /// (`Message::Reload`). The pipe SDDL grants `GW+FR` to
-    /// `BUILTIN\Users` so no elevation is required.
+    /// User-mode client that writes one framed `Message` to the
+    /// service's IPC pipe. Callers :
+    ///   - Config UI's Général tab (`TriggerPopupNow`, `Reload`)
+    ///   - User-session `--input-probe` child (`InputStamp` every ~5 s)
     ///
-    /// Retries a few times on `ERROR_PIPE_BUSY` — the pipe is
-    /// message-mode with `PIPE_UNLIMITED_INSTANCES` server-side so
-    /// contention is rare, but a service restart can transiently
-    /// close the pipe.
+    /// The pipe SDDL grants `GW+FR` to `BUILTIN\Users` so no elevation
+    /// is required. Retries a few times on `ERROR_PIPE_BUSY` — the pipe
+    /// is message-mode with `PIPE_UNLIMITED_INSTANCES` server-side so
+    /// contention is rare, but a service restart can transiently close
+    /// the pipe.
     pub fn send(msg: Message) -> Result<()> {
         let name_wide: HSTRING = PIPE_NAME.into();
         const ATTEMPTS: u32 = 3;
         const WAIT_MS: u32 = 500;
+
+        let bytes = msg.to_bytes();
 
         let mut last_err: Option<anyhow::Error> = None;
         for _ in 0..ATTEMPTS {
@@ -360,7 +385,7 @@ mod win {
 
             match handle {
                 Ok(h) if !h.is_invalid() => {
-                    let write_result = write_one_byte(h, msg.to_byte());
+                    let write_result = write_frame(h, &bytes);
                     unsafe { let _ = CloseHandle(h); }
                     return write_result;
                 }
@@ -390,15 +415,14 @@ mod win {
         Err(last_err.unwrap_or_else(|| anyhow!("send: exhausted retries")))
     }
 
-    fn write_one_byte(handle: HANDLE, byte: u8) -> Result<()> {
-        let buf = [byte];
+    fn write_frame(handle: HANDLE, bytes: &[u8]) -> Result<()> {
         let mut written: u32 = 0;
         let ok = unsafe {
-            WriteFile(handle, Some(&buf), Some(&mut written), None)
+            WriteFile(handle, Some(bytes), Some(&mut written), None)
         };
         ok.context("WriteFile(pipe)")?;
-        if written != 1 {
-            anyhow::bail!("short write: {written} bytes");
+        if written as usize != bytes.len() {
+            anyhow::bail!("short write: {written} bytes (expected {})", bytes.len());
         }
         Ok(())
     }
@@ -442,36 +466,91 @@ mod tests {
     }
 
     #[test]
-    fn parse_extra_bytes_returns_none() {
-        // Single-message framing: multi-byte payload is rejected so the
-        // client can't smuggle intent past the parser.
+    fn parse_extra_bytes_after_unit_variant_returns_none() {
+        // Unit variants are 1-byte only ; extra bytes after 0x01 must
+        // not be silently accepted or the client could smuggle intent.
         assert_eq!(Message::parse(&[0x01, 0x02]), None);
     }
 
     #[test]
-    fn to_byte_roundtrip() {
+    fn parse_input_stamp() {
+        // 0x04 tag + LE u64 for tick_ms = 0x0123_4567_89AB_CDEF.
+        let bytes = [0x04, 0xEF, 0xCD, 0xAB, 0x89, 0x67, 0x45, 0x23, 0x01];
+        assert_eq!(
+            Message::parse(&bytes),
+            Some(Message::InputStamp { tick_ms: 0x0123_4567_89AB_CDEF })
+        );
+    }
+
+    #[test]
+    fn parse_input_stamp_short_returns_none() {
+        // 8 bytes = tag missing an LE byte.
+        assert_eq!(
+            Message::parse(&[0x04, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07]),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_input_stamp_long_returns_none() {
+        // 10 bytes = one trailing byte too many.
+        assert_eq!(
+            Message::parse(&[0x04, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF]),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_input_stamp_wrong_tag_returns_none() {
+        // Correct payload length but tag != 0x04.
+        assert_eq!(
+            Message::parse(&[0x99, 0, 0, 0, 0, 0, 0, 0, 0]),
+            None
+        );
+    }
+
+    #[test]
+    fn to_bytes_roundtrip_unit_variants() {
         for m in [Message::TriggerPopupNow, Message::Reload, Message::Shutdown] {
-            assert_eq!(Message::parse(&[m.to_byte()]), Some(m));
+            let bytes = m.to_bytes();
+            assert_eq!(bytes.len(), 1, "{m:?} must encode to 1 byte");
+            assert_eq!(Message::parse(&bytes), Some(m));
         }
     }
 
-    // Wire-shape tests for the pipe client. The actual CreateFileW /
-    // WriteFile roundtrip requires a running server so it's part of
-    // the Windows host smoke — here we assert that the payload
-    // sent over the wire is exactly one byte per Message variant.
+    #[test]
+    fn to_bytes_input_stamp_roundtrip() {
+        for tick_ms in [0u64, 1, 5_000, u32::MAX as u64, u64::MAX] {
+            let msg = Message::InputStamp { tick_ms };
+            let bytes = msg.to_bytes();
+            assert_eq!(bytes.len(), 9, "InputStamp must encode to 9 bytes");
+            assert_eq!(bytes[0], 0x04);
+            assert_eq!(Message::parse(&bytes), Some(msg));
+        }
+    }
+
     #[test]
     fn client_wire_shape_trigger_is_0x01() {
-        assert_eq!(Message::TriggerPopupNow.to_byte(), 0x01);
+        assert_eq!(Message::TriggerPopupNow.to_bytes(), vec![0x01]);
     }
 
     #[test]
     fn client_wire_shape_reload_is_0x02() {
-        assert_eq!(Message::Reload.to_byte(), 0x02);
+        assert_eq!(Message::Reload.to_bytes(), vec![0x02]);
     }
 
     #[test]
     fn client_wire_shape_shutdown_is_0x03() {
-        assert_eq!(Message::Shutdown.to_byte(), 0x03);
+        assert_eq!(Message::Shutdown.to_bytes(), vec![0x03]);
+    }
+
+    #[test]
+    fn client_wire_shape_input_stamp_is_0x04_plus_le_u64() {
+        // tick_ms = 1 encodes as [0x04, 0x01, 0, 0, 0, 0, 0, 0, 0] LE.
+        assert_eq!(
+            Message::InputStamp { tick_ms: 1 }.to_bytes(),
+            vec![0x04, 0x01, 0, 0, 0, 0, 0, 0, 0]
+        );
     }
 
     #[test]

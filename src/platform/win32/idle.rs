@@ -1,7 +1,7 @@
 // Keyboard + mouse idleness signal for the service tick loop.
 // Does NOT call `GetLastInputInfo` directly (see below for why) —
-// reads the timestamp written by the user-session input probe
-// (`crate::modes::input_probe`) at `<exe_dir>/Data/lastinput.dat`.
+// reads the timestamp pushed by the user-session input probe
+// (`crate::modes::input_probe`) over the named-pipe IPC channel.
 //
 // # Session 0 pitfall
 //
@@ -13,61 +13,58 @@
 // its window station (they're not scoped by token), so impersonation
 // is ineffective for this API.
 //
-// The workaround (b.8) : a lightweight `--input-probe` child process
-// spawned in the interactive user session polls `GetLastInputInfo` on
-// its own turf and writes the absolute u64 tick of the last input to
-// a shared file. This module reads it and computes idle seconds
-// against the current tick. See `crate::modes::input_probe` for the
-// probe side.
+// # Transport
+//
+// A lightweight `--input-probe` child process spawned in the
+// interactive user session polls `GetLastInputInfo` on its own turf
+// and pushes the absolute u64 tick of the last input to the service's
+// named-pipe IPC (`Message::InputStamp { tick_ms }`) every ~5 s. The
+// service's pipe thread drains those onto a secondary mpsc that the
+// tick loop consumes ; each timeout tick materializes the latest
+// stamp into `InputStampState` and passes a reference here.
+//
+// (b.8 used a file at `<exe_dir>/Data/lastinput.dat` for the same
+// transport ; b.9 switched to the pipe — zero disk writes, reuses the
+// existing IPC infra between config UI and service.)
 //
 // # Fallbacks
 //
-// File missing / short read / older than `MAX_PROBE_STALENESS_MS` →
-// return 0 (assume active). Any probe glitch errs toward firing the
-// popup rather than silently deferring forever.
-
-use std::fs;
-use std::path::PathBuf;
+// State missing / older than `MAX_PROBE_STALENESS_MS` → return 0
+// (assume active). Any probe glitch errs toward firing the popup
+// rather than silently deferring forever.
 
 use windows::Win32::System::SystemInformation::GetTickCount64;
 
-use crate::modes::input_probe::LASTINPUT_FILE;
-
 /// Beyond this staleness we treat the probe as dead. 30 s = 6× the
-/// probe's 5 s poll cadence, so a healthy probe never hits the
+/// probe's 5 s push cadence, so a healthy probe never hits the
 /// threshold and a crashed one is detected within one service tick.
 const MAX_PROBE_STALENESS_MS: u64 = 30_000;
 
-/// Seconds since the last keyboard or mouse input on the interactive
-/// user session, sourced from the user-session probe file. Returns 0
-/// on any file-read / staleness failure so the tick errs toward
-/// "assume active".
-pub fn idle_seconds() -> u64 {
-    let path = probe_file_path();
-    let buf = match fs::read(&path) {
-        Ok(b) if b.len() == 16 => b,
-        Ok(b) => {
-            tracing::warn!(
-                len = b.len(),
-                path = %path.display(),
-                "lastinput.dat wrong size - assuming active"
-            );
-            return 0;
-        }
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                path = %path.display(),
-                "lastinput.dat read failed - assuming active (probe may be respawning)"
-            );
-            return 0;
-        }
-    };
+/// Latest input-stamp snapshot materialized by the service tick loop
+/// from the pipe transport. Mirrors the two-u64 shape of the b.8 file
+/// transport so `idle_seconds` staleness math is unchanged.
+#[derive(Debug, Clone, Copy)]
+pub struct InputStampState {
+    /// Absolute `GetTickCount64` of the last user input, as reported
+    /// by the user-session probe over the IPC pipe.
+    pub last_input_tick_ms: u64,
+    /// Absolute `GetTickCount64` when this stamp was received on the
+    /// service side. Used for staleness detection so a dead probe is
+    /// caught within one service tick.
+    pub received_at_tick_ms: u64,
+}
 
-    let last_input_tick = u64::from_be_bytes(buf[0..8].try_into().unwrap());
-    let written_at_tick = u64::from_be_bytes(buf[8..16].try_into().unwrap());
+/// Seconds since the last keyboard or mouse input on the interactive
+/// user session, sourced from the input-probe IPC push. Returns 0 on
+/// missing / stale state so the tick errs toward "assume active".
+pub fn idle_seconds(state: Option<&InputStampState>) -> u64 {
+    let Some(s) = state else {
+        // Probe never pushed yet — usually the first few ticks after
+        // service startup while the probe is spawning + connecting.
+        return 0;
+    };
     let current_tick = unsafe { GetTickCount64() };
-    let staleness_ms = current_tick.saturating_sub(written_at_tick);
+    let staleness_ms = current_tick.saturating_sub(s.received_at_tick_ms);
     if staleness_ms > MAX_PROBE_STALENESS_MS {
         tracing::warn!(
             staleness_ms,
@@ -75,19 +72,6 @@ pub fn idle_seconds() -> u64 {
         );
         return 0;
     }
-    let idle_ms = current_tick.saturating_sub(last_input_tick);
+    let idle_ms = current_tick.saturating_sub(s.last_input_tick_ms);
     idle_ms / 1000
-}
-
-fn probe_file_path() -> PathBuf {
-    // Same convention as `modes::input_probe` : <exe_dir>/Data/lastinput.dat.
-    // Both service (SYSTEM, current_exe = registered ImagePath) and
-    // probe (console user session, current_exe = same ImagePath via
-    // CreateProcessAsUserW) resolve to the same absolute path.
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            return parent.join("Data").join(LASTINPUT_FILE);
-        }
-    }
-    PathBuf::from("Data").join(LASTINPUT_FILE)
 }

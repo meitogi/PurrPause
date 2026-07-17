@@ -39,6 +39,7 @@ mod win {
 
     use anyhow::{Context, Result};
     use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::SystemInformation::GetTickCount64;
     use windows::Win32::System::Threading::SetEvent;
     use windows_service::define_windows_service;
     use windows_service::service::{
@@ -109,6 +110,16 @@ mod win {
         // before we spawn any new popups.
         if let Some(exe_parent) = exe.parent() {
             kill_orphan_webview2_workers(&webview2_dir(exe_parent));
+        }
+
+        // b.9 : the input-probe transport moved from a file
+        // (<exe_dir>/Data/lastinput.dat) to the IPC pipe. Any pre-
+        // existing file left by a b.8 install is now orphan bookkeeping
+        // — remove it silently so upgrades leave no stale artefact on
+        // disk. Idempotent, ENOENT is not an error.
+        if let Some(exe_parent) = exe.parent() {
+            let stale = exe_parent.join("Data").join("lastinput.dat");
+            let _ = std::fs::remove_file(&stale);
         }
 
         let state_path = PathBuf::from(STATE_DAT);
@@ -213,7 +224,13 @@ mod win {
         let ipc_tx = tx.clone();
         let sendable = ipc::SendableHandle(cancel_event);
         let ipc_tx_map = ipc_tx;
-        let pipe_thread = thread::spawn(move || run_pipe(sendable, ipc_tx_map));
+        // Secondary channel dedicated to input-stamp pushes from the
+        // pipe thread. Kept out of the main TickCommand mpsc so the
+        // ~5 s stamp cadence (matching TICK_INTERVAL) cannot starve
+        // the timeout branch that drives the actual tick logic — the
+        // tick loop drains this at the start of each timeout tick.
+        let (stamp_tx, stamp_rx) = mpsc::channel::<idle::InputStampState>();
+        let pipe_thread = thread::spawn(move || run_pipe(sendable, ipc_tx_map, stamp_tx));
 
         let notify_running_flag = Arc::new(AtomicBool::new(true));
         let notify_thread = spawn_notify(tx.clone(), notify_running_flag.clone());
@@ -234,11 +251,12 @@ mod win {
         let mut last_popup_child: Option<SpawnedChild> = None;
         let mut last_widget_children: HashMap<u32, SpawnedChild> = HashMap::new();
 
-        // User-session input probe. Spawned once here so the file at
-        // <exe_dir>/Data/lastinput.dat exists before the first
-        // idle::idle_seconds() call in the tick loop. Respawned by
-        // the tick loop if it dies. See modes::input_probe for the
-        // Session 0 rationale.
+        // User-session input probe. Spawned once here so the pipe
+        // client is ready before the first idle::idle_seconds() call
+        // in the tick loop. `idle_seconds` returns 0 (assume active)
+        // if no stamp has arrived yet, so the timing window is safe.
+        // Respawned by the tick loop if it dies. See modes::input_probe
+        // for the Session 0 rationale.
         let mut input_probe_child: Option<SpawnedChild> = None;
         match spawn_input_probe(&exe) {
             Ok(child) => {
@@ -285,6 +303,7 @@ mod win {
             &mut input_probe_child,
             &exe,
             &rx,
+            stamp_rx,
             power_rx,
         );
 
@@ -292,11 +311,10 @@ mod win {
         notify_running_flag.store(false, Ordering::Relaxed);
         unsafe { let _ = SetEvent(cancel_event); }
 
-        // Terminate the input probe explicitly. Without this the
-        // old probe would linger until user log-off and race a new
-        // probe spawned by the next service instance for the same
-        // lastinput.dat file. HANDLE-based terminate is immune to
-        // PID recycle.
+        // Terminate the input probe explicitly. Without this the old
+        // probe would linger until user log-off and hold onto its pipe
+        // client + process handle across the next service restart.
+        // HANDLE-based terminate is immune to PID recycle.
         if let Some(probe) = input_probe_child.take() {
             probe.terminate();
         }
@@ -342,6 +360,7 @@ mod win {
         input_probe_child: &mut Option<SpawnedChild>,
         exe: &Path,
         rx: &mpsc::Receiver<TickCommand>,
+        stamp_rx: mpsc::Receiver<idle::InputStampState>,
         power_rx: mpsc::Receiver<power_notify::PowerEvent>,
     ) -> Result<()> {
         // 60 s idle threshold. Toggled at runtime via
@@ -373,6 +392,12 @@ mod win {
         // component signals so bug reports show why the counter did or
         // didn't advance.
         let mut was_idle: Option<bool> = None;
+        // Latest input stamp materialized from the pipe transport. Held
+        // between ticks so a probe that stops pushing decays into
+        // staleness (`idle::idle_seconds` returns 0 after 30 s of no
+        // new stamps) rather than snapping back to "assume active"
+        // instantly.
+        let mut input_stamp: Option<idle::InputStampState> = None;
 
         loop {
             match rx.recv_timeout(TICK_INTERVAL) {
@@ -520,7 +545,14 @@ mod win {
                     let now = SystemTime::now();
                     let playing_video_or_audio_now = busy_detector::playing_video_or_audio();
                     let gamepad_seen = gamepad::gamepad_active_since_last_call();
-                    let idle_secs = idle::idle_seconds();
+                    // Drain any pending input-stamp pushes from the
+                    // pipe thread ; keep the newest (stamps are
+                    // monotonic). Held state carries across ticks
+                    // when the drain sees nothing.
+                    while let Ok(stamp) = stamp_rx.try_recv() {
+                        input_stamp = Some(stamp);
+                    }
+                    let idle_secs = idle::idle_seconds(input_stamp.as_ref());
                     let is_idle_now = if config.count_active_time {
                         signals::idle_tick_should_pause(
                             idle_secs,
@@ -778,21 +810,38 @@ mod win {
         }
     }
 
-    fn run_pipe(cancel: ipc::SendableHandle, tx: mpsc::Sender<TickCommand>) {
+    fn run_pipe(
+        cancel: ipc::SendableHandle,
+        tx: mpsc::Sender<TickCommand>,
+        stamp_tx: mpsc::Sender<idle::InputStampState>,
+    ) {
         let (msg_tx, msg_rx) = mpsc::channel::<Message>();
         let pipe_tx = tx.clone();
-        // Bridge Message → TickCommand on the same thread. Spawn the
-        // accept loop, then relay messages until the pipe closes.
+        // Bridge Message → (TickCommand OR stamp) on the same thread.
+        // Spawn the accept loop, then relay messages until the pipe
+        // closes. `InputStamp` bypasses the TickCommand mpsc and goes
+        // straight to a dedicated stamp channel — see the run_service
+        // comment on the stamp channel for the starvation rationale.
         let accept_result = thread::spawn(move || ipc::run_server(cancel, msg_tx));
         while let Ok(msg) = msg_rx.recv() {
-            let cmd = match msg {
-                Message::TriggerPopupNow => TickCommand::Trigger,
-                Message::Reload => TickCommand::Reload,
-                Message::Shutdown => TickCommand::Shutdown,
-            };
-            let _ = pipe_tx.send(cmd);
-            if matches!(msg, Message::Shutdown) {
-                break;
+            match msg {
+                Message::TriggerPopupNow => {
+                    let _ = pipe_tx.send(TickCommand::Trigger);
+                }
+                Message::Reload => {
+                    let _ = pipe_tx.send(TickCommand::Reload);
+                }
+                Message::Shutdown => {
+                    let _ = pipe_tx.send(TickCommand::Shutdown);
+                    break;
+                }
+                Message::InputStamp { tick_ms } => {
+                    let received_at = unsafe { GetTickCount64() };
+                    let _ = stamp_tx.send(idle::InputStampState {
+                        last_input_tick_ms: tick_ms,
+                        received_at_tick_ms: received_at,
+                    });
+                }
             }
         }
         if let Ok(Err(e)) = accept_result.join() {
