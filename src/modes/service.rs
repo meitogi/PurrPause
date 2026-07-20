@@ -332,10 +332,17 @@ mod win {
                 input_probe_child = Some(child);
             }
             Err(e) => {
-                tracing::warn!(
-                    error = ?e,
-                    "input-probe initial spawn failed - will retry on next tick"
-                );
+                if crate::platform::win32::spawn_user::is_user_session_not_ready(&e) {
+                    tracing::info!(
+                        error = %e,
+                        "input-probe initial spawn deferred - user session not ready yet, will retry on next tick"
+                    );
+                } else {
+                    tracing::warn!(
+                        error = ?e,
+                        "input-probe initial spawn failed - will retry on next tick"
+                    );
+                }
             }
         }
 
@@ -344,6 +351,13 @@ mod win {
         // refire it now so they pick up where they left off. Anti-bypass
         // (unclean shutdown) does NOT reach this block — that path
         // returns relaunch_now = false and full-reset shape.
+        //
+        // On cold boot the user session usually isn't ready yet (~5 s
+        // after service start), so this initial attempt often fails
+        // with a session-not-ready error. `popup_pending` stays true
+        // in that case and the tick loop's cold-start-retry branch
+        // (step 2c) drives the actual refire once the OS finishes the
+        // logon sequence.
         if relaunch_now {
             tracing::info!("cold-start relaunch: refiring popup for user rebooted mid-popup");
             if let Err(e) = fire_popup(
@@ -356,7 +370,14 @@ mod win {
                 &mut last_popup_child,
                 &config.passcode_hash,
             ) {
-                tracing::warn!(error = ?e, "cold-start relaunch failed - will retry on next tick");
+                if crate::platform::win32::spawn_user::is_user_session_not_ready(&e) {
+                    tracing::info!(
+                        error = %e,
+                        "cold-start relaunch deferred - user session not ready yet, tick loop will retry"
+                    );
+                } else {
+                    tracing::warn!(error = ?e, "cold-start relaunch failed - tick loop will retry");
+                }
             }
         }
 
@@ -760,9 +781,53 @@ mod win {
                                 *input_probe_child = Some(child);
                             }
                             Err(e) => {
+                                if crate::platform::win32::spawn_user::is_user_session_not_ready(&e) {
+                                    tracing::info!(
+                                        error = %e,
+                                        "input-probe respawn deferred - user session not ready, will retry on next tick"
+                                    );
+                                } else {
+                                    tracing::warn!(
+                                        error = ?e,
+                                        "input-probe respawn failed - will retry on next tick"
+                                    );
+                                }
+                            }
+                        }
+                    }
+
+                    // 2c. Cold-start relaunch retry. `popup_pending`
+                    //     came out of runtime.dat set to `true` and the
+                    //     resolve_cold_start "relaunch" branch fired
+                    //     (see the pre-loop attempt), but the initial
+                    //     spawn either wasn't attempted (relaunch_now
+                    //     was false because the pre-loop already
+                    //     handled it) or failed because the user
+                    //     session wasn't ready. `last_popup_child.is_none()`
+                    //     uniquely identifies "never spawned" here
+                    //     (crash-retry path always leaves the exited
+                    //     child in `last_popup_child`). Retry each tick
+                    //     until spawn succeeds.
+                    if *popup_pending && last_popup_child.is_none() {
+                        if let Err(e) = fire_popup(
+                            exe,
+                            last_popup,
+                            paused_secs,
+                            popup_pending,
+                            last_heartbeat,
+                            fired,
+                            last_popup_child,
+                            &config.passcode_hash,
+                        ) {
+                            if crate::platform::win32::spawn_user::is_user_session_not_ready(&e) {
+                                tracing::info!(
+                                    error = %e,
+                                    "cold-start relaunch retry deferred - user session not ready"
+                                );
+                            } else {
                                 tracing::warn!(
                                     error = ?e,
-                                    "input-probe respawn failed - will retry on next tick"
+                                    "cold-start relaunch retry failed - will retry on next tick"
                                 );
                             }
                         }
@@ -990,7 +1055,14 @@ mod win {
                 Ok(())
             }
             Err(e) => {
-                tracing::warn!(error = ?e, "popup spawn failed - will retry on next tick");
+                if crate::platform::win32::spawn_user::is_user_session_not_ready(&e) {
+                    tracing::info!(
+                        error = %e,
+                        "popup spawn deferred - user session not ready, caller will retry"
+                    );
+                } else {
+                    tracing::warn!(error = ?e, "popup spawn failed - will retry on next tick");
+                }
                 Err(e)
             }
         }

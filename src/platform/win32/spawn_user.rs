@@ -45,6 +45,29 @@ use crate::platform::argv::build_command_line;
 
 const NO_USER_SESSION: u32 = 0xFFFFFFFF;
 
+/// Message marker used by [`spawn_in_active_user_session`] when the OS
+/// has no active console session. Matched by
+/// [`is_user_session_not_ready`] so callers can pick a benign log level
+/// during the boot window where the user hasn't finished logging in
+/// yet.
+const ERR_MSG_NO_ACTIVE_SESSION: &str = "no active console session";
+
+/// Message marker for the `WTSQueryUserToken → ERROR_NO_TOKEN` case
+/// (logon screen shown, RDP disconnected, session locked before token
+/// materialised). Same benign-at-boot semantics as
+/// [`ERR_MSG_NO_ACTIVE_SESSION`].
+const ERR_MSG_NO_USER_TOKEN: &str = "no user token for session";
+
+/// True when `e` originated from a "user session not ready" condition —
+/// either the console session isn't attached yet or the user token
+/// hasn't materialised. Callers use this to downgrade the log level
+/// from WARN to INFO during service startup and to know a spawn retry
+/// will likely succeed once the OS finishes the logon sequence.
+pub fn is_user_session_not_ready(e: &anyhow::Error) -> bool {
+    let msg = e.to_string();
+    msg.contains(ERR_MSG_NO_ACTIVE_SESSION) || msg.contains(ERR_MSG_NO_USER_TOKEN)
+}
+
 /// A spawned user-session process. Owns the process HANDLE so
 /// TerminateProcess targets the specific process even after PID reuse.
 /// Drop closes the HANDLE ; callers never need to CloseHandle manually.
@@ -128,7 +151,7 @@ impl crate::platform::Spawner for RealSpawner {
 pub fn spawn_in_active_user_session(exe: &Path, args: &[&OsStr]) -> Result<SpawnedChild> {
     let session_id = unsafe { WTSGetActiveConsoleSessionId() };
     if session_id == NO_USER_SESSION {
-        anyhow::bail!("no active console session");
+        anyhow::bail!("{ERR_MSG_NO_ACTIVE_SESSION}");
     }
 
     let mut user_token = HANDLE::default();
@@ -136,7 +159,7 @@ pub fn spawn_in_active_user_session(exe: &Path, args: &[&OsStr]) -> Result<Spawn
     if let Err(e) = query {
         if e.code().0 == ERROR_NO_TOKEN.0 as i32 {
             anyhow::bail!(
-                "no user token for session {session_id} (logon screen / RDP disconnected)"
+                "{ERR_MSG_NO_USER_TOKEN} {session_id} (logon screen / RDP disconnected)"
             );
         }
         return Err(anyhow!("WTSQueryUserToken: {e}"));
