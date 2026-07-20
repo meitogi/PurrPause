@@ -157,7 +157,14 @@ pub fn spawn_in_active_user_session(exe: &Path, args: &[&OsStr]) -> Result<Spawn
     let mut user_token = HANDLE::default();
     let query = unsafe { WTSQueryUserToken(session_id, &mut user_token) };
     if let Err(e) = query {
-        if e.code().0 == ERROR_NO_TOKEN.0 as i32 {
+        // WTSQueryUserToken wraps the Win32 code as an HRESULT via
+        // HRESULT_FROM_WIN32 : ERROR_NO_TOKEN (0x3F0) surfaces as
+        // 0x800703F0. The naive `e.code().0 == ERROR_NO_TOKEN.0 as i32`
+        // comparison (raw Win32 code vs HRESULT) is always false and
+        // silently falls through to the generic message, which then
+        // fails to match `is_user_session_not_ready` downstream.
+        let hresult_no_token = (0x8007_0000u32 | ERROR_NO_TOKEN.0) as i32;
+        if e.code().0 == hresult_no_token {
             anyhow::bail!(
                 "{ERR_MSG_NO_USER_TOKEN} {session_id} (logon screen / RDP disconnected)"
             );

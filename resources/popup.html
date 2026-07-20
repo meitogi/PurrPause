@@ -686,7 +686,21 @@
     })();
   </script>
 
-  <!-- Countdown + dismiss wiring (works in both preview and prod). -->
+  <!-- Countdown + dismiss wiring (works in both preview and prod).
+       Wall-clock based, NOT tick-based : `remaining` is recomputed
+       from `Date.now() - startAt` on every setInterval firing. This
+       means a system suspend / hibernate DURING the popup naturally
+       propagates — on resume `Date.now()` reflects the wall-clock jump,
+       remaining collapses to 0, dismiss enables without any IPC signal
+       from the service side. Symmetric with the scheduler's
+       "downtime >= popup duration -> break already taken" rule at
+       cold-start.
+
+       Legacy pre-b.23 implementation decremented
+       `body.dataset.remainingSeconds` by 1 per setInterval firing
+       (paused during suspend), so a 5-min suspend during a 1-min popup
+       resumed with the popup still counting the same remaining seconds
+       as before sleep. TODO: remove this comment once b.23 has soaked. -->
   <script>
     (function () {
       const dismiss = document.getElementById('dismiss');
@@ -700,8 +714,18 @@
         const tpl = document.body.dataset.countdownTemplate || '{mm}:{ss}';
         return tpl.replace(/\{mm\}/g, m).replace(/\{ss\}/g, r);
       };
+      const initial = parseInt(
+        document.body.dataset.remainingSeconds || '0', 10);
+      const startAt = Date.now();
+      const wallRemaining = () => {
+        const elapsedSecs = Math.floor((Date.now() - startAt) / 1000);
+        return Math.max(0, initial - elapsedSecs);
+      };
       const render = () => {
-        const s = parseInt(document.body.dataset.remainingSeconds || '0', 10);
+        const s = wallRemaining();
+        // Mirror into the dataset so external code that still reads it
+        // (bounce script, etc) sees the current value.
+        document.body.dataset.remainingSeconds = String(s);
         cdEl.textContent = s > 0 ? fmt(s) : '';
         if (s <= 0) {
           dismiss.disabled = false;
@@ -716,11 +740,7 @@
         dismiss.classList.add('pulse');
       }
       render();
-      setInterval(() => {
-        const s = parseInt(document.body.dataset.remainingSeconds || '0', 10);
-        if (s > 0) document.body.dataset.remainingSeconds = String(s - 1);
-        render();
-      }, 1000);
+      setInterval(render, 1000);
       dismiss.addEventListener('click', () => {
         if (window.ipc && typeof window.ipc.postMessage === 'function') {
           window.ipc.postMessage('dismiss');

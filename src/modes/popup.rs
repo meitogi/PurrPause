@@ -152,7 +152,7 @@ pub fn run(
 mod windows_impl {
     use std::borrow::Cow;
     use std::path::{Path, PathBuf};
-    use std::time::Duration;
+    use std::time::{Duration, SystemTime};
 
     use anyhow::{Context, Result};
 
@@ -600,16 +600,32 @@ mod windows_impl {
             Some(guard)
         };
 
-        // Post-countdown unlock timer. After `countdown` seconds the
-        // dismiss button appears — no reason to keep the lockdown
-        // (LL hook, always-on-top, focus theft) active past that point.
-        // The proxy is Send ; sleeping on a dedicated thread avoids
-        // adding polling to tao's message pump.
+        // Post-countdown unlock timer. After `countdown` seconds
+        // (WALL-CLOCK, so system suspend counts) the dismiss button
+        // appears, the LL keyboard hook lifts, always-on-top drops,
+        // and Alt+F4 is unblocked.
+        //
+        // Uses a poll loop against `SystemTime::now()` rather than
+        // `std::thread::sleep(timer_secs)` because on Windows `Sleep()`
+        // is not guaranteed to include suspend time — a long
+        // hibernation during the popup could freeze the timer, leaving
+        // Alt+F4 blocked / popup topmost even though the JS wall-clock
+        // check (popup.html) has already enabled the dismiss button.
+        // Poll cadence 500 ms keeps CPU cost negligible ; the timer
+        // thread sleeps most of the time.
         let timer_proxy = event_loop.create_proxy();
         let timer_secs = countdown as u64;
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_secs(timer_secs));
-            let _ = timer_proxy.send_event(UserEvent::CountdownExpired);
+        let start_wall = SystemTime::now();
+        std::thread::spawn(move || loop {
+            std::thread::sleep(Duration::from_millis(500));
+            let elapsed = SystemTime::now()
+                .duration_since(start_wall)
+                .unwrap_or(Duration::ZERO)
+                .as_secs();
+            if elapsed >= timer_secs {
+                let _ = timer_proxy.send_event(UserEvent::CountdownExpired);
+                break;
+            }
         });
 
         let mut countdown_expired = false;

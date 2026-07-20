@@ -180,7 +180,7 @@ pub struct ColdStartDecision {
 /// keeps using [`resolve_last_popup`] with `last_popup: None` for the
 /// fresh-install / legacy-shift branch.
 ///
-/// Four ordered rules :
+/// Five ordered rules :
 /// 1. **Threshold reset** — `elapsed = now - last_popup >= reset_threshold_hours * 3600`.
 ///    Full reset : `last_popup = now`, `paused_secs = 0`,
 ///    `popup_pending = false`, no relaunch. Child was away long enough
@@ -189,12 +189,20 @@ pub struct ColdStartDecision {
 ///    Signature of "kid killed the service mid-popup to skip it".
 ///    Full reset (same shape as threshold) : the trick costs one full
 ///    cycle before the next popup fires.
-/// 3. **Relaunch pending popup** — else if `popup_pending && was_clean_shutdown`.
-///    Signature of "user cleanly rebooted the PC while a popup was
-///    displayed". Keep `last_popup` unchanged, keep `popup_pending`,
-///    set `relaunch_now = true`. The caller fires the popup right
-///    after cold-start so the user picks up where they left off.
-/// 4. **Credit downtime** — else (popup was NOT pending). Keep
+/// 3. **Absence covered the break** — else if
+///    `popup_pending && was_clean_shutdown && downtime >= duration_minutes * 60`.
+///    User cleanly rebooted mid-popup AND stayed away at least as long
+///    as the popup's own countdown asked them to. The absence *is* the
+///    break — full reset, no relaunch. Kids-can't-bypass-by-rebooting
+///    is preserved because either downtime is below duration (goes to
+///    rule 4, relaunch) or elapsed is above the interval threshold
+///    (goes to rule 1, threshold reset).
+/// 4. **Relaunch pending popup** — else if `popup_pending && was_clean_shutdown`.
+///    Short clean reboot mid-popup — the popup deserves to be re-shown.
+///    Keep `last_popup` unchanged, keep `popup_pending`, set
+///    `relaunch_now = true`. Caller fires the popup right after
+///    cold-start.
+/// 5. **Credit downtime** — else (popup was NOT pending). Keep
 ///    `last_popup`, credit `downtime = now - last_heartbeat` into
 ///    `paused_secs`, no relaunch. Clock skew (`now < last_heartbeat`)
 ///    treated as zero downtime, never negative.
@@ -239,6 +247,22 @@ pub fn resolve_cold_start(inputs: ResolveInputs, config: &Config) -> ColdStartDe
     }
 
     if popup_pending && was_clean_shutdown {
+        let downtime = now
+            .duration_since(last_heartbeat)
+            .unwrap_or(Duration::ZERO);
+        let popup_duration_secs = u64::from(config.duration_minutes)
+            .saturating_mul(60);
+        if downtime.as_secs() >= popup_duration_secs {
+            // The absence itself was longer than the break the popup
+            // was going to force. Treat as taken — fresh cycle from now,
+            // no relaunch.
+            return ColdStartDecision {
+                last_popup: now,
+                paused_secs: 0,
+                popup_pending: false,
+                relaunch_now: false,
+            };
+        }
         return ColdStartDecision {
             last_popup,
             paused_secs,
@@ -1277,6 +1301,57 @@ mod tests {
         let dec = resolve_cold_start(inputs, &cfg);
         assert_eq!(dec.last_popup, epoch_plus(lp_secs));
         assert_eq!(dec.paused_secs, 400); // unchanged, no downtime credit
+        assert!(dec.popup_pending);
+        assert!(dec.relaunch_now);
+    }
+
+    #[test]
+    fn resolve_cold_start_pending_clean_shutdown_long_downtime_full_reset() {
+        // popup_pending + clean shutdown BUT downtime >= duration_minutes*60.
+        // Absence covered the break already ; full reset instead of
+        // relaunching a popup for a break the user already took.
+        let mut cfg = config_with(2.0, vec![], false);
+        cfg.duration_minutes = 1; // popup would force 60 s of break.
+        let now_secs = 100_000;
+        let lp_secs = now_secs - 5 * 60; // 5 min elapsed, below threshold.
+        let hb_secs = now_secs - 120; // 2 min absence, above the 60 s bar.
+        let inputs = cold_inputs(now_secs, lp_secs, hb_secs, 0, true, true);
+        let dec = resolve_cold_start(inputs, &cfg);
+        assert_eq!(dec.last_popup, epoch_plus(now_secs));
+        assert_eq!(dec.paused_secs, 0);
+        assert!(!dec.popup_pending);
+        assert!(!dec.relaunch_now);
+    }
+
+    #[test]
+    fn resolve_cold_start_pending_clean_shutdown_downtime_exactly_at_duration_full_reset() {
+        // Boundary : downtime == duration_minutes*60 exactly → full reset
+        // (inclusive bound, matches the ">= duration" semantics).
+        let mut cfg = config_with(2.0, vec![], false);
+        cfg.duration_minutes = 1;
+        let now_secs = 100_000;
+        let lp_secs = now_secs - 5 * 60;
+        let hb_secs = now_secs - 60; // exactly the popup duration.
+        let inputs = cold_inputs(now_secs, lp_secs, hb_secs, 0, true, true);
+        let dec = resolve_cold_start(inputs, &cfg);
+        assert_eq!(dec.last_popup, epoch_plus(now_secs));
+        assert!(!dec.relaunch_now);
+    }
+
+    #[test]
+    fn resolve_cold_start_pending_clean_shutdown_short_downtime_still_relaunches() {
+        // popup_pending + clean shutdown + downtime BELOW duration →
+        // relaunch (the standard rule 4 case). Guards against my
+        // "duration" gate over-firing.
+        let mut cfg = config_with(2.0, vec![], false);
+        cfg.duration_minutes = 5; // 300 s bar.
+        let now_secs = 100_000;
+        let lp_secs = now_secs - 5 * 60;
+        let hb_secs = now_secs - 30; // 30 s absence, well below 300 s.
+        let inputs = cold_inputs(now_secs, lp_secs, hb_secs, 400, true, true);
+        let dec = resolve_cold_start(inputs, &cfg);
+        assert_eq!(dec.last_popup, epoch_plus(lp_secs));
+        assert_eq!(dec.paused_secs, 400);
         assert!(dec.popup_pending);
         assert!(dec.relaunch_now);
     }
