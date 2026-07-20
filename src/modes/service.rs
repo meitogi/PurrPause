@@ -194,21 +194,32 @@ mod win {
                         .duration_since(state.last_heartbeat)
                         .map(|d| d.as_secs())
                         .unwrap_or(0);
-                    // Gate Rule B on clean shutdown. `was_clean_shutdown`
-                    // is true when the previous graceful shutdown stamped
+                    // Clean-shutdown gate. `was_clean_shutdown` is true
+                    // when the previous graceful shutdown stamped
                     // last_clean_shutdown_at at or after the final
                     // heartbeat. v2 migrations populate the field with
                     // UNIX_EPOCH → always < heartbeat → treated as
-                    // unclean (safe : fires once on any format-upgrade
-                    // boot, then converges to actual shutdown state).
+                    // unclean (safe : converges to actual shutdown state
+                    // after the first graceful boot cycle).
+                    //
+                    // Semantics : the anti-bypass rule downstream fires
+                    // on `popup_pending == true`. That's the correct
+                    // punishment when the child killed the service mid-
+                    // popup (unclean shutdown, kid-kill signature). It
+                    // would be WRONG punishment when the user cleanly
+                    // shut the PC down while a popup was displayed (the
+                    // popup died as collateral of the OS shutdown, no
+                    // intent to bypass). Discriminant : clear
+                    // popup_pending on clean shutdown so anti-bypass
+                    // only fires on the unclean case.
                     let was_clean_shutdown =
                         state.last_clean_shutdown_at >= state.last_heartbeat;
                     let popup_pending_pre_gate = state.popup_pending;
-                    if !was_clean_shutdown && state.popup_pending {
+                    if was_clean_shutdown && state.popup_pending {
                         tracing::info!(
                             last_heartbeat = ?state.last_heartbeat,
                             last_clean_shutdown_at = ?state.last_clean_shutdown_at,
-                            "unclean shutdown detected - clearing popup_pending pre-Rule-B"
+                            "clean shutdown with popup_pending detected - clearing pre-anti-bypass (legitimate PC restart, not kid-killing service)"
                         );
                         state.popup_pending = false;
                     }
@@ -224,17 +235,25 @@ mod win {
                         },
                         &config,
                     );
-                    // Rule identification for bug-report clarity. Both
-                    // "threshold" and "anti-bypass" produce the same
-                    // (last_popup=now, paused_secs=0) shape — the raw
-                    // popup_pending input (before the unclean-shutdown
-                    // gate rewrote it) disambiguates them.
+                    // Rule identification for bug-report clarity.
+                    // Threshold and anti-bypass both produce
+                    // (last_popup=now, paused_secs=0). Elapsed vs
+                    // threshold disambiguates : if elapsed already
+                    // crossed the threshold, threshold rule fired first
+                    // inside resolve_cold_start (short-circuit) and
+                    // popup_pending was irrelevant.
                     let full_reset =
                         d.last_popup >= now && d.paused_secs == 0 && !d.popup_pending;
-                    let rule = if full_reset && popup_pending_pre_gate {
-                        "anti-bypass (popup_pending on unclean shutdown, full reset)"
-                    } else if full_reset {
+                    let threshold_secs =
+                        (f64::from(config.reset_threshold_hours) * 3600.0) as u64;
+                    let elapsed_secs = now
+                        .duration_since(state.last_popup)
+                        .unwrap_or(Duration::ZERO)
+                        .as_secs();
+                    let rule = if full_reset && elapsed_secs >= threshold_secs {
                         "threshold (elapsed >= reset_threshold_hours, full reset)"
+                    } else if full_reset {
+                        "anti-bypass (popup_pending on unclean shutdown, full reset)"
                     } else {
                         "credit (keep cycle, absorb downtime into paused_secs)"
                     };
