@@ -61,6 +61,11 @@ mod win {
     use crate::signals;
 
     const TICK_INTERVAL: Duration = Duration::from_secs(5);
+    /// Divergence between wall-clock delta and unbiased-interrupt-time
+    /// delta across a tick that triggers a `last_popup` shift. Filters
+    /// normal 5 s tick jitter and mpsc receiver latency (typically < 15
+    /// s) from being interpreted as a jump.
+    const CLOCK_JUMP_THRESHOLD: Duration = Duration::from_secs(60);
     const DEBOUNCE: Duration = Duration::from_millis(300);
     const SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
     // Popup crash retry policy. 30/60/90 s backoff × 3 attempts caps
@@ -145,12 +150,12 @@ mod win {
         let now = SystemTime::now();
         // Cold-start dispatch. No runtime.dat → fresh-install / migrated
         // 0.6.x path via resolve_last_popup (anti-cheat shift). Present
-        // runtime.dat → active-time A/B/C via resolve_cold_start :
-        //   A (elapsed >= 2 × interval)     → full reset
-        //   B (popup_pending && downtime < 30 min) → relaunch immediately
-        //   C (else)                        → absorb downtime into
-        //                                    paused_secs, keep cycle
-        let (mut last_popup, mut paused_secs, mut popup_pending, relaunch_now) =
+        // runtime.dat → threshold / anti-bypass / credit-downtime via
+        // resolve_cold_start :
+        //   threshold  (elapsed >= reset_threshold_hours) → full reset
+        //   anti-bypass(popup_pending was true on unclean death) → full reset
+        //   credit     (else) → keep cycle, credit downtime into paused_secs
+        let (mut last_popup, mut paused_secs, mut popup_pending) =
             match runtime_dat::read() {
                 None => {
                     let lp = scheduler::resolve_last_popup(
@@ -182,7 +187,7 @@ mod win {
                         seeded_last_popup = ?lp,
                         "cold-start: fresh install or migrated 0.6.x"
                     );
-                    (lp, 0u64, false, false)
+                    (lp, 0u64, false)
                 }
                 Some(mut state) => {
                     let downtime_secs = now
@@ -219,21 +224,19 @@ mod win {
                         },
                         &config,
                     );
-                    // Rule identification for bug-report clarity. Derived
-                    // from the decision : Rule B is uniquely marked by
-                    // relaunch_now = true ; Rule A resets last_popup to
-                    // now AND clears both paused_secs and popup_pending ;
-                    // everything else is Rule C (kept cycle, absorbed
-                    // downtime).
-                    let rule = if d.relaunch_now {
-                        "B (relaunch pending popup, downtime < 30 min)"
-                    } else if d.last_popup >= now
-                        && d.paused_secs == 0
-                        && !d.popup_pending
-                    {
-                        "A (elapsed >= 2 x interval, full reset)"
+                    // Rule identification for bug-report clarity. Both
+                    // "threshold" and "anti-bypass" produce the same
+                    // (last_popup=now, paused_secs=0) shape — the raw
+                    // popup_pending input (before the unclean-shutdown
+                    // gate rewrote it) disambiguates them.
+                    let full_reset =
+                        d.last_popup >= now && d.paused_secs == 0 && !d.popup_pending;
+                    let rule = if full_reset && popup_pending_pre_gate {
+                        "anti-bypass (popup_pending on unclean shutdown, full reset)"
+                    } else if full_reset {
+                        "threshold (elapsed >= reset_threshold_hours, full reset)"
                     } else {
-                        "C (keep cycle, absorb downtime into paused_secs)"
+                        "credit (keep cycle, absorb downtime into paused_secs)"
                     };
                     tracing::info!(
                         path = "with-runtime-dat",
@@ -247,8 +250,7 @@ mod win {
                         new_last_popup = ?d.last_popup,
                         new_paused_secs = d.paused_secs,
                         new_popup_pending = d.popup_pending,
-                        relaunch_now = d.relaunch_now,
-                        "cold-start: A/B/C dispatch"
+                        "cold-start: threshold / anti-bypass / credit dispatch"
                     );
                     // Immediately persist last_clean_shutdown_at = UNIX_EPOCH
                     // so any crash from here until the next graceful shutdown
@@ -262,7 +264,7 @@ mod win {
                         last_heartbeat: now,
                         last_clean_shutdown_at: SystemTime::UNIX_EPOCH,
                     });
-                    (d.last_popup, d.paused_secs, d.popup_pending, d.relaunch_now)
+                    (d.last_popup, d.paused_secs, d.popup_pending)
                 }
             };
         let mut last_heartbeat = now;
@@ -271,7 +273,6 @@ mod win {
             initial_paliers_fired = ?fired,
             paused_secs,
             popup_pending,
-            relaunch_now,
             "scheduler initialised"
         );
 
@@ -324,25 +325,6 @@ mod win {
                     error = ?e,
                     "input-probe initial spawn failed - will retry on next tick"
                 );
-            }
-        }
-
-        // Rule B : runtime.dat said popup_pending && downtime < 30 min
-        // when we cold-booted. Fire the popup before entering the tick
-        // loop so the user sees it as soon as the service is ready.
-        if relaunch_now {
-            tracing::info!("cold-start Rule B: relaunching pending popup");
-            if let Err(e) = fire_popup(
-                &exe,
-                &mut last_popup,
-                &mut paused_secs,
-                &mut popup_pending,
-                &mut last_heartbeat,
-                &mut fired,
-                &mut last_popup_child,
-                &config.passcode_hash,
-            ) {
-                tracing::warn!(error = ?e, "Rule B relaunch failed - will retry on next tick");
             }
         }
 
@@ -457,9 +439,8 @@ mod win {
         const IDLE_THRESHOLD_SECS: u64 = 60;
         // Heartbeat cadence : every 6th timeout tick (~30 s at 5 s
         // TICK_INTERVAL). Fire-path already persists eagerly ; this
-        // covers pure-idle stretches so downtime detection at next
-        // cold-boot has ≤30 s resolution (RESUME_WINDOW is 30 min, so
-        // Rule B stays correct with ~60× headroom).
+        // covers pure-idle stretches so cold-boot downtime detection
+        // resolves at ≤30 s granularity.
         const HEARTBEAT_EVERY_N_TICKS: u32 = 6;
         // Periodic idle-state log cadence : every 12th timeout tick
         // (~60 s at 5 s TICK_INTERVAL). Emits a `state snapshot` log
@@ -473,6 +454,14 @@ mod win {
         let mut suspended_at: Option<SystemTime> = None;
         let mut ticks_since_write: u32 = 0;
         let mut ticks_since_state_log: u32 = 0;
+        // Anchors for the clock-shift detector : compare wall delta
+        // against unbiased-interrupt-time delta each tick. When they
+        // diverge ≥ CLOCK_JUMP_THRESHOLD we shift `last_popup` by the
+        // divergence — neutralises VM freeze, S4 hibernate without
+        // power broadcast, and admin/NTP clock tampering. `None` on
+        // the first tick (no baseline to compare yet).
+        let mut prev_wall: Option<SystemTime> = None;
+        let mut prev_unbiased_secs: Option<u64> = None;
         // `was_idle = None` means "never observed yet" — the first tick's
         // idle transition log will read as a seed. After that, every
         // active↔inactive flip emits a single log line with the three
@@ -585,6 +574,51 @@ mod win {
                             }
                         }
                     }
+
+                    // 1b. Clock-shift detector. Sample wall + unbiased
+                    //     BEFORE the fire decision so a jump this tick
+                    //     is compensated before `next_event` reads
+                    //     `last_popup`. Skipped on the first tick (no
+                    //     baseline yet).
+                    let now_wall = SystemTime::now();
+                    let now_unbiased_secs = crate::platform::win32::unbiased_time::ticks_to_secs(
+                        crate::platform::win32::unbiased_time::query_100ns(),
+                    );
+                    if let (Some(pw), Some(pu)) = (prev_wall, prev_unbiased_secs) {
+                        let unbiased_delta_secs = now_unbiased_secs.saturating_sub(pu);
+                        if let Some(divergence) = scheduler::compute_clock_shift(
+                            pw,
+                            now_wall,
+                            unbiased_delta_secs,
+                            CLOCK_JUMP_THRESHOLD.as_secs(),
+                        ) {
+                            let wall_delta_secs = now_wall
+                                .duration_since(pw)
+                                .map(|d| d.as_secs() as i64)
+                                .unwrap_or_else(|e| -(e.duration().as_secs() as i64));
+                            let cause_hint = if divergence < 0 {
+                                "clock_rewind"
+                            } else if divergence >= 5 * 60 {
+                                "suspend_or_hibernate"
+                            } else {
+                                "clock_advanced"
+                            };
+                            let last_popup_before = *last_popup;
+                            *last_popup =
+                                scheduler::shift_systemtime(*last_popup, divergence);
+                            tracing::warn!(
+                                divergence_secs = divergence,
+                                wall_delta_secs,
+                                unbiased_delta_secs,
+                                cause_hint,
+                                last_popup_before = ?last_popup_before,
+                                last_popup_after = ?*last_popup,
+                                "clock jump detected, last_popup shifted to preserve active-time"
+                            );
+                        }
+                    }
+                    prev_wall = Some(now_wall);
+                    prev_unbiased_secs = Some(now_unbiased_secs);
 
                     // 2. Detect popup exit (Dismiss button OR the
                     //    countdown-then-close path both terminate the

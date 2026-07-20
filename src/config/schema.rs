@@ -14,6 +14,15 @@ pub struct Config {
     #[serde(default = "d::interval_hours")]
     pub interval_hours: f32,
 
+    /// Cold-boot dispatch : if `now - last_popup >= reset_threshold_hours`
+    /// the scheduler treats the child as having "missed a full cycle"
+    /// and reboots the timer to `now` on service startup. Default
+    /// tracks `interval_hours` — see `d::reset_threshold_hours()`.
+    /// UI wiring lands in session 2 (Volet 3) ; for now the slider is
+    /// absent and the value is edited by hand in state.dat.
+    #[serde(default = "d::reset_threshold_hours")]
+    pub reset_threshold_hours: f32,
+
     #[serde(default = "d::duration_minutes")]
     pub duration_minutes: u32,
 

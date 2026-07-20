@@ -33,13 +33,6 @@ const DEFAULT_INTERVAL_HOURS: f32 = 2.0;
 /// killing the service.
 pub const COLD_START_GRACE: Duration = Duration::from_secs(60);
 
-/// Rule B window : a `popup_pending == true` runtime.dat coming out of
-/// `downtime < RESUME_WINDOW` triggers an immediate popup relaunch on
-/// boot. Beyond this the popup mid-fire is considered stale — Rule C
-/// resumes the cycle without relaunching, or Rule A resets it entirely
-/// depending on total elapsed.
-pub const RESUME_WINDOW: Duration = Duration::from_secs(30 * 60);
-
 /// Fresh-install grace window: `runtime.dat` missing AND
 /// `first_install_at` within this many seconds of now = "user just
 /// installed, respect the full interval, don't shorten to 60 s."
@@ -157,37 +150,35 @@ pub fn resolve_last_popup(inputs: ResolveInputs, config: &Config) -> SystemTime 
 }
 
 /// Outcome of [`resolve_cold_start`] — everything the service tick loop
-/// needs to seed its in-memory state and decide whether to immediately
-/// respawn a popup that was mid-fire when the machine went down.
+/// needs to seed its in-memory state after reading `runtime.dat`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColdStartDecision {
     pub last_popup: SystemTime,
     pub paused_secs: u64,
     pub popup_pending: bool,
-    pub relaunch_now: bool,
 }
 
-/// Cold-boot A / B / C rules for the active-time cycle. Pure ; no I/O.
+/// Cold-boot dispatch for the active-time cycle. Pure ; no I/O.
 ///
 /// Preconditions : `inputs.last_popup.is_some()` — the caller must have
 /// read a valid `runtime.dat`. On a missing / corrupt file the caller
 /// keeps using [`resolve_last_popup`] with `last_popup: None` for the
 /// fresh-install / legacy-shift branch.
 ///
-/// Sequence :
-/// 1. **Step 0 (always)** — add `downtime = now - last_heartbeat` into
-///    `paused_secs`. Clock skew (`now < last_heartbeat`) is treated as
-///    zero downtime, never negative.
-/// 2. **Rule A** — `elapsed = now - last_popup >= 2 * interval`.
+/// Three ordered rules :
+/// 1. **Threshold reset** — `elapsed = now - last_popup >= reset_threshold_hours * 3600`.
 ///    Full reset : `last_popup = now`, `paused_secs = 0`,
-///    `popup_pending = false`, no relaunch even if one was pending.
-/// 3. **Rule B** — else if `popup_pending && downtime < RESUME_WINDOW`.
-///    Keep `last_popup`, carry the step-0 `paused_secs`, keep the
-///    pending flag, and set `relaunch_now = true` so the tick loop
-///    respawns the popup immediately.
-/// 4. **Rule C** — else. Keep `last_popup`, carry the step-0
-///    `paused_secs`, clear `popup_pending`, no relaunch. The cycle
-///    resumes in active-time exactly where it left off.
+///    `popup_pending = false`. The child was away long enough that
+///    resuming mid-cycle would buy them nothing.
+/// 2. **Anti-bypass** — else if `popup_pending == true`. Full reset
+///    too. Kills the "kill service to skip popup" trick : watchdog
+///    resurrects the service, cold-start hands the child a fresh full
+///    interval instead of relaunching the popup. Cost of the trick =
+///    one full cycle.
+/// 3. **Credit downtime** — else. Keep `last_popup`, credit
+///    `downtime = now - last_heartbeat` into `paused_secs`, clear
+///    `popup_pending`. Clock skew (`now < last_heartbeat`) treated as
+///    zero downtime, never negative.
 pub fn resolve_cold_start(inputs: ResolveInputs, config: &Config) -> ColdStartDecision {
     let ResolveInputs {
         now,
@@ -205,41 +196,90 @@ pub fn resolve_cold_start(inputs: ResolveInputs, config: &Config) -> ColdStartDe
          route None to resolve_last_popup fresh-install branch",
     );
 
-    let downtime = now
-        .duration_since(last_heartbeat)
-        .unwrap_or(Duration::ZERO);
-    let paused_after_step0 = paused_secs.saturating_add(downtime.as_secs());
-
     let elapsed = now.duration_since(last_popup).unwrap_or(Duration::ZERO);
-    let interval = interval(config);
+    let reset_threshold_secs =
+        (f64::from(config.reset_threshold_hours) * 3600.0) as u64;
 
-    // Rule A : long-downtime full reset. Boundary is inclusive to match
-    // resolve_last_popup's existing branch-3 semantics.
-    if elapsed >= interval.saturating_mul(2) {
+    if elapsed.as_secs() >= reset_threshold_secs {
         return ColdStartDecision {
             last_popup: now,
             paused_secs: 0,
             popup_pending: false,
-            relaunch_now: false,
         };
     }
 
-    // Rule B : popup was mid-fire and downtime is short — relaunch.
-    if popup_pending && downtime < RESUME_WINDOW {
+    if popup_pending {
         return ColdStartDecision {
-            last_popup,
-            paused_secs: paused_after_step0,
-            popup_pending: true,
-            relaunch_now: true,
+            last_popup: now,
+            paused_secs: 0,
+            popup_pending: false,
         };
     }
 
-    // Rule C : resume cycle, absorb downtime into paused_secs.
+    let downtime = now
+        .duration_since(last_heartbeat)
+        .unwrap_or(Duration::ZERO);
     ColdStartDecision {
         last_popup,
-        paused_secs: paused_after_step0,
+        paused_secs: paused_secs.saturating_add(downtime.as_secs()),
         popup_pending: false,
-        relaunch_now: false,
+    }
+}
+
+/// Compare wall-clock and unbiased-interrupt-time deltas across a tick
+/// and return the divergence in seconds if it exceeds `jump_threshold_secs`.
+///
+/// The unbiased interrupt time (see `QueryUnbiasedInterruptTime`) is
+/// monotonic and does NOT count time the system spent suspended /
+/// hibernated / (on VMs) frozen. Wall clock counts all of that, plus
+/// tolerates administrator or NTP jumps in either direction. Divergence
+/// isolates the anomaly :
+///
+/// - `wall_delta ≈ unbiased_delta` : normal tick — return `None`.
+/// - `wall_delta >> unbiased_delta` : suspend, hibernate, VM freeze, or
+///   admin advanced the clock — positive divergence, caller should
+///   shift `last_popup` forward.
+/// - `wall_delta << unbiased_delta` : admin rewound the clock — negative
+///   divergence, caller should shift `last_popup` backward by the same
+///   amount so `now - last_popup` preserves the real elapsed time.
+///
+/// The threshold gate (default 60 s in service.rs) filters normal 5 s
+/// tick jitter and ~15 s pauses in the mpsc receiver from being
+/// interpreted as jumps.
+pub fn compute_clock_shift(
+    prev_wall: SystemTime,
+    now_wall: SystemTime,
+    unbiased_delta_secs: u64,
+    jump_threshold_secs: u64,
+) -> Option<i64> {
+    let wall_delta_secs: i64 = match now_wall.duration_since(prev_wall) {
+        Ok(d) => d.as_secs() as i64,
+        Err(e) => -(e.duration().as_secs() as i64),
+    };
+    let divergence = wall_delta_secs.saturating_sub(unbiased_delta_secs as i64);
+    if divergence.unsigned_abs() >= jump_threshold_secs {
+        Some(divergence)
+    } else {
+        None
+    }
+}
+
+/// Add `delta_secs` (signed) to a `SystemTime`. Negative deltas subtract
+/// ; if the subtraction would go before `UNIX_EPOCH` the result clamps
+/// to the epoch. Explicit UNIX_EPOCH gate — `SystemTime::checked_sub`
+/// permits pre-epoch values on Linux (`tv_sec: -N`), which would break
+/// downstream `duration_since(UNIX_EPOCH)` unwraps.
+pub fn shift_systemtime(base: SystemTime, delta_secs: i64) -> SystemTime {
+    if delta_secs >= 0 {
+        return base + Duration::from_secs(delta_secs as u64);
+    }
+    let sub = Duration::from_secs(delta_secs.unsigned_abs());
+    match base.duration_since(SystemTime::UNIX_EPOCH) {
+        Ok(from_epoch) => from_epoch
+            .checked_sub(sub)
+            .map(|d| SystemTime::UNIX_EPOCH + d)
+            .unwrap_or(SystemTime::UNIX_EPOCH),
+        Err(_) => SystemTime::UNIX_EPOCH,
     }
 }
 
@@ -1122,7 +1162,7 @@ mod tests {
         );
     }
 
-    // -------- resolve_cold_start : rules A / B / C matrix --------
+    // -------- resolve_cold_start : threshold / anti-bypass / credit --------
 
     fn cold_inputs(
         now_secs: u64,
@@ -1142,152 +1182,94 @@ mod tests {
         }
     }
 
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum Rule {
-        A,
-        B,
-        C,
-    }
-
     #[test]
-    fn resolve_cold_start_rule_matrix() {
-        // interval × downtime × popup_pending × paused_pre → expected rule.
-        // Row shape : (interval_h, downtime_secs, pending, paused_pre_secs, expected).
-        let intervals_h: [f32; 3] = [0.75, 2.0, 6.0]; // 45 min, 2 h, 6 h.
-        let downtimes: [u64; 5] = [
-            5 * 60,      // 5 min
-            30 * 60,     // 30 min  == RESUME_WINDOW → Rule C when pending
-            60 * 60,     // 1 h
-            3 * 3600,    // 3 h
-            12 * 3600,   // 12 h
-        ];
-        let pendings = [false, true];
-        let paused_pres: [u64; 2] = [0, 30 * 60];
-
-        for &int_h in &intervals_h {
-            let interval_secs = (int_h * 3600.0) as u64;
-            let two_x = 2 * interval_secs;
-            for &downtime in &downtimes {
-                for &pending in &pendings {
-                    for &paused_pre in &paused_pres {
-                        // Fix elapsed at `interval + 10 min` so it's
-                        // above interval but not necessarily above 2×.
-                        let elapsed = interval_secs + 10 * 60;
-                        // lp anchored so that `now - lp = elapsed`.
-                        let now_secs = 10 * 24 * 3600; // safe base epoch.
-                        let lp_secs = now_secs - elapsed;
-                        let hb_secs = now_secs - downtime;
-
-                        let cfg = config_with(int_h, vec![], false);
-                        let inputs = cold_inputs(now_secs, lp_secs, hb_secs, paused_pre, pending);
-                        let dec = resolve_cold_start(inputs, &cfg);
-
-                        let expected = if elapsed >= two_x {
-                            Rule::A
-                        } else if pending && downtime < RESUME_WINDOW.as_secs() {
-                            Rule::B
-                        } else {
-                            Rule::C
-                        };
-
-                        let case = format!(
-                            "int={}h dt={}s pend={} pre={}s elapsed={}s -> {:?}",
-                            int_h, downtime, pending, paused_pre, elapsed, expected,
-                        );
-
-                        match expected {
-                            Rule::A => {
-                                assert_eq!(dec.last_popup, epoch_plus(now_secs), "A last_popup {}", case);
-                                assert_eq!(dec.paused_secs, 0, "A paused_secs {}", case);
-                                assert!(!dec.popup_pending, "A popup_pending {}", case);
-                                assert!(!dec.relaunch_now, "A relaunch_now {}", case);
-                            }
-                            Rule::B => {
-                                assert_eq!(dec.last_popup, epoch_plus(lp_secs), "B last_popup {}", case);
-                                assert_eq!(
-                                    dec.paused_secs,
-                                    paused_pre + downtime,
-                                    "B paused_secs {}",
-                                    case,
-                                );
-                                assert!(dec.popup_pending, "B popup_pending {}", case);
-                                assert!(dec.relaunch_now, "B relaunch_now {}", case);
-                            }
-                            Rule::C => {
-                                assert_eq!(dec.last_popup, epoch_plus(lp_secs), "C last_popup {}", case);
-                                assert_eq!(
-                                    dec.paused_secs,
-                                    paused_pre + downtime,
-                                    "C paused_secs {}",
-                                    case,
-                                );
-                                assert!(!dec.popup_pending, "C popup_pending {}", case);
-                                assert!(!dec.relaunch_now, "C relaunch_now {}", case);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn resolve_cold_start_rule_a_ignores_pending_and_paused_pre() {
-        // elapsed = 5 × interval → Rule A even with popup_pending=true and paused_pre=1h.
+    fn resolve_cold_start_elapsed_above_threshold_full_reset() {
+        // elapsed = threshold + 10 min → reset. Downtime and paused_pre
+        // irrelevant on this branch.
         let cfg = config_with(2.0, vec![], false);
+        let threshold_secs = (cfg.reset_threshold_hours * 3600.0) as u64;
         let now_secs = 100_000;
-        let lp_secs = now_secs - 5 * 2 * 3600;
-        let hb_secs = now_secs - 60; // 1 min downtime, well below RESUME_WINDOW.
-        let inputs = cold_inputs(now_secs, lp_secs, hb_secs, 3600, true);
+        let lp_secs = now_secs - (threshold_secs + 10 * 60);
+        let hb_secs = now_secs - 60;
+        let inputs = cold_inputs(now_secs, lp_secs, hb_secs, 1234, false);
         let dec = resolve_cold_start(inputs, &cfg);
         assert_eq!(dec.last_popup, epoch_plus(now_secs));
         assert_eq!(dec.paused_secs, 0);
         assert!(!dec.popup_pending);
-        assert!(!dec.relaunch_now);
     }
 
     #[test]
-    fn resolve_cold_start_rule_b_downtime_just_under_resume_window() {
-        // downtime = 30 min - 1 s → Rule B (strict `<`).
+    fn resolve_cold_start_pending_triggers_anti_bypass_full_reset() {
+        // elapsed well below threshold BUT popup_pending=true → full
+        // reset. Kills the "kill service to skip popup" trick.
         let cfg = config_with(2.0, vec![], false);
         let now_secs = 100_000;
-        let lp_secs = now_secs - 3600; // elapsed 1 h, below 2× interval.
-        let hb_secs = now_secs - (30 * 60 - 1);
+        let lp_secs = now_secs - 5 * 60; // 5 min elapsed, far below 2 h.
+        let hb_secs = now_secs - 30;
         let inputs = cold_inputs(now_secs, lp_secs, hb_secs, 0, true);
         let dec = resolve_cold_start(inputs, &cfg);
-        assert_eq!(dec.last_popup, epoch_plus(lp_secs));
-        assert_eq!(dec.paused_secs, 30 * 60 - 1);
-        assert!(dec.popup_pending);
-        assert!(dec.relaunch_now);
-    }
-
-    #[test]
-    fn resolve_cold_start_downtime_equal_resume_window_falls_to_rule_c() {
-        // downtime == RESUME_WINDOW exactly → NOT Rule B (strict `<`).
-        let cfg = config_with(2.0, vec![], false);
-        let now_secs = 100_000;
-        let lp_secs = now_secs - 3600;
-        let hb_secs = now_secs - RESUME_WINDOW.as_secs();
-        let inputs = cold_inputs(now_secs, lp_secs, hb_secs, 0, true);
-        let dec = resolve_cold_start(inputs, &cfg);
-        assert_eq!(dec.last_popup, epoch_plus(lp_secs));
-        assert_eq!(dec.paused_secs, RESUME_WINDOW.as_secs());
+        assert_eq!(dec.last_popup, epoch_plus(now_secs));
+        assert_eq!(dec.paused_secs, 0);
         assert!(!dec.popup_pending);
-        assert!(!dec.relaunch_now);
     }
 
     #[test]
-    fn resolve_cold_start_elapsed_exactly_2x_interval_hits_rule_a() {
-        // Boundary : elapsed == 2 × interval exactly → Rule A (inclusive,
-        // matches resolve_last_popup branch 3).
+    fn resolve_cold_start_no_reset_credits_downtime_to_paused_secs() {
+        // elapsed 30 min < 2 h threshold, pending=false, downtime=27000 s
+        // (7.5 h suspend without power broadcast — the reported bug).
+        // last_popup unchanged, paused_secs += 27000.
+        let cfg = config_with(2.0, vec![], false);
+        let now_secs = 1_000_000;
+        let lp_secs = now_secs - 30 * 60;
+        let hb_secs = now_secs - 27_000;
+        let inputs = cold_inputs(now_secs, lp_secs, hb_secs, 100, false);
+        let dec = resolve_cold_start(inputs, &cfg);
+        assert_eq!(dec.last_popup, epoch_plus(lp_secs));
+        assert_eq!(dec.paused_secs, 100 + 27_000);
+        assert!(!dec.popup_pending);
+    }
+
+    #[test]
+    fn resolve_cold_start_zero_downtime_no_op() {
+        // heartbeat fresh + elapsed 0 → last_popup unchanged, paused_secs
+        // unchanged. Edge case : service restarts within one tick.
         let cfg = config_with(2.0, vec![], false);
         let now_secs = 100_000;
-        let lp_secs = now_secs - 2 * 2 * 3600;
+        let lp_secs = now_secs;
+        let hb_secs = now_secs;
+        let inputs = cold_inputs(now_secs, lp_secs, hb_secs, 0, false);
+        let dec = resolve_cold_start(inputs, &cfg);
+        assert_eq!(dec.last_popup, epoch_plus(lp_secs));
+        assert_eq!(dec.paused_secs, 0);
+    }
+
+    #[test]
+    fn resolve_cold_start_threshold_exactly_at_boundary_hits_reset() {
+        // elapsed == threshold exactly → reset (inclusive boundary).
+        let cfg = config_with(2.0, vec![], false);
+        let threshold_secs = (cfg.reset_threshold_hours * 3600.0) as u64;
+        let now_secs = 100_000;
+        let lp_secs = now_secs - threshold_secs;
         let hb_secs = now_secs - 60;
         let inputs = cold_inputs(now_secs, lp_secs, hb_secs, 0, false);
         let dec = resolve_cold_start(inputs, &cfg);
         assert_eq!(dec.last_popup, epoch_plus(now_secs));
         assert_eq!(dec.paused_secs, 0);
+    }
+
+    #[test]
+    fn resolve_cold_start_custom_reset_threshold_hours_wires_through() {
+        // Set threshold to 6 h explicitly ; elapsed = 5 h → below,
+        // credit downtime instead of reset. Proves the field is read.
+        let mut cfg = config_with(2.0, vec![], false);
+        cfg.reset_threshold_hours = 6.0;
+        let now_secs = 1_000_000;
+        let lp_secs = now_secs - 5 * 3600;
+        let hb_secs = now_secs - 1000;
+        let inputs = cold_inputs(now_secs, lp_secs, hb_secs, 0, false);
+        let dec = resolve_cold_start(inputs, &cfg);
+        assert_eq!(dec.last_popup, epoch_plus(lp_secs));
+        assert_eq!(dec.paused_secs, 1000);
     }
 
     #[test]
@@ -1304,9 +1286,9 @@ mod tests {
     }
 
     #[test]
-    fn resolve_cold_start_clock_skew_last_popup_in_future_elapsed_zero_hits_rule_c() {
-        // last_popup > now → elapsed clamped to 0, below 2× interval, so
-        // Rule A never fires. Falls to C (or B if pending).
+    fn resolve_cold_start_clock_skew_last_popup_in_future_no_reset() {
+        // last_popup > now → elapsed clamped to 0, below threshold,
+        // pending=false → credit downtime branch. last_popup unchanged.
         let cfg = config_with(2.0, vec![], false);
         let now_secs = 100_000;
         let lp_secs = now_secs + 10_000; // future.
@@ -1314,6 +1296,103 @@ mod tests {
         let inputs = cold_inputs(now_secs, lp_secs, hb_secs, 0, false);
         let dec = resolve_cold_start(inputs, &cfg);
         assert_eq!(dec.last_popup, epoch_plus(lp_secs));
-        assert!(!dec.relaunch_now);
+        assert!(!dec.popup_pending);
+    }
+
+    // -------- compute_clock_shift + shift_systemtime --------
+
+    const JUMP_THRESHOLD: u64 = 60;
+
+    #[test]
+    fn clock_shift_normal_tick_returns_none() {
+        // wall 5 s, unbiased 5 s → divergence 0 → below threshold.
+        let prev = epoch_plus(1_000);
+        let now = epoch_plus(1_005);
+        assert_eq!(compute_clock_shift(prev, now, 5, JUMP_THRESHOLD), None);
+    }
+
+    #[test]
+    fn clock_shift_mild_noise_below_threshold_returns_none() {
+        // wall 15 s, unbiased 5 s → divergence 10 s. Below 60 s guard —
+        // don't false-positive on receiver latency.
+        let prev = epoch_plus(1_000);
+        let now = epoch_plus(1_015);
+        assert_eq!(compute_clock_shift(prev, now, 5, JUMP_THRESHOLD), None);
+    }
+
+    #[test]
+    fn clock_shift_suspend_returns_positive_divergence() {
+        // wall jumped 27 000 s (7.5 h suspend), unbiased 5 s.
+        let prev = epoch_plus(1_000);
+        let now = epoch_plus(1_000 + 27_000);
+        assert_eq!(
+            compute_clock_shift(prev, now, 5, JUMP_THRESHOLD),
+            Some(26_995),
+        );
+    }
+
+    #[test]
+    fn clock_shift_admin_advance_returns_positive_divergence() {
+        // Admin bumps clock forward 3 h. unbiased still 5 s.
+        let prev = epoch_plus(1_000);
+        let now = epoch_plus(1_000 + 10_800);
+        assert_eq!(
+            compute_clock_shift(prev, now, 5, JUMP_THRESHOLD),
+            Some(10_795),
+        );
+    }
+
+    #[test]
+    fn clock_shift_admin_rewind_returns_negative_divergence() {
+        // Admin rolls clock back 3 h. Wall delta = -10 800 s ; unbiased
+        // still advanced 5 s (monotonic).
+        let prev = epoch_plus(20_000);
+        let now = epoch_plus(20_000 - 10_800);
+        assert_eq!(
+            compute_clock_shift(prev, now, 5, JUMP_THRESHOLD),
+            Some(-10_805),
+        );
+    }
+
+    #[test]
+    fn clock_shift_realigned_after_tampering_returns_none() {
+        // Guards false positive : after a jump was compensated, the
+        // next normal tick must NOT re-trigger. wall 5 s, unbiased 5 s.
+        let prev = epoch_plus(20_000);
+        let now = epoch_plus(20_005);
+        assert_eq!(compute_clock_shift(prev, now, 5, JUMP_THRESHOLD), None);
+    }
+
+    #[test]
+    fn clock_shift_degenerate_unbiased_larger_than_wall_below_threshold_none() {
+        // Impossible in practice (unbiased running ahead of wall by 15 s)
+        // but the guard must still hold : |divergence| = 10 s < 60 s.
+        let prev = epoch_plus(1_000);
+        let now = epoch_plus(1_005);
+        assert_eq!(compute_clock_shift(prev, now, 15, JUMP_THRESHOLD), None);
+    }
+
+    #[test]
+    fn shift_systemtime_positive_adds_duration() {
+        let base = epoch_plus(1_000);
+        assert_eq!(shift_systemtime(base, 30), epoch_plus(1_030));
+    }
+
+    #[test]
+    fn shift_systemtime_negative_subtracts_duration() {
+        let base = epoch_plus(1_000);
+        assert_eq!(shift_systemtime(base, -30), epoch_plus(970));
+    }
+
+    #[test]
+    fn shift_systemtime_negative_past_epoch_clamps_to_epoch() {
+        let base = epoch_plus(100);
+        assert_eq!(shift_systemtime(base, -10_000), SystemTime::UNIX_EPOCH);
+    }
+
+    #[test]
+    fn shift_systemtime_zero_returns_base() {
+        let base = epoch_plus(1_000);
+        assert_eq!(shift_systemtime(base, 0), base);
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "purrpause"
-version = "1.1.0-b.17"
+version = "1.1.0-b.18"
 edition = "2021"
 license = "MIT"
 description = "Break-reminder overlay for Windows — camouflaged Windows Session Health Service"
@@ -73,6 +73,7 @@ windows = { version = "0.62.2", features = [
     "Win32_System_TaskScheduler",        # ITaskService COM watchdog registration
     "Win32_System_Threading",            # CreateProcessAsUser
     "Win32_System_Variant",              # VARIANT (Task Scheduler COM args)
+    "Win32_System_WindowsProgramming",   # QueryUnbiasedInterruptTime (clock-shift detector)
     "Win32_Storage_FileSystem",          # SetFileAttributesW
     "Win32_UI_Input_KeyboardAndMouse",   # GetAsyncKeyState, VK_* constants, GetLastInputInfo, LASTINPUTINFO
     "Win32_UI_Input_XboxController",     # XInputGetState + XINPUT_STATE (gamepad activity poll)

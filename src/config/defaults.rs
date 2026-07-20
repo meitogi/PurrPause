@@ -31,6 +31,14 @@ pub mod d {
     pub fn interval_hours() -> f32 {
         2.0
     }
+    /// Cold-boot "elapsed >= threshold ⇒ full reset" cutoff. Default
+    /// mirrors `interval_hours()` — one missed interval already means
+    /// the child has been away long enough that resuming mid-cycle
+    /// buys them nothing. The UI slider (session 2) clamps to
+    /// [interval_hours, 168].
+    pub fn reset_threshold_hours() -> f32 {
+        interval_hours()
+    }
     pub fn duration_minutes() -> u32 {
         5
     }
