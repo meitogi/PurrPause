@@ -322,23 +322,12 @@ fn format_local_hhmm(t: SystemTime) -> Option<String> {
 }
 
 fn ui_general(ui: &mut egui::Ui, cfg: &mut Config, dirty: &mut bool) {
-    // Threshold below which we consider the two sliders "linked" so
-    // moving the interval also moves the reset threshold. Small enough
-    // that ordinary slider steps can't slip past it accidentally.
-    const LINK_EPSILON: f32 = 0.001;
-
     ui.heading("Général");
     ui.add_space(8.0);
 
     // ── Cycle ──
     ui.label(egui::RichText::new("Cycle").strong());
     ui.add_space(4.0);
-
-    // Capture the linked state BEFORE mutating either slider so the
-    // interval-change branch below can propagate correctly (would-be
-    // stale otherwise if we recomputed after the mutation).
-    let was_linked =
-        (cfg.reset_threshold_hours - cfg.interval_hours).abs() < LINK_EPSILON;
 
     ui.horizontal(|ui| {
         ui.label("Intervalle entre les pauses :");
@@ -354,16 +343,7 @@ fn ui_general(ui: &mut egui::Ui, cfg: &mut Config, dirty: &mut bool) {
             )
             .changed()
         {
-            let new_hours = interval_min as f32 / 60.0;
-            cfg.interval_hours = new_hours;
-            if was_linked {
-                cfg.reset_threshold_hours = new_hours;
-            } else {
-                // Preserve the "threshold >= interval" invariant even
-                // when the sliders are diverged.
-                cfg.reset_threshold_hours =
-                    cfg.reset_threshold_hours.max(new_hours);
-            }
+            cfg.interval_hours = interval_min as f32 / 60.0;
             *dirty = true;
         }
     });
@@ -381,53 +361,24 @@ fn ui_general(ui: &mut egui::Ui, cfg: &mut Config, dirty: &mut bool) {
         preview_min, anchor_suffix
     ));
 
-    // Chain-state indicator between the two sliders. Recompute AFTER
-    // the interval slider ran so the icon reflects the just-applied
-    // change (linkage may have re-established if user dragged reset
-    // back to the interval value on a previous frame).
-    let linked =
-        (cfg.reset_threshold_hours - cfg.interval_hours).abs() < LINK_EPSILON;
-    let (icon_text, chain_hint) = if linked {
-        (
-            egui::RichText::new("🔗")
-                .color(egui::Color32::from_rgb(120, 200, 120)),
-            "Sliders liés : bouger l'intervalle bouge aussi le seuil \
-             de reset.",
-        )
-    } else {
-        (
-            egui::RichText::new("🔗")
-                .color(egui::Color32::from_rgb(160, 160, 160))
-                .strikethrough(),
-            "Sliders indépendants. Ramène le seuil de reset à la \
-             valeur de l'intervalle pour les re-lier.",
-        )
-    };
-    ui.horizontal(|ui| {
-        ui.add_space(20.0);
-        ui.label(icon_text).on_hover_text(chain_hint);
-    });
-
     ui.horizontal(|ui| {
         ui.label("Reset complet si offline plus de :");
-        let mut reset_h = cfg.reset_threshold_hours;
-        let min = cfg.interval_hours;
+        let mut reset_min = (cfg.reset_threshold_hours * 60.0).round() as u32;
         if ui
             .add(
-                egui::Slider::new(&mut reset_h, min..=168.0)
-                    .text("heures")
+                egui::Slider::new(&mut reset_min, 1..=720)
+                    .text("minutes")
                     .logarithmic(true),
             )
             .on_hover_text(
                 "Passé ce délai sans activité (ordi éteint, en \
                  veille, service coupé), le compteur repart de zéro \
                  au redémarrage. La prochaine popup arrive après un \
-                 cycle complet, pas immédiatement. Par défaut, suit \
-                 la durée entre popups.",
+                 cycle complet, pas immédiatement.",
             )
             .changed()
         {
-            cfg.reset_threshold_hours = reset_h.max(cfg.interval_hours);
+            cfg.reset_threshold_hours = reset_min as f32 / 60.0;
             *dirty = true;
         }
     });
