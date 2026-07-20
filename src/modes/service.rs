@@ -150,12 +150,13 @@ mod win {
         let now = SystemTime::now();
         // Cold-start dispatch. No runtime.dat → fresh-install / migrated
         // 0.6.x path via resolve_last_popup (anti-cheat shift). Present
-        // runtime.dat → threshold / anti-bypass / credit-downtime via
+        // runtime.dat → threshold / anti-bypass / relaunch / credit via
         // resolve_cold_start :
         //   threshold  (elapsed >= reset_threshold_hours) → full reset
-        //   anti-bypass(popup_pending was true on unclean death) → full reset
+        //   anti-bypass(pending && !clean, kid killed service) → full reset
+        //   relaunch   (pending && clean, user cleanly rebooted PC mid-popup) → refire popup
         //   credit     (else) → keep cycle, credit downtime into paused_secs
-        let (mut last_popup, mut paused_secs, mut popup_pending) =
+        let (mut last_popup, mut paused_secs, mut popup_pending, relaunch_now) =
             match runtime_dat::read() {
                 None => {
                     let lp = scheduler::resolve_last_popup(
@@ -167,6 +168,7 @@ mod win {
                             paused_secs: 0,
                             popup_pending: false,
                             last_heartbeat: SystemTime::UNIX_EPOCH,
+                            was_clean_shutdown: false,
                         },
                         &config,
                     );
@@ -187,42 +189,25 @@ mod win {
                         seeded_last_popup = ?lp,
                         "cold-start: fresh install or migrated 0.6.x"
                     );
-                    (lp, 0u64, false)
+                    (lp, 0u64, false, false)
                 }
-                Some(mut state) => {
+                Some(state) => {
                     let downtime_secs = now
                         .duration_since(state.last_heartbeat)
                         .map(|d| d.as_secs())
                         .unwrap_or(0);
-                    // Clean-shutdown gate. `was_clean_shutdown` is true
-                    // when the previous graceful shutdown stamped
-                    // last_clean_shutdown_at at or after the final
-                    // heartbeat. v2 migrations populate the field with
-                    // UNIX_EPOCH → always < heartbeat → treated as
-                    // unclean (safe : converges to actual shutdown state
-                    // after the first graceful boot cycle).
-                    //
-                    // Semantics : the anti-bypass rule downstream fires
-                    // on `popup_pending == true`. That's the correct
-                    // punishment when the child killed the service mid-
-                    // popup (unclean shutdown, kid-kill signature). It
-                    // would be WRONG punishment when the user cleanly
-                    // shut the PC down while a popup was displayed (the
-                    // popup died as collateral of the OS shutdown, no
-                    // intent to bypass). Discriminant : clear
-                    // popup_pending on clean shutdown so anti-bypass
-                    // only fires on the unclean case.
+                    // `was_clean_shutdown` : true when the previous
+                    // graceful shutdown stamped last_clean_shutdown_at
+                    // at or after the final heartbeat. Migrated formats
+                    // populate the field with UNIX_EPOCH → always <
+                    // heartbeat → treated as unclean (converges after
+                    // one clean boot cycle). Fed into resolve_cold_start
+                    // to discriminate the anti-bypass path (unclean +
+                    // pending, kid killed service) from the relaunch
+                    // path (clean + pending, user cleanly rebooted PC
+                    // while a popup was displayed).
                     let was_clean_shutdown =
                         state.last_clean_shutdown_at >= state.last_heartbeat;
-                    let popup_pending_pre_gate = state.popup_pending;
-                    if was_clean_shutdown && state.popup_pending {
-                        tracing::info!(
-                            last_heartbeat = ?state.last_heartbeat,
-                            last_clean_shutdown_at = ?state.last_clean_shutdown_at,
-                            "clean shutdown with popup_pending detected - clearing pre-anti-bypass (legitimate PC restart, not kid-killing service)"
-                        );
-                        state.popup_pending = false;
-                    }
                     let d = scheduler::resolve_cold_start(
                         scheduler::ResolveInputs {
                             now,
@@ -232,16 +217,20 @@ mod win {
                             paused_secs: state.paused_secs,
                             popup_pending: state.popup_pending,
                             last_heartbeat: state.last_heartbeat,
+                            was_clean_shutdown,
                         },
                         &config,
                     );
                     // Rule identification for bug-report clarity.
-                    // Threshold and anti-bypass both produce
-                    // (last_popup=now, paused_secs=0). Elapsed vs
-                    // threshold disambiguates : if elapsed already
-                    // crossed the threshold, threshold rule fired first
-                    // inside resolve_cold_start (short-circuit) and
-                    // popup_pending was irrelevant.
+                    // Discriminants :
+                    //   - relaunch_now = true → relaunch branch
+                    //     (clean + pending).
+                    //   - full_reset shape + elapsed >= threshold →
+                    //     threshold branch (short-circuits inside
+                    //     resolve_cold_start).
+                    //   - full_reset shape otherwise → anti-bypass
+                    //     (unclean + pending).
+                    //   - else → credit-downtime.
                     let full_reset =
                         d.last_popup >= now && d.paused_secs == 0 && !d.popup_pending;
                     let threshold_secs =
@@ -250,7 +239,9 @@ mod win {
                         .duration_since(state.last_popup)
                         .unwrap_or(Duration::ZERO)
                         .as_secs();
-                    let rule = if full_reset && elapsed_secs >= threshold_secs {
+                    let rule = if d.relaunch_now {
+                        "relaunch (popup_pending on clean shutdown, user rebooted mid-popup, refiring)"
+                    } else if full_reset && elapsed_secs >= threshold_secs {
                         "threshold (elapsed >= reset_threshold_hours, full reset)"
                     } else if full_reset {
                         "anti-bypass (popup_pending on unclean shutdown, full reset)"
@@ -262,14 +253,14 @@ mod win {
                         rule,
                         downtime_secs,
                         was_clean_shutdown,
-                        popup_pending_pre_gate,
                         prior_last_popup = ?state.last_popup,
                         prior_paused_secs = state.paused_secs,
                         prior_popup_pending = state.popup_pending,
                         new_last_popup = ?d.last_popup,
                         new_paused_secs = d.paused_secs,
                         new_popup_pending = d.popup_pending,
-                        "cold-start: threshold / anti-bypass / credit dispatch"
+                        relaunch_now = d.relaunch_now,
+                        "cold-start: threshold / anti-bypass / relaunch / credit dispatch"
                     );
                     // Immediately persist last_clean_shutdown_at = UNIX_EPOCH
                     // so any crash from here until the next graceful shutdown
@@ -283,7 +274,7 @@ mod win {
                         last_heartbeat: now,
                         last_clean_shutdown_at: SystemTime::UNIX_EPOCH,
                     });
-                    (d.last_popup, d.paused_secs, d.popup_pending)
+                    (d.last_popup, d.paused_secs, d.popup_pending, d.relaunch_now)
                 }
             };
         let mut last_heartbeat = now;
@@ -292,6 +283,7 @@ mod win {
             initial_paliers_fired = ?fired,
             paused_secs,
             popup_pending,
+            relaunch_now,
             "scheduler initialised"
         );
 
@@ -344,6 +336,27 @@ mod win {
                     error = ?e,
                     "input-probe initial spawn failed - will retry on next tick"
                 );
+            }
+        }
+
+        // Relaunch path : runtime.dat said popup_pending && the
+        // previous shutdown was clean. User rebooted the PC mid-popup ;
+        // refire it now so they pick up where they left off. Anti-bypass
+        // (unclean shutdown) does NOT reach this block — that path
+        // returns relaunch_now = false and full-reset shape.
+        if relaunch_now {
+            tracing::info!("cold-start relaunch: refiring popup for user rebooted mid-popup");
+            if let Err(e) = fire_popup(
+                &exe,
+                &mut last_popup,
+                &mut paused_secs,
+                &mut popup_pending,
+                &mut last_heartbeat,
+                &mut fired,
+                &mut last_popup_child,
+                &config.passcode_hash,
+            ) {
+                tracing::warn!(error = ?e, "cold-start relaunch failed - will retry on next tick");
             }
         }
 
@@ -538,6 +551,7 @@ mod win {
                             paused_secs: *paused_secs,
                             popup_pending: *popup_pending,
                             last_heartbeat: *last_heartbeat,
+                            was_clean_shutdown: false, // unused on reload path
                         },
                         config,
                     );

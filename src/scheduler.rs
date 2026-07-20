@@ -45,7 +45,8 @@ pub const FRESH_INSTALL_GRACE: Duration = Duration::from_secs(300);
 pub const RELOAD_MIN_GRACE: Duration = Duration::from_secs(120);
 
 /// Inputs shared by [`resolve_last_popup`] (reload + fresh-install) and
-/// [`resolve_cold_start`] (cold-boot A/B/C).
+/// [`resolve_cold_start`] (cold-boot threshold / anti-bypass / relaunch
+/// / credit).
 ///
 /// - `now` : wall clock at the decision moment.
 /// - `last_popup` : `None` when `runtime.dat` is missing, `Some(t)`
@@ -57,10 +58,12 @@ pub const RELOAD_MIN_GRACE: Duration = Duration::from_secs(120);
 /// - `paused_secs` : cumulative "not-active" seconds already banked
 ///   into the current cycle (persisted).
 /// - `popup_pending` : a popup was mid-fire when the service last
-///   heartbeat'd. Rule B relaunches it if downtime is short enough.
+///   heartbeat'd. Combined with `was_clean_shutdown`, drives the
+///   anti-bypass vs relaunch branch selection.
 /// - `last_heartbeat` : the last tick's `SystemTime::now()`, persisted
 ///   every ~30 s. `now - last_heartbeat` approximates cross-reboot
-///   downtime for step 0 of the cold-start rules.
+///   downtime credited into `paused_secs` on the credit-downtime
+///   branch.
 pub struct ResolveInputs {
     pub now: SystemTime,
     pub last_popup: Option<SystemTime>,
@@ -69,6 +72,14 @@ pub struct ResolveInputs {
     pub paused_secs: u64,
     pub popup_pending: bool,
     pub last_heartbeat: SystemTime,
+    /// `true` when the previous run stamped `last_clean_shutdown_at`
+    /// at or after its final heartbeat, i.e. the SCM Stop path
+    /// completed gracefully. Used by [`resolve_cold_start`] to
+    /// discriminate a user-initiated PC restart mid-popup (legitimate,
+    /// relaunch the popup) from a kid-killed service (unclean, punish
+    /// with anti-bypass full reset). Ignored by [`resolve_last_popup`]
+    /// — reload / fresh-install branches don't need it.
+    pub was_clean_shutdown: bool,
 }
 
 /// Decide what `last_popup` should hold given cold-start / reload /
@@ -98,6 +109,7 @@ pub fn resolve_last_popup(inputs: ResolveInputs, config: &Config) -> SystemTime 
         paused_secs: _,
         popup_pending: _,
         last_heartbeat: _,
+        was_clean_shutdown: _,
     } = inputs;
     let interval = interval(config);
 
@@ -151,11 +163,14 @@ pub fn resolve_last_popup(inputs: ResolveInputs, config: &Config) -> SystemTime 
 
 /// Outcome of [`resolve_cold_start`] — everything the service tick loop
 /// needs to seed its in-memory state after reading `runtime.dat`.
+/// `relaunch_now = true` asks the caller to fire a popup immediately
+/// after cold-start (resurrected Rule B, now gated on clean shutdown).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColdStartDecision {
     pub last_popup: SystemTime,
     pub paused_secs: u64,
     pub popup_pending: bool,
+    pub relaunch_now: bool,
 }
 
 /// Cold-boot dispatch for the active-time cycle. Pure ; no I/O.
@@ -165,20 +180,24 @@ pub struct ColdStartDecision {
 /// keeps using [`resolve_last_popup`] with `last_popup: None` for the
 /// fresh-install / legacy-shift branch.
 ///
-/// Three ordered rules :
+/// Four ordered rules :
 /// 1. **Threshold reset** — `elapsed = now - last_popup >= reset_threshold_hours * 3600`.
 ///    Full reset : `last_popup = now`, `paused_secs = 0`,
-///    `popup_pending = false`. The child was away long enough that
-///    resuming mid-cycle would buy them nothing.
-/// 2. **Anti-bypass** — else if `popup_pending == true`. Full reset
-///    too. Kills the "kill service to skip popup" trick : watchdog
-///    resurrects the service, cold-start hands the child a fresh full
-///    interval instead of relaunching the popup. Cost of the trick =
-///    one full cycle.
-/// 3. **Credit downtime** — else. Keep `last_popup`, credit
-///    `downtime = now - last_heartbeat` into `paused_secs`, clear
-///    `popup_pending`. Clock skew (`now < last_heartbeat`) treated as
-///    zero downtime, never negative.
+///    `popup_pending = false`, no relaunch. Child was away long enough
+///    that resuming mid-cycle buys nothing.
+/// 2. **Anti-bypass** — else if `popup_pending && !was_clean_shutdown`.
+///    Signature of "kid killed the service mid-popup to skip it".
+///    Full reset (same shape as threshold) : the trick costs one full
+///    cycle before the next popup fires.
+/// 3. **Relaunch pending popup** — else if `popup_pending && was_clean_shutdown`.
+///    Signature of "user cleanly rebooted the PC while a popup was
+///    displayed". Keep `last_popup` unchanged, keep `popup_pending`,
+///    set `relaunch_now = true`. The caller fires the popup right
+///    after cold-start so the user picks up where they left off.
+/// 4. **Credit downtime** — else (popup was NOT pending). Keep
+///    `last_popup`, credit `downtime = now - last_heartbeat` into
+///    `paused_secs`, no relaunch. Clock skew (`now < last_heartbeat`)
+///    treated as zero downtime, never negative.
 pub fn resolve_cold_start(inputs: ResolveInputs, config: &Config) -> ColdStartDecision {
     let ResolveInputs {
         now,
@@ -186,6 +205,7 @@ pub fn resolve_cold_start(inputs: ResolveInputs, config: &Config) -> ColdStartDe
         paused_secs,
         popup_pending,
         last_heartbeat,
+        was_clean_shutdown,
         // Reload / fresh-install fields — unused on the cold-start path.
         first_install_at: _,
         is_reload: _,
@@ -205,14 +225,25 @@ pub fn resolve_cold_start(inputs: ResolveInputs, config: &Config) -> ColdStartDe
             last_popup: now,
             paused_secs: 0,
             popup_pending: false,
+            relaunch_now: false,
         };
     }
 
-    if popup_pending {
+    if popup_pending && !was_clean_shutdown {
         return ColdStartDecision {
             last_popup: now,
             paused_secs: 0,
             popup_pending: false,
+            relaunch_now: false,
+        };
+    }
+
+    if popup_pending && was_clean_shutdown {
+        return ColdStartDecision {
+            last_popup,
+            paused_secs,
+            popup_pending: true,
+            relaunch_now: true,
         };
     }
 
@@ -223,6 +254,7 @@ pub fn resolve_cold_start(inputs: ResolveInputs, config: &Config) -> ColdStartDe
         last_popup,
         paused_secs: paused_secs.saturating_add(downtime.as_secs()),
         popup_pending: false,
+        relaunch_now: false,
     }
 }
 
@@ -695,6 +727,7 @@ mod tests {
                 paused_secs: 0,
                 popup_pending: false,
                 last_heartbeat: SystemTime::UNIX_EPOCH,
+                was_clean_shutdown: false,
             },
             &cfg,
         );
@@ -717,6 +750,7 @@ mod tests {
                 paused_secs: 0,
                 popup_pending: false,
                 last_heartbeat: SystemTime::UNIX_EPOCH,
+                was_clean_shutdown: false,
             },
             &cfg,
         );
@@ -740,6 +774,7 @@ mod tests {
                 paused_secs: 0,
                 popup_pending: false,
                 last_heartbeat: SystemTime::UNIX_EPOCH,
+                was_clean_shutdown: false,
             },
             &cfg,
         );
@@ -761,6 +796,7 @@ mod tests {
                 paused_secs: 0,
                 popup_pending: false,
                 last_heartbeat: SystemTime::UNIX_EPOCH,
+                was_clean_shutdown: false,
             },
             &cfg,
         );
@@ -782,6 +818,7 @@ mod tests {
                 paused_secs: 0,
                 popup_pending: false,
                 last_heartbeat: SystemTime::UNIX_EPOCH,
+                was_clean_shutdown: false,
             },
             &cfg,
         );
@@ -804,6 +841,7 @@ mod tests {
                 paused_secs: 0,
                 popup_pending: false,
                 last_heartbeat: SystemTime::UNIX_EPOCH,
+                was_clean_shutdown: false,
             },
             &cfg,
         );
@@ -825,6 +863,7 @@ mod tests {
                 paused_secs: 0,
                 popup_pending: false,
                 last_heartbeat: SystemTime::UNIX_EPOCH,
+                was_clean_shutdown: false,
             },
             &cfg,
         );
@@ -847,6 +886,7 @@ mod tests {
                 paused_secs: 0,
                 popup_pending: false,
                 last_heartbeat: SystemTime::UNIX_EPOCH,
+                was_clean_shutdown: false,
             },
             &cfg,
         );
@@ -869,6 +909,7 @@ mod tests {
                 paused_secs: 0,
                 popup_pending: false,
                 last_heartbeat: SystemTime::UNIX_EPOCH,
+                was_clean_shutdown: false,
             },
             &cfg,
         );
@@ -891,6 +932,7 @@ mod tests {
                 paused_secs: 0,
                 popup_pending: false,
                 last_heartbeat: SystemTime::UNIX_EPOCH,
+                was_clean_shutdown: false,
             },
             &cfg,
         );
@@ -912,6 +954,7 @@ mod tests {
                 paused_secs: 0,
                 popup_pending: false,
                 last_heartbeat: SystemTime::UNIX_EPOCH,
+                was_clean_shutdown: false,
             },
             &cfg,
         );
@@ -934,6 +977,7 @@ mod tests {
                 paused_secs: 0,
                 popup_pending: false,
                 last_heartbeat: SystemTime::UNIX_EPOCH,
+                was_clean_shutdown: false,
             },
             &cfg,
         );
@@ -954,6 +998,7 @@ mod tests {
                 paused_secs: 0,
                 popup_pending: false,
                 last_heartbeat: SystemTime::UNIX_EPOCH,
+                was_clean_shutdown: false,
             },
             &cfg,
         );
@@ -1170,6 +1215,7 @@ mod tests {
         hb_secs: u64,
         paused_secs: u64,
         popup_pending: bool,
+        was_clean_shutdown: bool,
     ) -> ResolveInputs {
         ResolveInputs {
             now: epoch_plus(now_secs),
@@ -1179,6 +1225,7 @@ mod tests {
             paused_secs,
             popup_pending,
             last_heartbeat: epoch_plus(hb_secs),
+            was_clean_shutdown,
         }
     }
 
@@ -1191,7 +1238,7 @@ mod tests {
         let now_secs = 100_000;
         let lp_secs = now_secs - (threshold_secs + 10 * 60);
         let hb_secs = now_secs - 60;
-        let inputs = cold_inputs(now_secs, lp_secs, hb_secs, 1234, false);
+        let inputs = cold_inputs(now_secs, lp_secs, hb_secs, 1234, false, false);
         let dec = resolve_cold_start(inputs, &cfg);
         assert_eq!(dec.last_popup, epoch_plus(now_secs));
         assert_eq!(dec.paused_secs, 0);
@@ -1199,18 +1246,57 @@ mod tests {
     }
 
     #[test]
-    fn resolve_cold_start_pending_triggers_anti_bypass_full_reset() {
-        // elapsed well below threshold BUT popup_pending=true → full
-        // reset. Kills the "kill service to skip popup" trick.
+    fn resolve_cold_start_pending_unclean_shutdown_triggers_anti_bypass_full_reset() {
+        // elapsed well below threshold, popup_pending=true, unclean
+        // shutdown (was_clean_shutdown=false) → full reset. Kid killed
+        // the service mid-popup ; anti-bypass fires.
         let cfg = config_with(2.0, vec![], false);
         let now_secs = 100_000;
         let lp_secs = now_secs - 5 * 60; // 5 min elapsed, far below 2 h.
         let hb_secs = now_secs - 30;
-        let inputs = cold_inputs(now_secs, lp_secs, hb_secs, 0, true);
+        let inputs = cold_inputs(now_secs, lp_secs, hb_secs, 0, true, false);
         let dec = resolve_cold_start(inputs, &cfg);
         assert_eq!(dec.last_popup, epoch_plus(now_secs));
         assert_eq!(dec.paused_secs, 0);
         assert!(!dec.popup_pending);
+        assert!(!dec.relaunch_now);
+    }
+
+    #[test]
+    fn resolve_cold_start_pending_clean_shutdown_triggers_relaunch() {
+        // elapsed below threshold, popup_pending=true, CLEAN shutdown
+        // (was_clean_shutdown=true) → user rebooted PC mid-popup ;
+        // resume the popup on next tick. Keep last_popup, keep pending,
+        // signal relaunch_now, don't credit downtime (the popup itself
+        // will terminate the cycle when dismissed).
+        let cfg = config_with(2.0, vec![], false);
+        let now_secs = 100_000;
+        let lp_secs = now_secs - 5 * 60;
+        let hb_secs = now_secs - 30;
+        let inputs = cold_inputs(now_secs, lp_secs, hb_secs, 400, true, true);
+        let dec = resolve_cold_start(inputs, &cfg);
+        assert_eq!(dec.last_popup, epoch_plus(lp_secs));
+        assert_eq!(dec.paused_secs, 400); // unchanged, no downtime credit
+        assert!(dec.popup_pending);
+        assert!(dec.relaunch_now);
+    }
+
+    #[test]
+    fn resolve_cold_start_threshold_takes_priority_over_relaunch() {
+        // elapsed > threshold AND pending=true AND clean shutdown →
+        // threshold rule fires FIRST (highest priority). Full reset,
+        // no relaunch, even though the "clean+pending" signature would
+        // otherwise trigger relaunch.
+        let cfg = config_with(2.0, vec![], false);
+        let threshold_secs = (cfg.reset_threshold_hours * 3600.0) as u64;
+        let now_secs = 100_000;
+        let lp_secs = now_secs - (threshold_secs + 60);
+        let hb_secs = now_secs - 30;
+        let inputs = cold_inputs(now_secs, lp_secs, hb_secs, 0, true, true);
+        let dec = resolve_cold_start(inputs, &cfg);
+        assert_eq!(dec.last_popup, epoch_plus(now_secs));
+        assert!(!dec.popup_pending);
+        assert!(!dec.relaunch_now);
     }
 
     #[test]
@@ -1222,7 +1308,7 @@ mod tests {
         let now_secs = 1_000_000;
         let lp_secs = now_secs - 30 * 60;
         let hb_secs = now_secs - 27_000;
-        let inputs = cold_inputs(now_secs, lp_secs, hb_secs, 100, false);
+        let inputs = cold_inputs(now_secs, lp_secs, hb_secs, 100, false, false);
         let dec = resolve_cold_start(inputs, &cfg);
         assert_eq!(dec.last_popup, epoch_plus(lp_secs));
         assert_eq!(dec.paused_secs, 100 + 27_000);
@@ -1237,7 +1323,7 @@ mod tests {
         let now_secs = 100_000;
         let lp_secs = now_secs;
         let hb_secs = now_secs;
-        let inputs = cold_inputs(now_secs, lp_secs, hb_secs, 0, false);
+        let inputs = cold_inputs(now_secs, lp_secs, hb_secs, 0, false, false);
         let dec = resolve_cold_start(inputs, &cfg);
         assert_eq!(dec.last_popup, epoch_plus(lp_secs));
         assert_eq!(dec.paused_secs, 0);
@@ -1251,7 +1337,7 @@ mod tests {
         let now_secs = 100_000;
         let lp_secs = now_secs - threshold_secs;
         let hb_secs = now_secs - 60;
-        let inputs = cold_inputs(now_secs, lp_secs, hb_secs, 0, false);
+        let inputs = cold_inputs(now_secs, lp_secs, hb_secs, 0, false, false);
         let dec = resolve_cold_start(inputs, &cfg);
         assert_eq!(dec.last_popup, epoch_plus(now_secs));
         assert_eq!(dec.paused_secs, 0);
@@ -1266,7 +1352,7 @@ mod tests {
         let now_secs = 1_000_000;
         let lp_secs = now_secs - 5 * 3600;
         let hb_secs = now_secs - 1000;
-        let inputs = cold_inputs(now_secs, lp_secs, hb_secs, 0, false);
+        let inputs = cold_inputs(now_secs, lp_secs, hb_secs, 0, false, false);
         let dec = resolve_cold_start(inputs, &cfg);
         assert_eq!(dec.last_popup, epoch_plus(lp_secs));
         assert_eq!(dec.paused_secs, 1000);
@@ -1280,7 +1366,7 @@ mod tests {
         let now_secs = 100_000;
         let lp_secs = now_secs - 3600;
         let hb_secs = now_secs + 10_000; // future.
-        let inputs = cold_inputs(now_secs, lp_secs, hb_secs, 500, false);
+        let inputs = cold_inputs(now_secs, lp_secs, hb_secs, 500, false, false);
         let dec = resolve_cold_start(inputs, &cfg);
         assert_eq!(dec.paused_secs, 500);
     }
@@ -1293,7 +1379,7 @@ mod tests {
         let now_secs = 100_000;
         let lp_secs = now_secs + 10_000; // future.
         let hb_secs = now_secs - 60;
-        let inputs = cold_inputs(now_secs, lp_secs, hb_secs, 0, false);
+        let inputs = cold_inputs(now_secs, lp_secs, hb_secs, 0, false, false);
         let dec = resolve_cold_start(inputs, &cfg);
         assert_eq!(dec.last_popup, epoch_plus(lp_secs));
         assert!(!dec.popup_pending);
