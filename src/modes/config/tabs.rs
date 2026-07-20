@@ -322,8 +322,23 @@ fn format_local_hhmm(t: SystemTime) -> Option<String> {
 }
 
 fn ui_general(ui: &mut egui::Ui, cfg: &mut Config, dirty: &mut bool) {
+    // Threshold below which we consider the two sliders "linked" so
+    // moving the interval also moves the reset threshold. Small enough
+    // that ordinary slider steps can't slip past it accidentally.
+    const LINK_EPSILON: f32 = 0.001;
+
     ui.heading("Général");
     ui.add_space(8.0);
+
+    // ── Cycle ──
+    ui.label(egui::RichText::new("Cycle").strong());
+    ui.add_space(4.0);
+
+    // Capture the linked state BEFORE mutating either slider so the
+    // interval-change branch below can propagate correctly (would-be
+    // stale otherwise if we recomputed after the mutation).
+    let was_linked =
+        (cfg.reset_threshold_hours - cfg.interval_hours).abs() < LINK_EPSILON;
 
     ui.horizontal(|ui| {
         ui.label("Intervalle entre les pauses :");
@@ -339,7 +354,16 @@ fn ui_general(ui: &mut egui::Ui, cfg: &mut Config, dirty: &mut bool) {
             )
             .changed()
         {
-            cfg.interval_hours = interval_min as f32 / 60.0;
+            let new_hours = interval_min as f32 / 60.0;
+            cfg.interval_hours = new_hours;
+            if was_linked {
+                cfg.reset_threshold_hours = new_hours;
+            } else {
+                // Preserve the "threshold >= interval" invariant even
+                // when the sliders are diverged.
+                cfg.reset_threshold_hours =
+                    cfg.reset_threshold_hours.max(new_hours);
+            }
             *dirty = true;
         }
     });
@@ -357,10 +381,71 @@ fn ui_general(ui: &mut egui::Ui, cfg: &mut Config, dirty: &mut bool) {
         preview_min, anchor_suffix
     ));
 
+    // Chain-state indicator between the two sliders. Recompute AFTER
+    // the interval slider ran so the icon reflects the just-applied
+    // change (linkage may have re-established if user dragged reset
+    // back to the interval value on a previous frame).
+    let linked =
+        (cfg.reset_threshold_hours - cfg.interval_hours).abs() < LINK_EPSILON;
+    let (icon_text, chain_hint) = if linked {
+        (
+            egui::RichText::new("🔗")
+                .color(egui::Color32::from_rgb(120, 200, 120)),
+            "Sliders liés : bouger l'intervalle bouge aussi le seuil \
+             de reset.",
+        )
+    } else {
+        (
+            egui::RichText::new("🔗")
+                .color(egui::Color32::from_rgb(160, 160, 160))
+                .strikethrough(),
+            "Sliders indépendants. Ramène le seuil de reset à la \
+             valeur de l'intervalle pour les re-lier.",
+        )
+    };
+    ui.horizontal(|ui| {
+        ui.add_space(20.0);
+        ui.label(icon_text).on_hover_text(chain_hint);
+    });
+
+    ui.horizontal(|ui| {
+        ui.label("Reset complet si offline plus de :");
+        let mut reset_h = cfg.reset_threshold_hours;
+        let min = cfg.interval_hours;
+        if ui
+            .add(
+                egui::Slider::new(&mut reset_h, min..=168.0)
+                    .text("heures")
+                    .logarithmic(true),
+            )
+            .on_hover_text(
+                "Passé ce délai sans activité (ordi éteint, en \
+                 veille, service coupé), le compteur repart de zéro \
+                 au redémarrage. La prochaine popup arrive après un \
+                 cycle complet, pas immédiatement. Par défaut, suit \
+                 la durée entre popups.",
+            )
+            .changed()
+        {
+            cfg.reset_threshold_hours = reset_h.max(cfg.interval_hours);
+            *dirty = true;
+        }
+    });
+
+    // ── Comportement ──
+    ui.add_space(12.0);
+    ui.label(egui::RichText::new("Comportement").strong());
+    ui.add_space(4.0);
+
     ui.horizontal(|ui| {
         ui.label("Durée d'une pause :");
         if ui
             .add(egui::Slider::new(&mut cfg.duration_minutes, 1..=30).text("minutes"))
+            .on_hover_text(
+                "Combien de temps la popup reste affichée. Après ce \
+                 délai le bouton « J'ai fait ma pause » devient \
+                 cliquable et l'utilisateur peut la fermer.",
+            )
             .changed()
         {
             *dirty = true;
@@ -384,14 +469,10 @@ fn ui_general(ui: &mut egui::Ui, cfg: &mut Config, dirty: &mut bool) {
         *dirty = true;
     }
 
-    if ui.checkbox(&mut cfg.disabled, "Désactiver les pauses").changed() {
-        *dirty = true;
-    }
-
-    ui.add_space(20.0);
-    ui.separator();
-    ui.add_space(10.0);
-    ui.label("Test :");
+    // ── Test ──
+    ui.add_space(12.0);
+    ui.label(egui::RichText::new("Test").strong());
+    ui.add_space(4.0);
     ui.horizontal_wrapped(|ui| {
         if ui.button("Déclencher une pause maintenant").clicked() {
             #[cfg(windows)]
@@ -434,6 +515,43 @@ fn ui_general(ui: &mut egui::Ui, cfg: &mut Config, dirty: &mut bool) {
                 tracing::warn!(error = %e, "spawn --popup test-prod failed");
             }
         }
+    });
+
+    // Destructive kill-switch. Visually isolated at the very bottom
+    // of the tab, framed, and tinted red when active so it never
+    // reads like a routine option.
+    ui.add_space(20.0);
+    ui.separator();
+    ui.add_space(20.0);
+
+    let frame = if cfg.disabled {
+        egui::Frame::group(ui.style())
+            .fill(egui::Color32::from_rgba_premultiplied(60, 30, 20, 255))
+            .stroke(egui::Stroke::new(
+                1.5,
+                egui::Color32::from_rgb(220, 120, 60),
+            ))
+    } else {
+        egui::Frame::group(ui.style())
+    };
+    frame.show(ui, |ui| {
+        if ui
+            .checkbox(
+                &mut cfg.disabled,
+                egui::RichText::new("⚠  Désactiver les pauses").strong(),
+            )
+            .changed()
+        {
+            *dirty = true;
+        }
+        ui.label(
+            egui::RichText::new(
+                "Aucune popup ne se déclenchera tant que cette case \
+                 est cochée.",
+            )
+            .weak()
+            .small(),
+        );
     });
 }
 
