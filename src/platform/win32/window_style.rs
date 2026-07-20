@@ -70,6 +70,57 @@ pub fn apply_topmost_toolwindow(hwnd: HWND) -> Result<()> {
     Ok(())
 }
 
+/// Steal foreground for `hwnd`, defeating Windows' foreground-lock
+/// policy. Needed when the popup is spawned from a Session 0 service
+/// (or via a cold-start relaunch just after boot) — plain
+/// `SetForegroundWindow` returns success but silently no-ops because
+/// the calling process wasn't the last input source, so the popup
+/// stays behind other windows despite being HWND_TOPMOST.
+///
+/// The `AttachThreadInput` trick briefly borrows the foreground
+/// thread's input state, which promotes our thread to "recently active"
+/// from Win32's perspective for the duration of the attachment, and
+/// makes `SetForegroundWindow` actually respect the request. Widely
+/// used across the ecosystem — Chrome, Notepad++, most tray apps that
+/// need to unhide their window on hotkey.
+///
+/// Preview path (config UI "Test" button) doesn't need this : the
+/// spawn happens right after the user click, foreground-lock is
+/// already relaxed. Safe to call unconditionally though — no-op when
+/// we already own the foreground.
+pub fn force_foreground(hwnd: HWND) -> Result<()> {
+    use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+    use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        BringWindowToTop, GetForegroundWindow, GetWindowThreadProcessId, SetForegroundWindow,
+        ShowWindow, SW_SHOW,
+    };
+
+    unsafe {
+        let foreground = GetForegroundWindow();
+        let our_tid = GetCurrentThreadId();
+        let foreground_tid = if !foreground.is_invalid() {
+            GetWindowThreadProcessId(foreground, None)
+        } else {
+            0
+        };
+
+        let attached = foreground_tid != 0 && foreground_tid != our_tid && {
+            AttachThreadInput(foreground_tid, our_tid, true).as_bool()
+        };
+
+        let _ = ShowWindow(hwnd, SW_SHOW);
+        let _ = BringWindowToTop(hwnd);
+        let _ = SetForegroundWindow(hwnd);
+        let _ = SetFocus(Some(hwnd));
+
+        if attached {
+            let _ = AttachThreadInput(foreground_tid, our_tid, false);
+        }
+    }
+    Ok(())
+}
+
 /// Explicitly remove the window from the Windows taskbar via
 /// `ITaskbarList::DeleteTab`. `WS_EX_TOOLWINDOW` alone doesn't
 /// reliably hide the popup on Win11 ARM64 (taskbar still shows a

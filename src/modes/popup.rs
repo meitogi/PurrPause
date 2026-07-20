@@ -394,6 +394,21 @@ mod windows_impl {
         window.set_fullscreen(Some(Fullscreen::Borderless(None)));
         tracing::info!("popup: fullscreen re-forced post-set_visible");
 
+        // Steal foreground, defeating Windows' foreground-lock policy.
+        // Necessary on any spawn where no user input happened in the
+        // last few seconds : cold-start relaunch after reboot, service
+        // auto-fire while the user is in a game / IDE / any focused
+        // app. Without this, the popup sits topmost in z-order but
+        // stays behind the currently active window until the user
+        // clicks the taskbar. Preview / debug paths don't strictly
+        // need it (spawn happens right after a user click, foreground
+        // lock is relaxed) but calling unconditionally is safe.
+        if let Err(e) = window_style::force_foreground(hwnd) {
+            tracing::warn!(error = ?e, "popup: force_foreground failed");
+        } else {
+            tracing::info!("popup: force_foreground applied");
+        }
+
         // NB : strip_window_frame + disable_dwm_nc_rendering are NOT
         // called on the popup. It's fullscreen borderless — no bord
         // visible by definition, no DWM shadow either. Both calls
