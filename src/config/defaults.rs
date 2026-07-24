@@ -24,6 +24,10 @@ pub const DEFAULT_WIZARD_WELCOME: &str =
     "Bienvenue. Configure les rappels de pause avant de continuer.";
 pub const DEFAULT_WIZARD_PASSWORD_HINT: &str =
     "Choisis un code numérique entre 4 et 12 chiffres. Il sera demandé pour modifier ou désinstaller.";
+pub const DEFAULT_DAILY_PAUSE_TIMEZONE: &str = "Europe/Paris";
+pub const DEFAULT_DAILY_PAUSE_POPUP_TITLE: &str = "Pause midi";
+pub const DEFAULT_DAILY_PAUSE_POPUP_SUBTITLE: &str =
+    "C'est l'heure de manger. À tout à l'heure !";
 
 pub mod d {
     use super::*;
@@ -97,6 +101,41 @@ pub mod d {
     }
     pub fn animation_offset_y_vh() -> i8 {
         0
+    }
+    /// Default `false` = anti-tamper mode ON : `time_authority` queries
+    /// NTP/HTTPS and falls back silently to `SystemTime::now()` if
+    /// offline. Setting `true` is the escape hatch for public /
+    /// permissive usage.
+    pub const fn use_system_clock() -> bool {
+        false
+    }
+    pub const fn daily_pause_enabled() -> bool {
+        true
+    }
+    pub fn daily_pause_timezone() -> String {
+        DEFAULT_DAILY_PAUSE_TIMEZONE.to_string()
+    }
+    pub const fn daily_pause_hour() -> u8 {
+        12
+    }
+    pub const fn daily_pause_minute() -> u8 {
+        0
+    }
+    pub const fn daily_pause_duration_minutes() -> u32 {
+        30
+    }
+    pub fn daily_pause_popup_title() -> String {
+        DEFAULT_DAILY_PAUSE_POPUP_TITLE.to_string()
+    }
+    pub fn daily_pause_popup_subtitle() -> String {
+        DEFAULT_DAILY_PAUSE_POPUP_SUBTITLE.to_string()
+    }
+    pub fn daily_pause_pre_notif_messages() -> HashMap<u32, String> {
+        let mut m = HashMap::new();
+        m.insert(15, "Pause midi dans 15 min".to_string());
+        m.insert(10, "Pause midi dans 10 min".to_string());
+        m.insert(5, "Pause midi dans 5 min !".to_string());
+        m
     }
     /// Default AnimationEntry list — the two `.lottie` files shipped
     /// under `<exe_dir>/resources/animations/`, with `scale` +

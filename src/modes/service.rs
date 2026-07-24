@@ -183,6 +183,7 @@ mod win {
                         popup_pending: false,
                         last_heartbeat: now,
                         last_clean_shutdown_at: SystemTime::UNIX_EPOCH,
+                        ..runtime_dat::RuntimeState::default()
                     });
                     tracing::info!(
                         path = "no-runtime-dat",
@@ -273,6 +274,7 @@ mod win {
                         popup_pending: d.popup_pending,
                         last_heartbeat: now,
                         last_clean_shutdown_at: SystemTime::UNIX_EPOCH,
+                        ..runtime_dat::RuntimeState::default()
                     });
                     (d.last_popup, d.paused_secs, d.popup_pending, d.relaunch_now)
                 }
@@ -428,6 +430,7 @@ mod win {
             popup_pending,
             last_heartbeat: shutdown_now,
             last_clean_shutdown_at: shutdown_now,
+            ..runtime_dat::RuntimeState::default()
         }) {
             tracing::warn!(
                 error = ?e,
@@ -590,6 +593,7 @@ mod win {
                             popup_pending: *popup_pending,
                             last_heartbeat: *last_heartbeat,
                             last_clean_shutdown_at: SystemTime::UNIX_EPOCH,
+                            ..runtime_dat::RuntimeState::default()
                         });
                     }
                     *fired = scheduler::derive_already_fired(
@@ -912,12 +916,26 @@ mod win {
                     //    the popup is the intended escape hatch for the
                     //    rare "I'm mid-presentation, don't interrupt"
                     //    case.
+                    // Session-1 placeholder pass : the three new
+                    // args (popup_pending, daily_pause_state,
+                    // now_local) preserve the pre-daily-pause
+                    // behavior. Session 2 wires the real values via
+                    // `time_authority::in_configured_tz` + runtime.dat
+                    // state, at which point the daily-pause branch
+                    // starts firing.
+                    let now_local_placeholder = {
+                        let utc: chrono::DateTime<chrono::Utc> = now.into();
+                        utc.with_timezone(&chrono_tz::Europe::Paris)
+                    };
                     match scheduler::next_event(
                         now,
                         config,
                         *last_popup,
                         *paused_secs,
                         fired,
+                        false,
+                        &scheduler::DailyPauseState::default(),
+                        now_local_placeholder,
                     ) {
                         SchedulerDecision::Nothing => {}
                         SchedulerDecision::FirePopup => {
@@ -964,6 +982,13 @@ mod win {
                                 tracing::warn!(error = ?e, "tick fire_countdown failed");
                             }
                         }
+                        // Session-1 placeholder : the daily-pause
+                        // scheduler branch is dormant because the
+                        // DailyPauseState placeholder has enabled=false.
+                        // Session 2 replaces these arms with
+                        // fire_popup_daily / fire_countdown_daily.
+                        SchedulerDecision::FireDailyPause => {}
+                        SchedulerDecision::FireDailyCountdown { .. } => {}
                     }
 
                     // 5. Throttled heartbeat (~30 s cadence). The fire
@@ -979,6 +1004,7 @@ mod win {
                             popup_pending: *popup_pending,
                             last_heartbeat: *last_heartbeat,
                             last_clean_shutdown_at: SystemTime::UNIX_EPOCH,
+                            ..runtime_dat::RuntimeState::default()
                         }) {
                             tracing::warn!(error = ?e, "heartbeat runtime.dat write failed");
                         }
@@ -1048,6 +1074,7 @@ mod win {
                     popup_pending: true,
                     last_heartbeat: now,
                     last_clean_shutdown_at: SystemTime::UNIX_EPOCH,
+                    ..runtime_dat::RuntimeState::default()
                 }) {
                     tracing::warn!(error = ?e, "write runtime.dat failed");
                 }

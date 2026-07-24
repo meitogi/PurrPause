@@ -20,6 +20,7 @@ mod platform;
 mod runtime_dat;
 mod scheduler;
 mod signals;
+mod time_authority;
 #[cfg(test)]
 mod tracing_lint;
 #[cfg(test)]

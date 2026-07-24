@@ -46,6 +46,24 @@ pub struct Config {
     #[serde(default = "d::count_active_time")]
     pub count_active_time: bool,
 
+    // --- Time authority ---
+    /// When `true`, the scheduler uses `SystemTime::now()` + Windows
+    /// local TZ (public / permissive mode). When `false` (default),
+    /// `time_authority` queries NTP/HTTPS for real UTC and applies
+    /// `daily_pause.timezone` — the anti-tamper story. Persisted in
+    /// state.dat so a child toggling this off later is a config edit,
+    /// not a runtime flag.
+    #[serde(default = "d::use_system_clock")]
+    pub use_system_clock: bool,
+
+    // --- Daily pause (Pause midi) ---
+    /// Core config for the daily lunch pause. Independent kill-switch
+    /// from [`Self::disabled`] — the General-tab kill-switch scopes to
+    /// intervals only ; disabling the daily pause happens via
+    /// [`DailyPauseConfig::enabled`] in its own tab.
+    #[serde(default)]
+    pub daily_pause: DailyPauseConfig,
+
     // --- Animations ---
     /// Populated from `d::animations()` with the two shipped assets
     /// when state.dat is fresh — user adds/removes via the config UI.
@@ -151,4 +169,65 @@ pub struct AnimationEntry {
 pub enum RotationMode {
     Random,
     Sequential,
+}
+
+/// Daily lunch pause — mandatory popup at a wall-clock H:M in a
+/// persisted IANA time-zone. Independent of the interval-based
+/// popups (different kill-switch, different texts, different paliers).
+///
+/// Paliers `[15, 10, 5]` are fixed per spec ; the `HashMap` key set
+/// is those three values. The pre-notif texts are user-editable via
+/// the Messages tab.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DailyPauseConfig {
+    /// Kill-switch scoped to the daily pause only. Default `true` —
+    /// the pause fires unless the child (or admin) explicitly turns
+    /// it off. Independent of [`Config::disabled`], which scopes to
+    /// interval popups.
+    #[serde(default = "d::daily_pause_enabled")]
+    pub enabled: bool,
+
+    /// IANA time-zone name — default `"Europe/Paris"`. Persisted so a
+    /// child changing Windows TZ cannot shift the pause hour. Invalid
+    /// values fall back to Europe/Paris at read time (see
+    /// [`crate::time_authority::in_configured_tz`]).
+    #[serde(default = "d::daily_pause_timezone")]
+    pub timezone: String,
+
+    /// Wall-clock hour (0..=23) in [`Self::timezone`]. Default 12.
+    #[serde(default = "d::daily_pause_hour")]
+    pub hour: u8,
+    /// Wall-clock minute (0..=59) in [`Self::timezone`]. Default 0.
+    #[serde(default = "d::daily_pause_minute")]
+    pub minute: u8,
+
+    /// Duration of the daily-pause popup before the dismiss button
+    /// becomes clickable. Default 30. UI slider clamps to 5..=120
+    /// (session 3).
+    #[serde(default = "d::daily_pause_duration_minutes")]
+    pub duration_minutes: u32,
+
+    /// Popup title — independent of [`Config::popup_title`] so the
+    /// daily pause reads distinctly (« Pause midi » vs the interval's
+    /// « C'est l'heure de la pause »).
+    #[serde(default = "d::daily_pause_popup_title")]
+    pub popup_title: String,
+    /// Popup subtitle — pairs with [`Self::popup_title`].
+    #[serde(default = "d::daily_pause_popup_subtitle")]
+    pub popup_subtitle: String,
+
+    /// Pre-notification messages keyed by palier minutes. Keys are
+    /// always `{15, 10, 5}` — the palier set is fixed for the daily
+    /// pause (unlike the interval paliers). Missing keys mean the
+    /// countdown widget shows an empty message ; use the defaults.
+    #[serde(default = "d::daily_pause_pre_notif_messages")]
+    pub pre_notif_messages: HashMap<u32, String>,
+}
+
+impl Default for DailyPauseConfig {
+    fn default() -> Self {
+        // Mirror the `Config::default` idiom : deserialize from an
+        // empty TOML doc so every `#[serde(default = "d::…")]` fires.
+        toml::from_str("").expect("empty toml deserializes to DailyPauseConfig default")
+    }
 }

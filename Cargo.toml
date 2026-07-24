@@ -32,6 +32,18 @@ notify = "8.2.0"
 # animations/*.json } and we mutate the animation JSON (strip full-canvas
 # white solid layers) before re-zipping.
 serde_json = "1.0.128"
+# Calendar arithmetic for the daily-pause scheduler (H:M fire moment,
+# grace window, "today vs tomorrow" comparison). `clock` gives us
+# `Utc::now()` + IANA time-zone resolution ; trim `oldtime` +
+# `wasmbind` we don't need.
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
+# IANA TZ database bundled at build time — persisted TZ name in config
+# resists Windows TZ-panel tampering (the whole anti-cheat premise).
+chrono-tz = "0.10.4"
+# SNTP protocol handling for the anti-tamper time authority. Session 1
+# adds only the protocol crate ; the socket adapter (`sntpc-net-std`)
+# lands in session 2 when the sync loop actually spawns.
+sntpc = { version = "0.11.0", default-features = false, features = ["std"] }
 # ZIP read+write for the Lottie sanitizer. `deflate-flate2` picks the
 # pure-Rust miniz_oxide backend — cross-compiles cleanly under xwin and
 # keeps binary size in check. `.lottie` files use standard DEFLATE.

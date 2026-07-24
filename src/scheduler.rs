@@ -14,6 +14,9 @@
 use std::collections::HashSet;
 use std::time::{Duration, SystemTime};
 
+use chrono::{DateTime, Duration as ChronoDuration, TimeZone};
+use chrono_tz::Tz;
+
 use crate::config::Config;
 
 // 1 minute minimum : aligned with the config UI's minutes-based slider
@@ -390,6 +393,68 @@ pub enum SchedulerDecision {
         seconds_until_popup: u64,
     },
     FirePopup,
+    /// Fire the daily lunch pause popup. Takes priority over
+    /// `FirePopup` when both would trigger on the same tick — the
+    /// daily pause is time-anchored while the interval popup will
+    /// simply reschedule.
+    FireDailyPause,
+    /// Fire a pre-notification widget for the daily pause at palier
+    /// `palier_minutes` (one of 15, 10, 5). `seconds_until` is the
+    /// countdown displayed inside the widget.
+    FireDailyCountdown {
+        palier_minutes: u32,
+        seconds_until: u64,
+    },
+}
+
+/// Snapshot of the daily-pause state for a single tick — the scheduler
+/// is TZ-agnostic ; the caller (`service.rs`) pre-resolves timestamps
+/// via `time_authority::in_configured_tz` and the ROLLOUT's H:M schedule.
+#[derive(Debug, Clone)]
+pub struct DailyPauseState {
+    /// Independent kill-switch (`Config::daily_pause.enabled`). When
+    /// false, no daily-pause decisions are emitted — the interval
+    /// path still runs.
+    pub enabled: bool,
+    /// True once today's daily pause has fired. Derived from
+    /// `runtime.daily_pause_fired_at` compared against `now_local`'s
+    /// date. Reset at day boundary by the caller.
+    pub fired_today: bool,
+    /// Today's fire moment in the configured TZ. Precomputed by the
+    /// caller so the scheduler doesn't own the TZ/date arithmetic.
+    pub fire_at_today: DateTime<Tz>,
+    /// End of the grace window : `fire_at_today + duration_minutes`.
+    /// Past this the pause is skipped for the day (Cas C — see
+    /// ROLLOUT).
+    pub grace_window_end: DateTime<Tz>,
+    /// Paliers already fired for today. The caller may pre-populate
+    /// with paliers whose windows are already past at boot to prevent
+    /// retroactive fires (Cas B in the ROLLOUT).
+    pub fired_paliers: HashSet<u32>,
+    /// Anti-forkbomb marker (Cas C) : true when today's fire attempt
+    /// hit past-grace-window ; scheduler must not retry until tomorrow.
+    pub skipped_today: bool,
+}
+
+impl Default for DailyPauseState {
+    fn default() -> Self {
+        // Sentinel values : disabled + fire moment at UNIX_EPOCH-ish.
+        // The scheduler short-circuits before consuming the dates
+        // because `enabled=false`. Used by service.rs session-1
+        // placeholder pass ; session 2 threads real values.
+        let epoch = chrono_tz::Europe::Paris
+            .with_ymd_and_hms(1970, 1, 1, 0, 0, 0)
+            .single()
+            .expect("1970-01-01 00:00 Paris is unambiguous");
+        Self {
+            enabled: false,
+            fired_today: false,
+            fire_at_today: epoch,
+            grace_window_end: epoch,
+            fired_paliers: HashSet::new(),
+            skipped_today: false,
+        }
+    }
 }
 
 /// Central decision : what should happen right now given the tick's
@@ -403,13 +468,77 @@ pub enum SchedulerDecision {
 /// `fired_paliers` tracks paliers already spawned in the current cycle.
 /// Reset it to empty after a popup fires ; re-derive it via
 /// [`derive_already_fired`] after service restart or config reload.
+///
+/// `popup_pending` is a top-level guard : when true, NO decision is
+/// emitted — countdown spawns are suppressed while a popup is up, and
+/// even the daily-pause fire waits for the current popup to close
+/// (session 2 dispatches an explicit collision-resolution path).
+///
+/// `daily_pause_state` provides the TZ-pre-resolved state for the
+/// daily lunch pause (fire moment, grace window, already-fired
+/// paliers). The scheduler stays TZ-agnostic ; the caller in
+/// `service.rs` owns the `now_local` computation via
+/// `time_authority::in_configured_tz`.
+///
+/// **Kill-switch scoping** : `Config::disabled` only gates the
+/// interval branch — the daily-pause branch honors its own
+/// `DailyPauseState::enabled` flag. This mirrors the "Two orthogonal
+/// switches" decision in the ROLLOUT.
 pub fn next_event(
     now: SystemTime,
     config: &Config,
     last_popup: SystemTime,
     paused_secs: u64,
     fired_paliers: &HashSet<u32>,
+    popup_pending: bool,
+    daily_pause_state: &DailyPauseState,
+    now_local: DateTime<Tz>,
 ) -> SchedulerDecision {
+    // Top-level guard : no fresh spawns while a popup is up. Kills
+    // pre-notif countdowns AND defers the daily-pause fire — session 2
+    // handles the collision by dismissing the current popup and
+    // re-firing on the next tick.
+    if popup_pending {
+        return SchedulerDecision::Nothing;
+    }
+
+    // Daily-pause fire has the highest priority : it's time-anchored
+    // and the interval popup can reschedule freely.
+    if daily_pause_state.enabled
+        && !daily_pause_state.fired_today
+        && !daily_pause_state.skipped_today
+        && now_local >= daily_pause_state.fire_at_today
+        && now_local <= daily_pause_state.grace_window_end
+    {
+        return SchedulerDecision::FireDailyPause;
+    }
+
+    // Daily-pause countdowns — iterate largest → smallest so we emit
+    // the tightest-still-relevant palier when the earlier ones have
+    // already been fired. Windows are closed once now_local passes
+    // fire_at_today (the fire branch above catches that case).
+    if daily_pause_state.enabled && !daily_pause_state.fired_today {
+        for palier in [15u32, 10, 5] {
+            if daily_pause_state.fired_paliers.contains(&palier) {
+                continue;
+            }
+            let palier_moment = daily_pause_state.fire_at_today
+                - ChronoDuration::minutes(i64::from(palier));
+            if now_local >= palier_moment && now_local < daily_pause_state.fire_at_today {
+                let seconds_until = (daily_pause_state.fire_at_today - now_local)
+                    .num_seconds()
+                    .max(0) as u64;
+                return SchedulerDecision::FireDailyCountdown {
+                    palier_minutes: palier,
+                    seconds_until,
+                };
+            }
+        }
+    }
+
+    // Interval branch — scoped kill-switch (Config::disabled only
+    // disables intervals per the ROLLOUT "kill-switch separation"
+    // decision).
     if config.disabled {
         return SchedulerDecision::Nothing;
     }
@@ -530,6 +659,57 @@ mod tests {
         SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
     }
 
+    /// Thin test helper — supplies default (disabled) daily-pause
+    /// state and a `now_local` computed by treating `now` as UTC and
+    /// projecting into Europe/Paris. Keeps the interval-focused tests
+    /// terse ; the daily-pause tests below build the full state
+    /// explicitly.
+    fn next_event_intervals_only(
+        now: SystemTime,
+        cfg: &Config,
+        last: SystemTime,
+        paused: u64,
+        fired: &HashSet<u32>,
+    ) -> SchedulerDecision {
+        let utc: DateTime<chrono::Utc> = now.into();
+        let now_local = utc.with_timezone(&chrono_tz::Europe::Paris);
+        next_event(
+            now,
+            cfg,
+            last,
+            paused,
+            fired,
+            false,
+            &DailyPauseState::default(),
+            now_local,
+        )
+    }
+
+    /// Build a `DailyPauseState` firing at (H:M) today in `tz` with a
+    /// grace window of `duration_minutes`. `now_local` anchors the
+    /// "today" date.
+    fn daily_state_at(
+        tz: Tz,
+        now_local: DateTime<Tz>,
+        h: u32,
+        m: u32,
+        duration_minutes: i64,
+    ) -> DailyPauseState {
+        use chrono::Datelike;
+        let fire = tz
+            .with_ymd_and_hms(now_local.year(), now_local.month(), now_local.day(), h, m, 0)
+            .single()
+            .expect("test time is unambiguous");
+        DailyPauseState {
+            enabled: true,
+            fired_today: false,
+            fire_at_today: fire,
+            grace_window_end: fire + ChronoDuration::minutes(duration_minutes),
+            fired_paliers: HashSet::new(),
+            skipped_today: false,
+        }
+    }
+
     #[test]
     fn disabled_config_returns_nothing() {
         let cfg = config_with(2.0, vec![15, 10, 5], true);
@@ -537,7 +717,7 @@ mod tests {
         let last = epoch_plus(0);
         let fired = HashSet::new();
         assert_eq!(
-            next_event(now, &cfg, last, 0, &fired),
+            next_event_intervals_only(now, &cfg, last, 0, &fired),
             SchedulerDecision::Nothing
         );
     }
@@ -550,7 +730,7 @@ mod tests {
         let last = epoch_plus(0);
         let fired = HashSet::new();
         assert_eq!(
-            next_event(now, &cfg, last, 0, &fired),
+            next_event_intervals_only(now, &cfg, last, 0, &fired),
             SchedulerDecision::Nothing
         );
     }
@@ -563,7 +743,7 @@ mod tests {
         let last = epoch_plus(0);
         let fired = HashSet::new();
         assert_eq!(
-            next_event(now, &cfg, last, 0, &fired),
+            next_event_intervals_only(now, &cfg, last, 0, &fired),
             SchedulerDecision::FirePopup
         );
     }
@@ -575,7 +755,7 @@ mod tests {
         let last = epoch_plus(0);
         let fired = HashSet::new();
         assert_eq!(
-            next_event(now, &cfg, last, 0, &fired),
+            next_event_intervals_only(now, &cfg, last, 0, &fired),
             SchedulerDecision::FirePopup
         );
     }
@@ -588,7 +768,7 @@ mod tests {
         let next_popup = 2 * 3600;
         let now = epoch_plus(next_popup - 15 * 60);
         let fired = HashSet::new();
-        match next_event(now, &cfg, last, 0, &fired) {
+        match next_event_intervals_only(now, &cfg, last, 0, &fired) {
             SchedulerDecision::FireCountdown {
                 palier_minutes,
                 seconds_until_popup,
@@ -609,7 +789,7 @@ mod tests {
         let mut fired = HashSet::new();
         fired.insert(15);
         assert_eq!(
-            next_event(now, &cfg, last, 0, &fired),
+            next_event_intervals_only(now, &cfg, last, 0, &fired),
             SchedulerDecision::Nothing
         );
     }
@@ -624,7 +804,7 @@ mod tests {
         let next_popup = 2 * 3600;
         let now = epoch_plus(next_popup - 9 * 60);
         let fired = HashSet::new();
-        match next_event(now, &cfg, last, 0, &fired) {
+        match next_event_intervals_only(now, &cfg, last, 0, &fired) {
             SchedulerDecision::FireCountdown { palier_minutes, .. } => {
                 assert_eq!(palier_minutes, 15);
             }
@@ -639,7 +819,7 @@ mod tests {
         let last = epoch_plus(0);
         let now = epoch_plus(2 * 3600 - 15 * 60);
         let fired = HashSet::new();
-        match next_event(now, &cfg, last, 0, &fired) {
+        match next_event_intervals_only(now, &cfg, last, 0, &fired) {
             SchedulerDecision::FireCountdown { palier_minutes, .. } => {
                 assert_eq!(palier_minutes, 15);
             }
@@ -728,7 +908,7 @@ mod tests {
         let last = now;
         let fired = HashSet::new();
         assert_eq!(
-            next_event(now, &cfg, last, 0, &fired),
+            next_event_intervals_only(now, &cfg, last, 0, &fired),
             SchedulerDecision::Nothing
         );
     }
@@ -1226,7 +1406,7 @@ mod tests {
         let now = epoch_plus(2 * 3600 + 1);
         let fired = HashSet::new();
         assert_eq!(
-            next_event(now, &cfg, last, 30 * 60, &fired),
+            next_event_intervals_only(now, &cfg, last, 30 * 60, &fired),
             SchedulerDecision::Nothing,
         );
     }
@@ -1555,5 +1735,222 @@ mod tests {
     fn shift_systemtime_zero_returns_base() {
         let base = epoch_plus(1_000);
         assert_eq!(shift_systemtime(base, 0), base);
+    }
+
+    // === Daily-pause scheduler tests ===
+
+    fn paris_at(y: i32, mo: u32, d: u32, h: u32, m: u32) -> DateTime<Tz> {
+        chrono_tz::Europe::Paris
+            .with_ymd_and_hms(y, mo, d, h, m, 0)
+            .single()
+            .expect("test wall time is unambiguous in Paris")
+    }
+
+    #[test]
+    fn daily_pause_fires_at_configured_hour() {
+        let cfg = config_with(2.0, vec![15, 10, 5, 1], false);
+        let now = epoch_plus(10_000);
+        let last = epoch_plus(0);
+        let fired = HashSet::new();
+        let now_local = paris_at(2026, 3, 15, 12, 0);
+        let state = daily_state_at(chrono_tz::Europe::Paris, now_local, 12, 0, 30);
+        let decision = next_event(now, &cfg, last, 0, &fired, false, &state, now_local);
+        assert_eq!(decision, SchedulerDecision::FireDailyPause);
+    }
+
+    #[test]
+    fn daily_pause_skipped_when_popup_pending() {
+        let cfg = config_with(2.0, vec![15, 10, 5, 1], false);
+        let now = epoch_plus(10_000);
+        let last = epoch_plus(0);
+        let fired = HashSet::new();
+        let now_local = paris_at(2026, 3, 15, 12, 0);
+        let state = daily_state_at(chrono_tz::Europe::Paris, now_local, 12, 0, 30);
+        let decision = next_event(now, &cfg, last, 0, &fired, true, &state, now_local);
+        assert_eq!(decision, SchedulerDecision::Nothing);
+    }
+
+    #[test]
+    fn daily_pause_countdown_skips_fired_palier() {
+        let cfg = config_with(2.0, vec![], false); // interval paliers irrelevant
+        let now = epoch_plus(10_000);
+        let last = epoch_plus(0);
+        let fired = HashSet::new();
+        let now_local = paris_at(2026, 3, 15, 11, 55); // T-5min from 12:00
+        let mut state = daily_state_at(chrono_tz::Europe::Paris, now_local, 12, 0, 30);
+        // Paliers 15 and 10 already fired earlier — we should get 5.
+        state.fired_paliers.insert(15);
+        state.fired_paliers.insert(10);
+        let decision = next_event(now, &cfg, last, 0, &fired, false, &state, now_local);
+        match decision {
+            SchedulerDecision::FireDailyCountdown { palier_minutes, .. } => {
+                assert_eq!(palier_minutes, 5);
+            }
+            other => panic!("expected FireDailyCountdown{{palier=5}}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn daily_pause_disabled_returns_no_daily_events() {
+        // With daily-pause disabled, the scheduler ignores the daily
+        // branch entirely — the interval path (also disabled here via
+        // config.disabled) drops through to Nothing.
+        let cfg = config_with(2.0, vec![15, 10, 5], true);
+        let now = epoch_plus(10_000);
+        let last = epoch_plus(0);
+        let fired = HashSet::new();
+        let now_local = paris_at(2026, 3, 15, 12, 0);
+        let mut state = daily_state_at(chrono_tz::Europe::Paris, now_local, 12, 0, 30);
+        state.enabled = false;
+        let decision = next_event(now, &cfg, last, 0, &fired, false, &state, now_local);
+        assert_eq!(decision, SchedulerDecision::Nothing);
+    }
+
+    #[test]
+    fn daily_pause_fires_on_weekend() {
+        // 2026-03-14 is a Saturday. Fire must still trigger — the
+        // daily pause has no day-of-week filter (per ROLLOUT).
+        let cfg = config_with(2.0, vec![15, 10, 5], false);
+        let now = epoch_plus(10_000);
+        let last = epoch_plus(0);
+        let fired = HashSet::new();
+        let now_local = paris_at(2026, 3, 14, 12, 0);
+        let state = daily_state_at(chrono_tz::Europe::Paris, now_local, 12, 0, 30);
+        let decision = next_event(now, &cfg, last, 0, &fired, false, &state, now_local);
+        assert_eq!(decision, SchedulerDecision::FireDailyPause);
+    }
+
+    #[test]
+    fn daily_pause_non_paris_tz_fires_at_local_noon() {
+        // Fire at 12:00 America/New_York. Same scheduler logic — the
+        // caller (session 2) picks the TZ ; the scheduler just
+        // compares DateTime<Tz> values.
+        let cfg = config_with(2.0, vec![15, 10, 5], false);
+        let now = epoch_plus(10_000);
+        let last = epoch_plus(0);
+        let fired = HashSet::new();
+        let now_local = chrono_tz::America::New_York
+            .with_ymd_and_hms(2026, 3, 15, 12, 0, 0)
+            .single()
+            .unwrap();
+        let state = daily_state_at(chrono_tz::America::New_York, now_local, 12, 0, 30);
+        let decision = next_event(now, &cfg, last, 0, &fired, false, &state, now_local);
+        assert_eq!(decision, SchedulerDecision::FireDailyPause);
+    }
+
+    #[test]
+    fn daily_pause_grace_window_at_29_min_fires() {
+        let cfg = config_with(2.0, vec![], false);
+        let now = epoch_plus(10_000);
+        let last = epoch_plus(0);
+        let fired = HashSet::new();
+        let now_local = paris_at(2026, 3, 15, 12, 29);
+        let state = daily_state_at(chrono_tz::Europe::Paris, now_local, 12, 0, 30);
+        let decision = next_event(now, &cfg, last, 0, &fired, false, &state, now_local);
+        assert_eq!(decision, SchedulerDecision::FireDailyPause);
+    }
+
+    #[test]
+    fn daily_pause_grace_window_at_31_min_does_not_fire() {
+        // Past the grace window (12:00 + 30min = 12:30) → no fire.
+        // The caller (session 2) sets skipped_today after seeing
+        // Nothing here, so the next tick doesn't re-attempt.
+        // Intervals disabled so the assertion isolates the daily branch.
+        let cfg = config_with(2.0, vec![], true);
+        let now = epoch_plus(10_000);
+        let last = epoch_plus(0);
+        let fired = HashSet::new();
+        let now_local = paris_at(2026, 3, 15, 12, 31);
+        let state = daily_state_at(chrono_tz::Europe::Paris, now_local, 12, 0, 30);
+        let decision = next_event(now, &cfg, last, 0, &fired, false, &state, now_local);
+        assert_eq!(decision, SchedulerDecision::Nothing);
+    }
+
+    #[test]
+    fn daily_pause_priority_over_interval_popup() {
+        // Both branches would fire on the same tick — daily pause
+        // wins per the ROLLOUT ("time-anchored takes priority ; the
+        // interval popup will simply reschedule").
+        let cfg = config_with(0.001, vec![], false); // interval = 3.6s → immediately due
+        let now = epoch_plus(10_000);
+        let last = epoch_plus(0); // last popup was long ago
+        let fired = HashSet::new();
+        let now_local = paris_at(2026, 3, 15, 12, 0);
+        let state = daily_state_at(chrono_tz::Europe::Paris, now_local, 12, 0, 30);
+        let decision = next_event(now, &cfg, last, 0, &fired, false, &state, now_local);
+        assert_eq!(decision, SchedulerDecision::FireDailyPause);
+    }
+
+    #[test]
+    fn daily_pause_skipped_today_blocks_retry() {
+        // Intervals disabled so the assertion isolates the daily branch.
+        let cfg = config_with(2.0, vec![], true);
+        let now = epoch_plus(10_000);
+        let last = epoch_plus(0);
+        let fired = HashSet::new();
+        let now_local = paris_at(2026, 3, 15, 12, 15);
+        let mut state = daily_state_at(chrono_tz::Europe::Paris, now_local, 12, 0, 30);
+        state.skipped_today = true;
+        let decision = next_event(now, &cfg, last, 0, &fired, false, &state, now_local);
+        assert_eq!(decision, SchedulerDecision::Nothing);
+    }
+
+    #[test]
+    fn daily_pause_boot_mid_grace_window_fires_not_stale_countdown() {
+        // Cas B : PC boots at 12h05 with the caller pre-populating
+        // paliers 15+10 as "already past" (the ROLLOUT anti-retro
+        // rule). The scheduler must return FireDailyPause directly,
+        // NOT a stale countdown for palier 5 (which is also past
+        // relative to fire_at_today, so its window has closed).
+        let cfg = config_with(2.0, vec![], false);
+        let now = epoch_plus(10_000);
+        let last = epoch_plus(0);
+        let fired = HashSet::new();
+        let now_local = paris_at(2026, 3, 15, 12, 5);
+        let mut state = daily_state_at(chrono_tz::Europe::Paris, now_local, 12, 0, 30);
+        state.fired_paliers.insert(15);
+        state.fired_paliers.insert(10);
+        // Note : palier 5's window is [11:55, 12:00) ; now_local=12:05
+        // is past 12:00 so the countdown branch's `< fire_at_today`
+        // check already excludes it. The fire branch takes precedence.
+        let decision = next_event(now, &cfg, last, 0, &fired, false, &state, now_local);
+        assert_eq!(decision, SchedulerDecision::FireDailyPause);
+    }
+
+    #[test]
+    fn daily_pause_use_system_clock_true_still_works_from_caller_side() {
+        // use_system_clock is a caller-side concern (it picks the
+        // wall clock feeding time_authority::in_configured_tz). The
+        // scheduler receives a valid `now_local` regardless — so a
+        // fire scenario constructed with any valid DateTime<Tz>
+        // fires as expected.
+        let cfg = config_with(2.0, vec![], false);
+        let now = epoch_plus(10_000);
+        let last = epoch_plus(0);
+        let fired = HashSet::new();
+        let now_local = paris_at(2026, 3, 15, 12, 0);
+        let state = daily_state_at(chrono_tz::Europe::Paris, now_local, 12, 0, 30);
+        let decision = next_event(now, &cfg, last, 0, &fired, false, &state, now_local);
+        assert_eq!(decision, SchedulerDecision::FireDailyPause);
+    }
+
+    #[test]
+    fn daily_pause_countdown_palier_15_fires_at_boundary() {
+        let cfg = config_with(2.0, vec![], false);
+        let now = epoch_plus(10_000);
+        let last = epoch_plus(0);
+        let fired = HashSet::new();
+        let now_local = paris_at(2026, 3, 15, 11, 45); // exactly T-15
+        let state = daily_state_at(chrono_tz::Europe::Paris, now_local, 12, 0, 30);
+        match next_event(now, &cfg, last, 0, &fired, false, &state, now_local) {
+            SchedulerDecision::FireDailyCountdown {
+                palier_minutes,
+                seconds_until,
+            } => {
+                assert_eq!(palier_minutes, 15);
+                assert_eq!(seconds_until, 15 * 60);
+            }
+            other => panic!("expected FireDailyCountdown{{palier=15}}, got {other:?}"),
+        }
     }
 }
