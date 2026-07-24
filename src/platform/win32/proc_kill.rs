@@ -26,13 +26,13 @@ use std::mem::size_of;
 use std::path::Path;
 
 use windows::core::PWSTR;
-use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_TIMEOUT};
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
 };
 use windows::Win32::System::Threading::{
-    OpenProcess, QueryFullProcessImageNameW, TerminateProcess, PROCESS_NAME_FORMAT,
-    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
+    OpenProcess, QueryFullProcessImageNameW, TerminateProcess, WaitForSingleObject,
+    PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
 };
 
 /// Kill every `msedgewebview2.exe` whose full image path lives under
@@ -129,6 +129,35 @@ fn open_process_for_query(pid: u32) -> Option<HANDLE> {
         // Access denied is expected for system / other-user processes ; skip silently.
         _ => None,
     }
+}
+
+/// Non-blocking liveness check for a bare PID recovered from `runtime.dat`.
+///
+/// Used by the daily-pause Cas D respawn path : if the service was killed
+/// while the popup was up, on reboot we need to know whether the popup
+/// is still running (skip respawn) or dead (respawn with elapsed
+/// pre-decrement).
+///
+/// Returns `true` iff `OpenProcess(SYNCHRONIZE)` succeeds AND
+/// `WaitForSingleObject(handle, 0) == WAIT_TIMEOUT` (still running).
+/// Any other outcome — OpenProcess failure (PID recycled or access
+/// denied), signal state, error — reports the process as dead. False
+/// positives (reporting dead when actually alive) are the safe default :
+/// worst case we spawn a second popup which `spawn_replacing` would
+/// eventually clean up on the next fire.
+pub fn is_pid_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    let handle = match unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, pid) } {
+        Ok(h) if !h.is_invalid() => h,
+        _ => return false,
+    };
+    let result = unsafe { WaitForSingleObject(handle, 0) };
+    unsafe {
+        let _ = CloseHandle(handle);
+    }
+    result == WAIT_TIMEOUT
 }
 
 fn terminate_by_pid(pid: u32) -> bool {

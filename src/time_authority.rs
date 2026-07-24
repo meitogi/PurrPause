@@ -14,24 +14,43 @@
 //   - `use_system_clock=true` short-circuits both : that's the public /
 //     permissive escape hatch documented in the ROLLOUT.
 //
-// Session 1 provides the shape + fallback logic + TZ resolution. The
-// actual NTP + HTTPS sync loop (spawn + retry cadence) lands in
-// session 2 when the caller in `service.rs` is ready to drive it.
-// `sync_ntp()` / `sync_https()` are wired but return `Err` for now —
-// the fallback path is what keeps the scheduler correct while the
-// sync is stubbed.
+// Session 1 provided the shape + fallback logic + TZ resolution.
+// Session 2 wires the actual NTP + HTTPS sync loop. Both sync fns are
+// now functional and silent on failure ; the caller in `service.rs`
+// spawns them on a background thread with a two-cadence retry loop
+// (6h on success, 10min on failure).
 
 #![cfg_attr(not(windows), allow(dead_code))]
 
+use std::net::{ToSocketAddrs, UdpSocket};
 use std::str::FromStr;
 use std::sync::RwLock;
 use std::time::{Duration, SystemTime};
 
-use chrono::{DateTime, Datelike, Duration as ChronoDuration, TimeZone, Timelike};
+use chrono::{DateTime, Datelike, Duration as ChronoDuration, TimeZone};
 use chrono_tz::Tz;
 
 use crate::config::Config;
 use crate::config::defaults::DEFAULT_DAILY_PAUSE_TIMEZONE;
+
+/// NTP servers tried in order. First success wins ; on failure iterate.
+/// Kept small on purpose — two well-known anycast pools cover 99% of
+/// environments, and each attempt already costs ~3s on the failure path.
+const NTP_SERVERS: &[&str] = &["pool.ntp.org:123", "time.cloudflare.com:123"];
+
+/// Per-server socket timeout for a single NTP round-trip. 3s balances
+/// the "network is slow" case against the "server dead" case — going
+/// higher just delays the fallback to HTTPS.
+const NTP_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// HTTPS fallback endpoints — Cloudflare is anycasted and fast, worldtimeapi
+/// is a distinct provider for provider-diversity. Both return the wall
+/// time in the standard `Date:` response header.
+const HTTPS_ENDPOINTS: &[&str] = &["https://time.cloudflare.com/", "https://worldtimeapi.org/"];
+
+/// HTTPS timeout : slightly larger than NTP because TLS handshake +
+/// HTTP layering adds overhead on top of raw UDP.
+const HTTPS_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Snapshot of the last successful network sync : the UTC instant the
 /// server reported paired with the monotonic tick at reception. `now
@@ -208,32 +227,105 @@ fn with_hm(tz: &Tz, y: i32, m: u32, d: u32, h: u32, min: u32) -> DateTime<Tz> {
     }
 }
 
-/// Blocking NTP sync attempt. Called from a `std::thread` in session 2.
+/// Blocking NTP sync attempt. Called from a `std::thread` at service boot.
 ///
-/// Session 1 stub : returns `Err` because the socket adapter
-/// (`sntpc-net-std`) lands with the sync loop wiring in session 2. The
-/// `now_authoritative` fallback path already handles this cleanly, so
-/// the scheduler stays correct in the meantime.
-///
-/// Contract when wired : must never panic and must not log at
-/// error-level on failure — offline is a normal state. Successful
-/// syncs write to `SYNCED` via [`record_sync`].
+/// Contract : must never panic and must not log at error-level on
+/// failure — offline is a normal state. Successful syncs write to
+/// `SYNCED` via [`record_sync`]. Iterates [`NTP_SERVERS`] in order,
+/// returns `Ok(())` on the first success, `Err` if all fail.
 pub fn sync_ntp() -> anyhow::Result<()> {
-    // Session 2 fills this in with sntpc + sntpc-net-std. The stub
-    // returns an anyhow error rather than panicking so the caller's
-    // retry loop treats it as a routine miss.
-    anyhow::bail!("NTP sync not yet wired");
+    for server in NTP_SERVERS {
+        match ntp_query_one(server) {
+            Ok(wall) => {
+                record_sync(wall);
+                tracing::info!(server, "NTP sync succeeded");
+                return Ok(());
+            }
+            Err(e) => {
+                tracing::info!(server, error = %e, "NTP sync attempt failed");
+            }
+        }
+    }
+    anyhow::bail!("all NTP servers failed");
 }
 
-/// Blocking HTTPS sync attempt (parse the `Date:` header of a fast
-/// endpoint like `time.cloudflare.com`). Fallback for firewalled NTP.
+/// Single NTP round-trip against one hostname. Extracted so the caller
+/// can iterate without repeating the socket / context setup.
+fn ntp_query_one(host_port: &str) -> anyhow::Result<SystemTime> {
+    use sntpc::{NtpContext, StdTimestampGen};
+    use sntpc_net_std::UdpSocketWrapper;
+
+    let addr = host_port
+        .to_socket_addrs()?
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("no socket addr for {host_port}"))?;
+
+    let socket = UdpSocket::bind("0.0.0.0:0")?;
+    socket.set_read_timeout(Some(NTP_TIMEOUT))?;
+    socket.set_write_timeout(Some(NTP_TIMEOUT))?;
+    let wrapper = UdpSocketWrapper::new(socket);
+    let context = NtpContext::new(StdTimestampGen::default());
+
+    let result = sntpc::sync::get_time(addr, &wrapper, context)
+        .map_err(|e| anyhow::anyhow!("sntpc error: {e:?}"))?;
+
+    Ok(SystemTime::UNIX_EPOCH + Duration::from_secs(result.sec()))
+}
+
+/// Blocking HTTPS sync attempt : GET a well-known endpoint and parse
+/// the `Date:` response header (RFC 2822 format). Fallback for
+/// firewalled NTP (school / corporate networks). Iterates
+/// [`HTTPS_ENDPOINTS`] in order — first success wins.
 ///
-/// Session 1 stub — see [`sync_ntp`] for rationale. The HTTP client
-/// choice (`ureq` vs `reqwest`) is deliberately deferred until the
-/// sync loop actually lands, so we don't drag a heavyweight dep in
-/// for a stub.
+/// Contract identical to [`sync_ntp`] : never panics, info-level logs
+/// only, writes to `SYNCED` via [`record_sync`] on success.
+///
+/// Windows-only implementation : `ureq` with the `native-tls` feature
+/// pulls Schannel via `windows-sys`, avoiding the `ring`/`clang` cross-
+/// compile toolchain issue. On non-Windows, this returns an error stub
+/// so unit tests exercise the fallback path without dragging
+/// openssl-sys onto Linux CI. The service is Windows-only anyway.
+#[cfg(windows)]
 pub fn sync_https() -> anyhow::Result<()> {
-    anyhow::bail!("HTTPS sync not yet wired");
+    for endpoint in HTTPS_ENDPOINTS {
+        match https_query_one(endpoint) {
+            Ok(wall) => {
+                record_sync(wall);
+                tracing::info!(endpoint, "HTTPS sync succeeded");
+                return Ok(());
+            }
+            Err(e) => {
+                tracing::info!(endpoint, error = %e, "HTTPS sync attempt failed");
+            }
+        }
+    }
+    anyhow::bail!("all HTTPS endpoints failed");
+}
+
+#[cfg(not(windows))]
+pub fn sync_https() -> anyhow::Result<()> {
+    anyhow::bail!("HTTPS sync is Windows-only (no openssl on Linux CI)");
+}
+
+/// Single HTTPS round-trip against one endpoint. GET + read `Date:`
+/// header + parse as RFC 2822. The body is not consumed — HEAD would
+/// also work but not every server implements it correctly.
+#[cfg(windows)]
+fn https_query_one(endpoint: &str) -> anyhow::Result<SystemTime> {
+    use ureq::Agent;
+
+    let agent: Agent = Agent::config_builder()
+        .timeout_global(Some(HTTPS_TIMEOUT))
+        .build()
+        .into();
+    let response = agent.get(endpoint).call()?;
+    let date_header = response
+        .headers()
+        .get("date")
+        .ok_or_else(|| anyhow::anyhow!("no Date header in response"))?
+        .to_str()?;
+    let parsed = DateTime::parse_from_rfc2822(date_header)?;
+    Ok(parsed.with_timezone(&chrono::Utc).into())
 }
 
 /// Record a successful sync. Reset semantics : always overwrites the
@@ -375,13 +467,19 @@ mod tests {
     }
 
     #[test]
-    fn sync_ntp_stub_returns_err_and_does_not_panic() {
-        assert!(sync_ntp().is_err());
+    fn sync_ntp_does_not_panic() {
+        // Whether NTP is reachable in the test environment is out of
+        // our control — the contract is just "must not panic" and the
+        // return value is either Ok (we hit a server) or Err (all
+        // failed). Both are valid.
+        let _ = sync_ntp();
     }
 
     #[test]
-    fn sync_https_stub_returns_err_and_does_not_panic() {
-        assert!(sync_https().is_err());
+    fn sync_https_does_not_panic() {
+        // Same contract as sync_ntp — environment-agnostic, no
+        // assertion on the outcome.
+        let _ = sync_https();
     }
 
     #[test]

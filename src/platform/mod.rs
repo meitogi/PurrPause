@@ -29,6 +29,22 @@ pub(crate) trait ChildHandle: Send + Sync {
 pub(crate) trait Spawner {
     type Child: ChildHandle;
     fn spawn(&self, exe: &Path, args: &[&OsStr]) -> Result<Self::Child>;
+    /// Same as [`Spawner::spawn`] but with additional (key, value) env
+    /// pairs merged on top of the child's environment. Default impl
+    /// forwards to `spawn` and drops the env — fake test spawners don't
+    /// need to model the environment. `RealSpawner` overrides to inject
+    /// the pairs into the Win32 environment block passed to
+    /// `CreateProcessAsUserW` (used for `PURRPAUSE_FROZEN_TZ` on
+    /// daily-pause popup/countdown spawns so children format times
+    /// against the config-persisted IANA TZ, not the Windows panel TZ).
+    fn spawn_with_env(
+        &self,
+        exe: &Path,
+        args: &[&OsStr],
+        _env: &[(&OsStr, &OsStr)],
+    ) -> Result<Self::Child> {
+        self.spawn(exe, args)
+    }
 }
 
 /// Pure kernel : spawn the new child first, kill the predecessor only on
@@ -42,6 +58,26 @@ pub(crate) fn spawn_replacing<S: Spawner>(
     predecessor: &mut Option<S::Child>,
 ) -> Result<S::Child> {
     let new_child = spawner.spawn(exe, args)?;
+    if let Some(prev) = predecessor.take() {
+        prev.terminate();
+        drop(prev);
+    }
+    Ok(new_child)
+}
+
+/// Env-aware sibling of [`spawn_replacing`] : forwards extra env pairs
+/// through the spawner. Used for daily-pause popup spawns that need to
+/// pin the child's `PURRPAUSE_FROZEN_TZ` to the config-persisted IANA
+/// name (so display formatting stays consistent even when the Windows
+/// TZ panel is tampered with).
+pub(crate) fn spawn_replacing_with_env<S: Spawner>(
+    spawner: &S,
+    exe: &Path,
+    args: &[&OsStr],
+    env: &[(&OsStr, &OsStr)],
+    predecessor: &mut Option<S::Child>,
+) -> Result<S::Child> {
+    let new_child = spawner.spawn_with_env(exe, args, env)?;
     if let Some(prev) = predecessor.take() {
         prev.terminate();
         drop(prev);

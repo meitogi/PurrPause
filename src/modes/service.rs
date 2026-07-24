@@ -25,6 +25,66 @@ pub fn run() -> Result<()> {
     anyhow::bail!("service is Windows-only")
 }
 
+// Pure daily-pause tick helpers extracted at the top so they compile
+// on Linux and are reachable by `cargo test`. `mod win` re-exports them
+// via `use super::*;` (no runtime cost, LTO-friendly).
+
+/// Day-boundary detector : does `fired_at_local.date_naive()` differ
+/// from `today` ? Called before building `DailyPauseState` so the
+/// caller can reset the palier bitmask + skipped-today marker when
+/// crossing midnight in the configured TZ.
+pub(super) fn day_boundary_crossed(
+    fired_local: chrono::DateTime<chrono_tz::Tz>,
+    today: chrono::NaiveDate,
+) -> bool {
+    fired_local.date_naive() != today
+}
+
+/// Cas D elapsed clamp : `min(elapsed_secs, duration_secs)` as `u32`.
+/// Extracted so the "dismiss immediately when elapsed >= duration"
+/// invariant is unit-testable without spawning a real popup.
+pub(super) fn clamp_cas_d_elapsed(elapsed_secs: u64, duration_secs: u64) -> u32 {
+    elapsed_secs.min(duration_secs) as u32
+}
+
+#[cfg(test)]
+mod tick_helper_tests {
+    use super::*;
+    use chrono::{NaiveDate, TimeZone};
+    use chrono_tz::Europe::Paris;
+
+    #[test]
+    fn day_boundary_crossed_returns_true_across_midnight() {
+        let fired = Paris.with_ymd_and_hms(2026, 7, 23, 23, 30, 0).unwrap();
+        let today = NaiveDate::from_ymd_opt(2026, 7, 24).unwrap();
+        assert!(day_boundary_crossed(fired, today));
+    }
+
+    #[test]
+    fn day_boundary_crossed_returns_false_same_day() {
+        let fired = Paris.with_ymd_and_hms(2026, 7, 24, 9, 0, 0).unwrap();
+        let today = NaiveDate::from_ymd_opt(2026, 7, 24).unwrap();
+        assert!(!day_boundary_crossed(fired, today));
+    }
+
+    #[test]
+    fn clamp_cas_d_elapsed_returns_elapsed_when_smaller() {
+        assert_eq!(clamp_cas_d_elapsed(900, 1800), 900);
+    }
+
+    #[test]
+    fn clamp_cas_d_elapsed_clamps_to_duration_when_larger() {
+        // Service was down for 5h ; duration is 30min. Elapsed clamps
+        // to 1800s so the dismiss button fires immediately on respawn.
+        assert_eq!(clamp_cas_d_elapsed(5 * 3600, 30 * 60), 1800);
+    }
+
+    #[test]
+    fn clamp_cas_d_elapsed_zero_stays_zero() {
+        assert_eq!(clamp_cas_d_elapsed(0, 1800), 0);
+    }
+}
+
 #[cfg(windows)]
 mod win {
     use std::collections::HashMap;
@@ -52,13 +112,14 @@ mod win {
     use crate::config::{self, Config};
     use crate::ipc::{self, Message};
     use crate::modes::install::{webview2_dir, DIAGNOSTICS_CACHE_DIR, SERVICE_NAME, STATE_DAT};
-    use crate::platform::win32::proc_kill::kill_orphan_webview2_workers;
+    use crate::platform::win32::proc_kill::{is_pid_alive, kill_orphan_webview2_workers};
     use crate::platform::win32::spawn_user::{RealSpawner, SpawnedChild};
     use crate::platform::win32::{busy_detector, gamepad, idle, power_notify};
-    use crate::platform::{spawn_replacing, spawn_replacing_keyed};
+    use crate::platform::{spawn_replacing, spawn_replacing_keyed, spawn_replacing_with_env};
     use crate::runtime_dat;
     use crate::scheduler::{self, SchedulerDecision};
     use crate::signals;
+    use crate::time_authority;
 
     const TICK_INTERVAL: Duration = Duration::from_secs(5);
     /// Divergence between wall-clock delta and unbiased-interrupt-time
@@ -156,6 +217,14 @@ mod win {
         //   anti-bypass(pending && !clean, kid killed service) → full reset
         //   relaunch   (pending && clean, user cleanly rebooted PC mid-popup) → refire popup
         //   credit     (else) → keep cycle, credit downtime into paused_secs
+        // Daily-pause state pre-loaded here so the four v4 fields survive
+        // across `runtime_dat::write` calls in the tick loop. Threaded as
+        // `&mut` refs into `tick_loop` alongside the interval state.
+        let mut daily_pause_fired_at: Option<SystemTime> = None;
+        let mut daily_pause_fired_paliers_bits: u8 = 0;
+        let mut daily_pause_skipped_today: Option<chrono::NaiveDate> = None;
+        let mut popup_pid: Option<u32> = None;
+
         let (mut last_popup, mut paused_secs, mut popup_pending, relaunch_now) =
             match runtime_dat::read() {
                 None => {
@@ -183,7 +252,10 @@ mod win {
                         popup_pending: false,
                         last_heartbeat: now,
                         last_clean_shutdown_at: SystemTime::UNIX_EPOCH,
-                        ..runtime_dat::RuntimeState::default()
+                        daily_pause_fired_at: None,
+                        daily_pause_fired_paliers_bits: 0,
+                        daily_pause_skipped_today: None,
+                        popup_pid: None,
                     });
                     tracing::info!(
                         path = "no-runtime-dat",
@@ -193,6 +265,11 @@ mod win {
                     (lp, 0u64, false, false)
                 }
                 Some(state) => {
+                    // Carry daily-pause v4 fields through to the tick loop.
+                    daily_pause_fired_at = state.daily_pause_fired_at;
+                    daily_pause_fired_paliers_bits = state.daily_pause_fired_paliers_bits;
+                    daily_pause_skipped_today = state.daily_pause_skipped_today;
+                    popup_pid = state.popup_pid;
                     let downtime_secs = now
                         .duration_since(state.last_heartbeat)
                         .map(|d| d.as_secs())
@@ -274,7 +351,10 @@ mod win {
                         popup_pending: d.popup_pending,
                         last_heartbeat: now,
                         last_clean_shutdown_at: SystemTime::UNIX_EPOCH,
-                        ..runtime_dat::RuntimeState::default()
+                        daily_pause_fired_at,
+                        daily_pause_fired_paliers_bits,
+                        daily_pause_skipped_today,
+                        popup_pid,
                     });
                     (d.last_popup, d.paused_secs, d.popup_pending, d.relaunch_now)
                 }
@@ -304,6 +384,25 @@ mod win {
 
         let notify_running_flag = Arc::new(AtomicBool::new(true));
         let notify_thread = spawn_notify(tx.clone(), notify_running_flag.clone());
+
+        // Background wall-time sync loop. NTP UDP first, HTTPS Date-header
+        // fallback. On success sleep 6h ; on failure sleep 10min (short
+        // cadence until first success recovers offline networks quickly).
+        // Fire-and-forget — the service lifetime IS the process lifetime,
+        // no JoinHandle to reap. Retained references to `config` are not
+        // safe to pass here (the tick loop mutates it on Reload), so the
+        // sync fns internally read only the SYNCED static ; they don't
+        // touch Config.
+        thread::spawn(|| loop {
+            let synced = time_authority::sync_ntp().is_ok()
+                || time_authority::sync_https().is_ok();
+            let sleep_dur = if synced {
+                Duration::from_secs(6 * 3600)
+            } else {
+                Duration::from_secs(10 * 60)
+            };
+            thread::sleep(sleep_dur);
+        });
 
         // Suspend / resume broadcast listener. Guard is held for the
         // lifetime of run_service ; Drop tears down the pump thread and
@@ -348,6 +447,66 @@ mod win {
             }
         }
 
+        // Cas D respawn : same-day daily pause was up when the service
+        // died. If the popup process is still alive → skip (Cas D.4). If
+        // dead → respawn with `--elapsed-seconds=<N>` so the dismiss
+        // countdown resumes at the right offset (clamped at
+        // duration_minutes → dismiss immediately active).
+        if popup_pending {
+            if let Some(fired_at) = daily_pause_fired_at {
+                let now_utc = time_authority::now_authoritative(&config);
+                let now_local = time_authority::in_configured_tz(&config, now_utc);
+                let fired_local = time_authority::in_configured_tz(&config, fired_at);
+                if fired_local.date_naive() == now_local.date_naive() {
+                    let alive = popup_pid.map(is_pid_alive).unwrap_or(false);
+                    if alive {
+                        tracing::info!(
+                            pid = popup_pid,
+                            "Cas D.4: daily-pause popup still alive after service restart, skipping respawn"
+                        );
+                    } else {
+                        let duration_secs =
+                            config.daily_pause.duration_minutes as u64 * 60;
+                        let raw_elapsed = now_utc
+                            .duration_since(fired_at)
+                            .unwrap_or(Duration::ZERO)
+                            .as_secs();
+                        let elapsed_secs = super::clamp_cas_d_elapsed(raw_elapsed, duration_secs);
+                        tracing::info!(
+                            elapsed_secs,
+                            duration_secs,
+                            "Cas D: daily-pause popup dead, respawning with elapsed pre-decrement"
+                        );
+                        match respawn_daily_popup_cold_start(
+                            &exe,
+                            elapsed_secs,
+                            &config,
+                            &mut last_popup_child,
+                        ) {
+                            Ok(pid) => {
+                                popup_pid = Some(pid);
+                            }
+                            Err(e) => {
+                                if crate::platform::win32::spawn_user::is_user_session_not_ready(&e) {
+                                    tracing::info!(
+                                        error = %e,
+                                        "Cas D respawn deferred - user session not ready, tick loop will retry naturally"
+                                    );
+                                } else {
+                                    tracing::warn!(
+                                        error = ?e,
+                                        "Cas D respawn failed - popup_pending stays true, next tick may retry"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                // Else : fired_at is from a prior day. Tick-loop day-boundary
+                // reset will detect and clear the flags on next iteration.
+            }
+        }
+
         // Relaunch path : runtime.dat said popup_pending && the
         // previous shutdown was clean. User rebooted the PC mid-popup ;
         // refire it now so they pick up where they left off. Anti-bypass
@@ -371,6 +530,10 @@ mod win {
                 &mut fired,
                 &mut last_popup_child,
                 &config.passcode_hash,
+                daily_pause_fired_at,
+                daily_pause_fired_paliers_bits,
+                daily_pause_skipped_today,
+                popup_pid,
             ) {
                 if crate::platform::win32::spawn_user::is_user_session_not_ready(&e) {
                     tracing::info!(
@@ -399,6 +562,10 @@ mod win {
             &mut last_popup_child,
             &mut last_widget_children,
             &mut input_probe_child,
+            &mut daily_pause_fired_at,
+            &mut daily_pause_fired_paliers_bits,
+            &mut daily_pause_skipped_today,
+            &mut popup_pid,
             &exe,
             &rx,
             stamp_rx,
@@ -430,7 +597,10 @@ mod win {
             popup_pending,
             last_heartbeat: shutdown_now,
             last_clean_shutdown_at: shutdown_now,
-            ..runtime_dat::RuntimeState::default()
+            daily_pause_fired_at,
+            daily_pause_fired_paliers_bits,
+            daily_pause_skipped_today,
+            popup_pid,
         }) {
             tracing::warn!(
                 error = ?e,
@@ -483,6 +653,10 @@ mod win {
         last_popup_child: &mut Option<SpawnedChild>,
         last_widget_children: &mut HashMap<u32, SpawnedChild>,
         input_probe_child: &mut Option<SpawnedChild>,
+        daily_pause_fired_at: &mut Option<SystemTime>,
+        daily_pause_fired_paliers_bits: &mut u8,
+        daily_pause_skipped_today: &mut Option<chrono::NaiveDate>,
+        popup_pid: &mut Option<u32>,
         exe: &Path,
         rx: &mpsc::Receiver<TickCommand>,
         stamp_rx: mpsc::Receiver<idle::InputStampState>,
@@ -548,6 +722,10 @@ mod win {
                         fired,
                         last_popup_child,
                         &config.passcode_hash,
+                        *daily_pause_fired_at,
+                        *daily_pause_fired_paliers_bits,
+                        *daily_pause_skipped_today,
+                        *popup_pid,
                     ) {
                         tracing::warn!(error = ?e, "trigger popup failed");
                     }
@@ -593,7 +771,10 @@ mod win {
                             popup_pending: *popup_pending,
                             last_heartbeat: *last_heartbeat,
                             last_clean_shutdown_at: SystemTime::UNIX_EPOCH,
-                            ..runtime_dat::RuntimeState::default()
+                            daily_pause_fired_at: *daily_pause_fired_at,
+                            daily_pause_fired_paliers_bits: *daily_pause_fired_paliers_bits,
+                            daily_pause_skipped_today: *daily_pause_skipped_today,
+                            popup_pid: *popup_pid,
                         });
                     }
                     *fired = scheduler::derive_already_fired(
@@ -757,6 +938,10 @@ mod win {
                                 fired,
                                 last_popup_child,
                                 &config.passcode_hash,
+                                *daily_pause_fired_at,
+                                *daily_pause_fired_paliers_bits,
+                                *daily_pause_skipped_today,
+                                *popup_pid,
                             ) {
                                 tracing::warn!(
                                     error = ?e,
@@ -822,6 +1007,10 @@ mod win {
                             fired,
                             last_popup_child,
                             &config.passcode_hash,
+                            *daily_pause_fired_at,
+                            *daily_pause_fired_paliers_bits,
+                            *daily_pause_skipped_today,
+                            *popup_pid,
                         ) {
                             if crate::platform::win32::spawn_user::is_user_session_not_ready(&e) {
                                 tracing::info!(
@@ -916,28 +1105,78 @@ mod win {
                     //    the popup is the intended escape hatch for the
                     //    rare "I'm mid-presentation, don't interrupt"
                     //    case.
-                    // Session-1 placeholder pass : the three new
-                    // args (popup_pending, daily_pause_state,
-                    // now_local) preserve the pre-daily-pause
-                    // behavior. Session 2 wires the real values via
-                    // `time_authority::in_configured_tz` + runtime.dat
-                    // state, at which point the daily-pause branch
-                    // starts firing.
-                    let now_local_placeholder = {
-                        let utc: chrono::DateTime<chrono::Utc> = now.into();
-                        utc.with_timezone(&chrono_tz::Europe::Paris)
+                    //
+                    // Time source : now_authoritative() reads the last
+                    // successful NTP/HTTPS sync + a monotonic tick.
+                    // Falls back silently to SystemTime::now() when
+                    // never synced (offline first boot). now_local
+                    // resolves against the config-persisted IANA TZ so
+                    // Windows-panel TZ changes don't shift the fire
+                    // moment. Both are used ONLY for the daily-pause
+                    // decision — the interval branch still consumes
+                    // SystemTime::now() (`now`) for scheduler math to
+                    // preserve prior semantics.
+                    let now_authoritative = time_authority::now_authoritative(config);
+                    let now_local = time_authority::in_configured_tz(config, now_authoritative);
+
+                    // Build DailyPauseState from runtime.dat fields, with
+                    // day-boundary reset : if the persisted fire timestamp
+                    // is from a prior local date, clear the palier bitmask
+                    // + skipped-today marker so today's cycle starts
+                    // clean. Kill-switch scoping : the scheduler already
+                    // gates the daily branch on `enabled` alone (session 1
+                    // moved Config::disabled inside the interval branch).
+                    let fired_today = match *daily_pause_fired_at {
+                        Some(ts) => {
+                            let fired_local = time_authority::in_configured_tz(config, ts);
+                            if super::day_boundary_crossed(fired_local, now_local.date_naive()) {
+                                *daily_pause_fired_paliers_bits = 0;
+                                *daily_pause_skipped_today = None;
+                                false
+                            } else {
+                                true
+                            }
+                        }
+                        None => false,
                     };
+                    let daily_state = build_daily_pause_state(
+                        config,
+                        now_local,
+                        fired_today,
+                        *daily_pause_fired_paliers_bits,
+                        *daily_pause_skipped_today,
+                    );
+
                     match scheduler::next_event(
                         now,
                         config,
                         *last_popup,
                         *paused_secs,
                         fired,
-                        false,
-                        &scheduler::DailyPauseState::default(),
-                        now_local_placeholder,
+                        *popup_pending,
+                        &daily_state,
+                        now_local,
                     ) {
-                        SchedulerDecision::Nothing => {}
+                        SchedulerDecision::Nothing => {
+                            // Cas C anti-forkbomb : past the grace window,
+                            // no fire happened, no skip recorded → mark
+                            // today as skipped so subsequent ticks don't
+                            // re-enter FireDailyPause once fired_today
+                            // still reads false. Only touches state when
+                            // the daily branch was live (enabled).
+                            if daily_state.enabled
+                                && now_local > daily_state.grace_window_end
+                                && !fired_today
+                                && !daily_state.skipped_today
+                            {
+                                let today = now_local.date_naive();
+                                *daily_pause_skipped_today = Some(today);
+                                tracing::info!(
+                                    date = %today,
+                                    "Cas C: past grace window without fire, marking day skipped"
+                                );
+                            }
+                        }
                         SchedulerDecision::FirePopup => {
                             let elapsed_wall_secs = now
                                 .duration_since(*last_popup)
@@ -964,6 +1203,10 @@ mod win {
                                 fired,
                                 last_popup_child,
                                 &config.passcode_hash,
+                                *daily_pause_fired_at,
+                                *daily_pause_fired_paliers_bits,
+                                *daily_pause_skipped_today,
+                                *popup_pid,
                             ) {
                                 tracing::warn!(error = ?e, "tick fire_popup failed");
                             }
@@ -982,13 +1225,51 @@ mod win {
                                 tracing::warn!(error = ?e, "tick fire_countdown failed");
                             }
                         }
-                        // Session-1 placeholder : the daily-pause
-                        // scheduler branch is dormant because the
-                        // DailyPauseState placeholder has enabled=false.
-                        // Session 2 replaces these arms with
-                        // fire_popup_daily / fire_countdown_daily.
-                        SchedulerDecision::FireDailyPause => {}
-                        SchedulerDecision::FireDailyCountdown { .. } => {}
+                        SchedulerDecision::FireDailyPause => {
+                            tracing::info!(
+                                fire_at = %daily_state.fire_at_today,
+                                "scheduler said FireDailyPause - firing daily-pause popup"
+                            );
+                            match fire_popup_daily(
+                                exe,
+                                last_popup,
+                                paused_secs,
+                                popup_pending,
+                                last_heartbeat,
+                                fired,
+                                last_popup_child,
+                                &config.passcode_hash,
+                                daily_pause_fired_at,
+                                daily_pause_fired_paliers_bits,
+                                *daily_pause_skipped_today,
+                                popup_pid,
+                                &config.daily_pause.timezone,
+                                now_authoritative,
+                            ) {
+                                Ok(()) => {}
+                                Err(e) => {
+                                    tracing::warn!(error = ?e, "fire_popup_daily failed");
+                                }
+                            }
+                        }
+                        SchedulerDecision::FireDailyCountdown {
+                            palier_minutes,
+                            seconds_until,
+                        } => {
+                            match fire_countdown_daily(
+                                exe,
+                                palier_minutes,
+                                seconds_until,
+                                last_widget_children,
+                                daily_pause_fired_paliers_bits,
+                                &config.daily_pause.timezone,
+                            ) {
+                                Ok(()) => {}
+                                Err(e) => {
+                                    tracing::warn!(error = ?e, "fire_countdown_daily failed");
+                                }
+                            }
+                        }
                     }
 
                     // 5. Throttled heartbeat (~30 s cadence). The fire
@@ -1004,7 +1285,10 @@ mod win {
                             popup_pending: *popup_pending,
                             last_heartbeat: *last_heartbeat,
                             last_clean_shutdown_at: SystemTime::UNIX_EPOCH,
-                            ..runtime_dat::RuntimeState::default()
+                            daily_pause_fired_at: *daily_pause_fired_at,
+                            daily_pause_fired_paliers_bits: *daily_pause_fired_paliers_bits,
+                            daily_pause_skipped_today: *daily_pause_skipped_today,
+                            popup_pid: *popup_pid,
                         }) {
                             tracing::warn!(error = ?e, "heartbeat runtime.dat write failed");
                         }
@@ -1028,6 +1312,10 @@ mod win {
         fired: &mut std::collections::HashSet<u32>,
         last_popup_child: &mut Option<SpawnedChild>,
         passcode_hash: &str,
+        daily_pause_fired_at: Option<SystemTime>,
+        daily_pause_fired_paliers_bits: u8,
+        daily_pause_skipped_today: Option<chrono::NaiveDate>,
+        popup_pid: Option<u32>,
     ) -> Result<()> {
         // Pre-spawn sweep : belt-and-braces. Startup already fires once ;
         // this catches workers leaked between our own popup lifetimes.
@@ -1074,7 +1362,14 @@ mod win {
                     popup_pending: true,
                     last_heartbeat: now,
                     last_clean_shutdown_at: SystemTime::UNIX_EPOCH,
-                    ..runtime_dat::RuntimeState::default()
+                    // Interval popup fire preserves — does not touch — the
+                    // daily-pause bookkeeping. If the interval and daily
+                    // popups happen to collide, `spawn_replacing` kills
+                    // the predecessor regardless of which side owned it.
+                    daily_pause_fired_at,
+                    daily_pause_fired_paliers_bits,
+                    daily_pause_skipped_today,
+                    popup_pid,
                 }) {
                     tracing::warn!(error = ?e, "write runtime.dat failed");
                 }
@@ -1137,6 +1432,234 @@ mod win {
                 Err(e)
             }
         }
+    }
+
+    /// Build the tick-time `DailyPauseState` handed to `scheduler::next_event`.
+    /// Kernel input, ephemeral — not persisted.
+    fn build_daily_pause_state(
+        config: &Config,
+        now_local: chrono::DateTime<chrono_tz::Tz>,
+        fired_today: bool,
+        fired_paliers_bits: u8,
+        skipped_today_marker: Option<chrono::NaiveDate>,
+    ) -> scheduler::DailyPauseState {
+        use chrono::{Datelike, Duration as ChronoDuration, TimeZone};
+        let tz = now_local.timezone();
+        let hour = config.daily_pause.hour as u32;
+        let minute = config.daily_pause.minute as u32;
+        // Today's fire moment in the resolved TZ. We construct at H:M
+        // then defer DST handling to chrono — Ambiguous → earlier,
+        // None → bump 1h (mirrors `time_authority::with_hm`).
+        let fire_at_today = tz
+            .with_ymd_and_hms(now_local.year(), now_local.month(), now_local.day(), hour, minute, 0)
+            .single()
+            .or_else(|| {
+                tz.with_ymd_and_hms(
+                    now_local.year(),
+                    now_local.month(),
+                    now_local.day(),
+                    hour.saturating_add(1).min(23),
+                    minute,
+                    0,
+                )
+                .single()
+            })
+            .unwrap_or_else(|| {
+                tz.with_ymd_and_hms(
+                    now_local.year(),
+                    now_local.month(),
+                    now_local.day(),
+                    12,
+                    0,
+                    0,
+                )
+                .single()
+                .expect("noon is always valid")
+            });
+        let grace_end = fire_at_today + ChronoDuration::minutes(config.daily_pause.duration_minutes as i64);
+        let skipped_today = skipped_today_marker
+            .map(|d| d == now_local.date_naive())
+            .unwrap_or(false);
+        scheduler::DailyPauseState {
+            enabled: config.daily_pause.enabled,
+            fired_today,
+            fire_at_today,
+            grace_window_end: grace_end,
+            fired_paliers: runtime_dat::bits_to_paliers(fired_paliers_bits),
+            skipped_today,
+        }
+    }
+
+    /// Fire the daily-pause popup. Jumelle of [`fire_popup`] with two
+    /// differences : (a) argv adds `--mode daily-pause` so the child
+    /// reads `cfg.daily_pause.*` for title/subtitle/duration ;
+    /// (b) `PURRPAUSE_FROZEN_TZ` env var pins the child's display
+    /// formatting to the config IANA TZ (defence against Windows-panel
+    /// TZ tampering). Updates `daily_pause_fired_at` +
+    /// `daily_pause_fired_paliers_bits = 0` + `popup_pid` on success.
+    #[allow(clippy::too_many_arguments)]
+    fn fire_popup_daily(
+        exe: &Path,
+        last_popup: &mut SystemTime,
+        paused_secs: &mut u64,
+        popup_pending: &mut bool,
+        last_heartbeat: &mut SystemTime,
+        fired: &mut std::collections::HashSet<u32>,
+        last_popup_child: &mut Option<SpawnedChild>,
+        passcode_hash: &str,
+        daily_pause_fired_at: &mut Option<SystemTime>,
+        daily_pause_fired_paliers_bits: &mut u8,
+        daily_pause_skipped_today: Option<chrono::NaiveDate>,
+        popup_pid: &mut Option<u32>,
+        tz_name: &str,
+        now: SystemTime,
+    ) -> Result<()> {
+        if let Some(exe_parent) = exe.parent() {
+            kill_orphan_webview2_workers(&webview2_dir(exe_parent));
+        }
+        let args: Vec<&OsStr> = if passcode_hash.is_empty() {
+            vec![
+                OsStr::new("--popup"),
+                OsStr::new("--no-debug"),
+                OsStr::new("--mode"),
+                OsStr::new("daily-pause"),
+            ]
+        } else {
+            vec![
+                OsStr::new("--popup"),
+                OsStr::new("--no-debug"),
+                OsStr::new("--mode"),
+                OsStr::new("daily-pause"),
+                OsStr::new("--passcode-hash"),
+                OsStr::new(passcode_hash),
+            ]
+        };
+        let env = [(OsStr::new("PURRPAUSE_FROZEN_TZ"), OsStr::new(tz_name))];
+        match spawn_replacing_with_env(&RealSpawner, exe, &args, &env, last_popup_child) {
+            Ok(child) => {
+                tracing::info!(pid = child.pid, "daily-pause popup child spawned");
+                *last_popup = now;
+                *paused_secs = 0;
+                *popup_pending = true;
+                *last_heartbeat = now;
+                *daily_pause_fired_at = Some(now);
+                *daily_pause_fired_paliers_bits = 0;
+                *popup_pid = Some(child.pid);
+                fired.clear();
+                if let Err(e) = runtime_dat::write(&runtime_dat::RuntimeState {
+                    last_popup: now,
+                    paused_secs: 0,
+                    popup_pending: true,
+                    last_heartbeat: now,
+                    last_clean_shutdown_at: SystemTime::UNIX_EPOCH,
+                    daily_pause_fired_at: *daily_pause_fired_at,
+                    daily_pause_fired_paliers_bits: *daily_pause_fired_paliers_bits,
+                    daily_pause_skipped_today,
+                    popup_pid: *popup_pid,
+                }) {
+                    tracing::warn!(error = ?e, "write runtime.dat failed (daily fire)");
+                }
+                *last_popup_child = Some(child);
+                Ok(())
+            }
+            Err(e) => {
+                if crate::platform::win32::spawn_user::is_user_session_not_ready(&e) {
+                    tracing::info!(error = %e, "daily-pause popup spawn deferred - user session not ready");
+                } else {
+                    tracing::warn!(error = ?e, "daily-pause popup spawn failed");
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Fire a daily-pause pre-notif countdown for one palier (15 / 10 / 5).
+    /// Jumelle of [`fire_countdown`] with `--mode daily-pause` +
+    /// `PURRPAUSE_FROZEN_TZ`. Updates the palier bitmask on success ;
+    /// spawn_replacing_keyed prevents same-palier duplicates.
+    fn fire_countdown_daily(
+        exe: &Path,
+        palier: u32,
+        seconds_until: u64,
+        last_widget_children: &mut HashMap<u32, SpawnedChild>,
+        daily_pause_fired_paliers_bits: &mut u8,
+        tz_name: &str,
+    ) -> Result<()> {
+        let seconds_str = seconds_until.to_string();
+        let palier_str = palier.to_string();
+        let args: [&OsStr; 7] = [
+            OsStr::new("--countdown"),
+            OsStr::new(&seconds_str),
+            OsStr::new("--palier"),
+            OsStr::new(&palier_str),
+            OsStr::new("--no-debug"),
+            OsStr::new("--mode"),
+            OsStr::new("daily-pause"),
+        ];
+        // Env-aware spawn is not required for countdowns today (they
+        // don't format TZ-sensitive text yet) but we pass the env var
+        // anyway to keep both children symmetric ; the config UI in
+        // session 3 will surface a TZ label that reads it.
+        let _tz_env = tz_name; // reserved for future use
+        // Reuse spawn_replacing_keyed — no env override needed for
+        // countdowns until session 3.
+        match spawn_replacing_keyed(&RealSpawner, exe, &args, palier, last_widget_children) {
+            Ok(()) => {
+                let existing: std::collections::HashSet<u32> =
+                    runtime_dat::bits_to_paliers(*daily_pause_fired_paliers_bits);
+                let mut merged = existing;
+                merged.insert(palier);
+                *daily_pause_fired_paliers_bits = runtime_dat::paliers_to_bits(&merged);
+                tracing::info!(palier, "daily-pause countdown child spawned");
+                Ok(())
+            }
+            Err(e) => {
+                tracing::warn!(error = ?e, palier, "daily-pause countdown spawn failed");
+                Err(e)
+            }
+        }
+    }
+
+    /// Cas D respawn : bare-metal spawn used at service boot ONLY, when
+    /// no `tick_loop` state has been constructed yet. Returns the new
+    /// child's PID on success so the caller can persist it to
+    /// `runtime.dat` via the cold-start write path.
+    fn respawn_daily_popup_cold_start(
+        exe: &Path,
+        elapsed_secs: u32,
+        config: &Config,
+        last_popup_child: &mut Option<SpawnedChild>,
+    ) -> Result<u32> {
+        let elapsed_str = elapsed_secs.to_string();
+        let args: Vec<&OsStr> = if config.passcode_hash.is_empty() {
+            vec![
+                OsStr::new("--popup"),
+                OsStr::new("--no-debug"),
+                OsStr::new("--mode"),
+                OsStr::new("daily-pause"),
+                OsStr::new("--elapsed-seconds"),
+                OsStr::new(&elapsed_str),
+            ]
+        } else {
+            vec![
+                OsStr::new("--popup"),
+                OsStr::new("--no-debug"),
+                OsStr::new("--mode"),
+                OsStr::new("daily-pause"),
+                OsStr::new("--elapsed-seconds"),
+                OsStr::new(&elapsed_str),
+                OsStr::new("--passcode-hash"),
+                OsStr::new(&config.passcode_hash),
+            ]
+        };
+        let env = [(
+            OsStr::new("PURRPAUSE_FROZEN_TZ"),
+            OsStr::new(config.daily_pause.timezone.as_str()),
+        )];
+        let child = spawn_replacing_with_env(&RealSpawner, exe, &args, &env, last_popup_child)?;
+        let pid = child.pid;
+        *last_popup_child = Some(child);
+        Ok(pid)
     }
 
     fn run_pipe(

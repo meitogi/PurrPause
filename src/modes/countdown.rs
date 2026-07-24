@@ -31,14 +31,21 @@ pub fn format_countdown(template: &str, remaining_seconds: u64) -> String {
         .replace("{total_min}", &total_min.to_string())
 }
 
-/// Reads `Config::pre_notif_messages[palier]`, falls back to a
-/// templated default (`"Pause dans <N> min"`) if the palier is missing
-/// from the map. Callers pass the raw palier value (15, 10, 5, 1, or a
-/// custom user value) — the config UI (session 6) will guarantee an
-/// entry exists for every palier in `pre_notification_minutes`, but
-/// state.dat edited by hand can drift.
-pub fn resolve_palier_message(cfg: &Config, palier: u32) -> String {
-    cfg.pre_notif_messages
+/// Reads the palier message from either `Config::pre_notif_messages`
+/// (interval mode, default) or `Config::daily_pause.pre_notif_messages`
+/// (daily-pause mode, when `mode == Some("daily-pause")`). Falls back
+/// to a templated default (`"Pause dans <N> min"`) if the palier is
+/// missing from the map. Callers pass the raw palier value (15, 10, 5,
+/// 1, or a custom user value) — the config UI will guarantee an entry
+/// exists for every palier in `pre_notification_minutes`, but state.dat
+/// edited by hand can drift.
+pub fn resolve_palier_message(cfg: &Config, palier: u32, mode: Option<&str>) -> String {
+    let source = if mode == Some("daily-pause") {
+        &cfg.daily_pause.pre_notif_messages
+    } else {
+        &cfg.pre_notif_messages
+    };
+    source
         .get(&palier)
         .cloned()
         .unwrap_or_else(|| format!("Pause dans {palier} min"))
@@ -50,8 +57,9 @@ pub fn run(
     palier: u32,
     debug: bool,
     config_override: Option<String>,
+    mode: Option<String>,
 ) -> anyhow::Result<()> {
-    windows_impl::run(seconds, palier, debug, config_override)
+    windows_impl::run(seconds, palier, debug, config_override, mode)
 }
 
 #[cfg(not(windows))]
@@ -60,6 +68,7 @@ pub fn run(
     _palier: u32,
     _debug: bool,
     _config_override: Option<String>,
+    _mode: Option<String>,
 ) -> anyhow::Result<()> {
     anyhow::bail!("countdown mode is Windows-only")
 }
@@ -99,6 +108,7 @@ mod windows_impl {
         palier: u32,
         debug: bool,
         config_override: Option<String>,
+        mode: Option<String>,
     ) -> Result<()> {
         // Preview / test spawns from the config UI pass a per-PID
         // temp state file so uncommitted edits show up. Regular
@@ -179,7 +189,7 @@ mod windows_impl {
         };
 
         let spawn_deadline = Instant::now() + Duration::from_secs(seconds);
-        let message = resolve_palier_message(&cfg, palier);
+        let message = resolve_palier_message(&cfg, palier, mode.as_deref());
         let template = cfg.widget_countdown_template.clone();
         let title = cfg.popup_window_title.clone();
 
@@ -463,23 +473,49 @@ mod tests {
         let cfg = Config::default();
         // Default HashMap ships 15/10/5/1.
         assert_eq!(
-            resolve_palier_message(&cfg, 15),
+            resolve_palier_message(&cfg, 15, None),
             "Prochaine pause dans 15 min"
         );
-        assert_eq!(resolve_palier_message(&cfg, 1), "Pause dans 1 min !");
+        assert_eq!(resolve_palier_message(&cfg, 1, None), "Pause dans 1 min !");
     }
 
     #[test]
     fn resolve_palier_message_unknown_palier_templated_fallback() {
         let cfg = Config::default();
-        assert_eq!(resolve_palier_message(&cfg, 7), "Pause dans 7 min");
+        assert_eq!(resolve_palier_message(&cfg, 7, None), "Pause dans 7 min");
     }
 
     #[test]
     fn resolve_palier_message_empty_map_falls_back() {
         let mut cfg = Config::default();
         cfg.pre_notif_messages = HashMap::new();
-        assert_eq!(resolve_palier_message(&cfg, 15), "Pause dans 15 min");
-        assert_eq!(resolve_palier_message(&cfg, 1), "Pause dans 1 min");
+        assert_eq!(resolve_palier_message(&cfg, 15, None), "Pause dans 15 min");
+        assert_eq!(resolve_palier_message(&cfg, 1, None), "Pause dans 1 min");
+    }
+
+    #[test]
+    fn resolve_palier_message_daily_pause_reads_daily_map() {
+        let mut cfg = Config::default();
+        cfg.daily_pause.pre_notif_messages.insert(15, "Repas dans 15 min".to_string());
+        cfg.pre_notif_messages.insert(15, "Interval-specific 15".to_string());
+        assert_eq!(
+            resolve_palier_message(&cfg, 15, Some("daily-pause")),
+            "Repas dans 15 min"
+        );
+        // Interval mode still uses the interval map even when daily has an entry.
+        assert_eq!(
+            resolve_palier_message(&cfg, 15, None),
+            "Interval-specific 15"
+        );
+    }
+
+    #[test]
+    fn resolve_palier_message_daily_pause_missing_falls_back() {
+        let cfg = Config::default();
+        // Daily map defaults are empty for palier 7.
+        assert_eq!(
+            resolve_palier_message(&cfg, 7, Some("daily-pause")),
+            "Pause dans 7 min"
+        );
     }
 }

@@ -223,6 +223,16 @@ enum Mode {
         /// popup then skips the Alt+pincode capture path entirely and
         /// only the natural countdown-then-dismiss path is available.
         passcode_hash: Option<String>,
+        /// `"daily-pause"` when spawned by the daily-pause fire path ;
+        /// `None` = interval mode (default). Switches the source of
+        /// popup title / subtitle / duration from `cfg.*` to
+        /// `cfg.daily_pause.*`.
+        mode: Option<String>,
+        /// Cas D respawn : when the service was killed mid-pause and
+        /// restarts, the popup is respawned with the elapsed wall time
+        /// so the dismiss countdown resumes at the right offset (or
+        /// activates immediately if elapsed >= duration).
+        elapsed_seconds: Option<u32>,
     },
     /// Small corner countdown widget for T-15 / T-10 / T-5 / T-1.
     /// `debug` skips force-minimize so the current window isn't lost.
@@ -231,6 +241,10 @@ enum Mode {
         palier: u32,
         debug: bool,
         config_override: Option<String>,
+        /// `"daily-pause"` when spawned for the noon pause palier —
+        /// countdown reads `cfg.daily_pause.pre_notif_messages[palier]`
+        /// instead of the interval `cfg.pre_notif_messages[palier]`.
+        mode: Option<String>,
     },
     /// Isolated diagnostic window with tunable options. Zero
     /// dependency on the rest of the app (no state.dat load, no
@@ -271,6 +285,8 @@ fn classify_mode(args: &[String]) -> Mode {
             config_override: parse_config_override(args),
             test_countdown_secs: parse_u32_after(args, "--test-countdown-secs"),
             passcode_hash: parse_string_after(args, "--passcode-hash"),
+            mode: parse_string_after(args, "--mode"),
+            elapsed_seconds: parse_u32_after(args, "--elapsed-seconds"),
         },
         Some("--countdown") => parse_countdown(args),
         Some("--config") => Mode::Config {
@@ -352,7 +368,8 @@ fn parse_countdown(args: &[String]) -> Mode {
     // harmlessly by callers as belt-and-suspenders redundancy.
     let debug = args.iter().any(|a| a == "--debug");
     let config_override = parse_config_override(args);
-    Mode::Countdown { seconds, palier, debug, config_override }
+    let mode = parse_string_after(args, "--mode");
+    Mode::Countdown { seconds, palier, debug, config_override, mode }
 }
 
 fn dispatch(mode: Mode) -> anyhow::Result<()> {
@@ -364,11 +381,11 @@ fn dispatch(mode: Mode) -> anyhow::Result<()> {
         Mode::Service => modes::service::run()?,
         Mode::Watchdog => modes::watchdog::run()?,
         Mode::InputProbe => modes::input_probe::run()?,
-        Mode::Popup { preview, debug, anim_override, config_override, test_countdown_secs, passcode_hash } => {
-            modes::popup::run(preview, debug, anim_override, config_override, test_countdown_secs, passcode_hash)?
+        Mode::Popup { preview, debug, anim_override, config_override, test_countdown_secs, passcode_hash, mode: popup_mode, elapsed_seconds } => {
+            modes::popup::run(preview, debug, anim_override, config_override, test_countdown_secs, passcode_hash, popup_mode, elapsed_seconds)?
         }
-        Mode::Countdown { seconds, palier, debug, config_override } => {
-            modes::countdown::run(seconds, palier, debug, config_override)?
+        Mode::Countdown { seconds, palier, debug, config_override, mode: cd_mode } => {
+            modes::countdown::run(seconds, palier, debug, config_override, cd_mode)?
         }
         Mode::Config { first_run: false } => modes::config::run()?,
         #[cfg(not(windows))]
@@ -408,7 +425,7 @@ mod tests {
     fn popup_with_preview() {
         assert_eq!(
             classify_mode(&as_args(["--popup", "--preview"])),
-            Mode::Popup { preview: true, debug: false, anim_override: None, config_override: None, test_countdown_secs: None, passcode_hash: None }
+            Mode::Popup { preview: true, debug: false, anim_override: None, config_override: None, test_countdown_secs: None, passcode_hash: None, mode: None, elapsed_seconds: None }
         );
     }
 
@@ -416,7 +433,7 @@ mod tests {
     fn popup_without_preview() {
         assert_eq!(
             classify_mode(&as_args(["--popup"])),
-            Mode::Popup { preview: false, debug: false, anim_override: None, config_override: None, test_countdown_secs: None, passcode_hash: None }
+            Mode::Popup { preview: false, debug: false, anim_override: None, config_override: None, test_countdown_secs: None, passcode_hash: None, mode: None, elapsed_seconds: None }
         );
     }
 
@@ -424,7 +441,7 @@ mod tests {
     fn popup_default_has_no_debug() {
         assert_eq!(
             classify_mode(&as_args(["--popup"])),
-            Mode::Popup { preview: false, debug: false, anim_override: None, config_override: None, test_countdown_secs: None, passcode_hash: None }
+            Mode::Popup { preview: false, debug: false, anim_override: None, config_override: None, test_countdown_secs: None, passcode_hash: None, mode: None, elapsed_seconds: None }
         );
     }
 
@@ -432,7 +449,7 @@ mod tests {
     fn popup_debug_opts_in() {
         assert_eq!(
             classify_mode(&as_args(["--popup", "--debug"])),
-            Mode::Popup { preview: false, debug: true, anim_override: None, config_override: None, test_countdown_secs: None, passcode_hash: None }
+            Mode::Popup { preview: false, debug: true, anim_override: None, config_override: None, test_countdown_secs: None, passcode_hash: None, mode: None, elapsed_seconds: None }
         );
     }
 
@@ -440,7 +457,7 @@ mod tests {
     fn popup_legacy_no_debug_is_ignored() {
         assert_eq!(
             classify_mode(&as_args(["--popup", "--no-debug"])),
-            Mode::Popup { preview: false, debug: false, anim_override: None, config_override: None, test_countdown_secs: None, passcode_hash: None }
+            Mode::Popup { preview: false, debug: false, anim_override: None, config_override: None, test_countdown_secs: None, passcode_hash: None, mode: None, elapsed_seconds: None }
         );
     }
 
@@ -457,6 +474,8 @@ mod tests {
                 config_override: None,
                 test_countdown_secs: None,
                 passcode_hash: None,
+                mode: None,
+                elapsed_seconds: None,
             }
         );
     }
@@ -465,7 +484,7 @@ mod tests {
     fn popup_anim_traversal_rejected() {
         assert_eq!(
             classify_mode(&as_args(["--popup", "--anim", "../etc/passwd"])),
-            Mode::Popup { preview: false, debug: false, anim_override: None, config_override: None, test_countdown_secs: None, passcode_hash: None }
+            Mode::Popup { preview: false, debug: false, anim_override: None, config_override: None, test_countdown_secs: None, passcode_hash: None, mode: None, elapsed_seconds: None }
         );
     }
 
@@ -480,6 +499,8 @@ mod tests {
                 config_override: None,
                 test_countdown_secs: Some(10),
                 passcode_hash: None,
+                mode: None,
+                elapsed_seconds: None,
             }
         );
     }
@@ -488,7 +509,7 @@ mod tests {
     fn popup_anim_absolute_path_rejected() {
         assert_eq!(
             classify_mode(&as_args(["--popup", "--anim", "/etc/hosts"])),
-            Mode::Popup { preview: false, debug: false, anim_override: None, config_override: None, test_countdown_secs: None, passcode_hash: None }
+            Mode::Popup { preview: false, debug: false, anim_override: None, config_override: None, test_countdown_secs: None, passcode_hash: None, mode: None, elapsed_seconds: None }
         );
     }
 
@@ -506,6 +527,8 @@ mod tests {
                 config_override: None,
                 test_countdown_secs: None,
                 passcode_hash: Some(hash.to_string()),
+                mode: None,
+                elapsed_seconds: None,
             }
         );
     }
@@ -514,7 +537,7 @@ mod tests {
     fn popup_passcode_hash_absent_is_none() {
         assert_eq!(
             classify_mode(&as_args(["--popup"])),
-            Mode::Popup { preview: false, debug: false, anim_override: None, config_override: None, test_countdown_secs: None, passcode_hash: None }
+            Mode::Popup { preview: false, debug: false, anim_override: None, config_override: None, test_countdown_secs: None, passcode_hash: None, mode: None, elapsed_seconds: None }
         );
     }
 
@@ -522,7 +545,7 @@ mod tests {
     fn countdown_parsed() {
         assert_eq!(
             classify_mode(&as_args(["--countdown", "900", "--palier", "15"])),
-            Mode::Countdown { seconds: 900, palier: 15, debug: false, config_override: None }
+            Mode::Countdown { seconds: 900, palier: 15, debug: false, config_override: None, mode: None }
         );
     }
 
@@ -530,7 +553,7 @@ mod tests {
     fn countdown_default_has_no_debug() {
         assert_eq!(
             classify_mode(&as_args(["--countdown", "60", "--palier", "1"])),
-            Mode::Countdown { seconds: 60, palier: 1, debug: false, config_override: None }
+            Mode::Countdown { seconds: 60, palier: 1, debug: false, config_override: None, mode: None }
         );
     }
 
@@ -538,7 +561,7 @@ mod tests {
     fn countdown_debug_opts_in() {
         assert_eq!(
             classify_mode(&as_args(["--countdown", "60", "--palier", "1", "--debug"])),
-            Mode::Countdown { seconds: 60, palier: 1, debug: true, config_override: None }
+            Mode::Countdown { seconds: 60, palier: 1, debug: true, config_override: None, mode: None }
         );
     }
 
@@ -546,7 +569,7 @@ mod tests {
     fn countdown_legacy_no_debug_is_ignored() {
         assert_eq!(
             classify_mode(&as_args(["--countdown", "60", "--palier", "1", "--no-debug"])),
-            Mode::Countdown { seconds: 60, palier: 1, debug: false, config_override: None }
+            Mode::Countdown { seconds: 60, palier: 1, debug: false, config_override: None, mode: None }
         );
     }
 
@@ -562,5 +585,53 @@ mod tests {
     fn unknown_flag() {
         let m = classify_mode(&as_args(["--garbage"]));
         assert!(matches!(m, Mode::Unknown(_)));
+    }
+
+    #[test]
+    fn popup_mode_daily_pause_captured() {
+        assert_eq!(
+            classify_mode(&as_args(["--popup", "--mode", "daily-pause"])),
+            Mode::Popup {
+                preview: false,
+                debug: false,
+                anim_override: None,
+                config_override: None,
+                test_countdown_secs: None,
+                passcode_hash: None,
+                mode: Some("daily-pause".to_string()),
+                elapsed_seconds: None,
+            }
+        );
+    }
+
+    #[test]
+    fn popup_elapsed_seconds_captured() {
+        assert_eq!(
+            classify_mode(&as_args(["--popup", "--mode", "daily-pause", "--elapsed-seconds", "900"])),
+            Mode::Popup {
+                preview: false,
+                debug: false,
+                anim_override: None,
+                config_override: None,
+                test_countdown_secs: None,
+                passcode_hash: None,
+                mode: Some("daily-pause".to_string()),
+                elapsed_seconds: Some(900),
+            }
+        );
+    }
+
+    #[test]
+    fn countdown_mode_daily_pause_captured() {
+        assert_eq!(
+            classify_mode(&as_args(["--countdown", "600", "--palier", "10", "--mode", "daily-pause"])),
+            Mode::Countdown {
+                seconds: 600,
+                palier: 10,
+                debug: false,
+                config_override: None,
+                mode: Some("daily-pause".to_string()),
+            }
+        );
     }
 }

@@ -144,11 +144,27 @@ pub(crate) struct RealSpawner;
 impl crate::platform::Spawner for RealSpawner {
     type Child = SpawnedChild;
     fn spawn(&self, exe: &Path, args: &[&OsStr]) -> Result<SpawnedChild> {
-        spawn_in_active_user_session(exe, args)
+        spawn_in_active_user_session_with_env(exe, args, &[])
+    }
+    fn spawn_with_env(
+        &self,
+        exe: &Path,
+        args: &[&OsStr],
+        env: &[(&OsStr, &OsStr)],
+    ) -> Result<SpawnedChild> {
+        spawn_in_active_user_session_with_env(exe, args, env)
     }
 }
 
 pub fn spawn_in_active_user_session(exe: &Path, args: &[&OsStr]) -> Result<SpawnedChild> {
+    spawn_in_active_user_session_with_env(exe, args, &[])
+}
+
+pub fn spawn_in_active_user_session_with_env(
+    exe: &Path,
+    args: &[&OsStr],
+    extra_env: &[(&OsStr, &OsStr)],
+) -> Result<SpawnedChild> {
     let session_id = unsafe { WTSGetActiveConsoleSessionId() };
     if session_id == NO_USER_SESSION {
         anyhow::bail!("{ERR_MSG_NO_ACTIVE_SESSION}");
@@ -209,6 +225,21 @@ pub fn spawn_in_active_user_session(exe: &Path, args: &[&OsStr]) -> Result<Spawn
         }
     };
 
+    // When extra env pairs are requested, materialise a merged Vec<u16>
+    // built from the profile block + injected entries. The Vec's pointer
+    // is what CreateProcessAsUserW consumes ; the profile block is still
+    // Destroyed after the call. Empty `extra_env` skips the copy — the
+    // profile block is passed through directly (zero-cost interval path).
+    let merged_env: Option<Vec<u16>> = if extra_env.is_empty() {
+        None
+    } else {
+        Some(merge_env_block(env_block, extra_env))
+    };
+    let env_ptr: *const c_void = match merged_env.as_ref() {
+        Some(v) => v.as_ptr() as *const c_void,
+        None => env_block as *const c_void,
+    };
+
     let mut cmd_line = build_command_line(exe, args);
     let mut desktop: Vec<u16> = "winsta0\\default\0".encode_utf16().collect();
 
@@ -229,18 +260,20 @@ pub fn spawn_in_active_user_session(exe: &Path, args: &[&OsStr]) -> Result<Spawn
             null_sa,
             false,
             CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW | NORMAL_PRIORITY_CLASS,
-            Some(env_block),
+            Some(env_ptr as *const c_void),
             PCWSTR::null(),
             &startup,
             &mut process_info,
         )
     };
 
-    // Always release the env block + primary token, even on failure.
+    // Always release the profile env block + primary token, even on failure.
+    // `merged_env` (Vec<u16>) drops naturally when it goes out of scope.
     unsafe {
         let _ = DestroyEnvironmentBlock(env_block);
         let _ = CloseHandle(primary);
     }
+    drop(merged_env);
 
     create.context("CreateProcessAsUserW")?;
 
@@ -298,6 +331,57 @@ fn duplicate_to_primary(impersonation: HANDLE) -> Result<HANDLE> {
     }
     .context("DuplicateTokenEx")?;
     Ok(primary)
+}
+
+/// Build a merged UTF-16 environment block from the profile block +
+/// injected `(K, V)` pairs. Layout : `KEY=VALUE\0KEY=VALUE\0…\0`.
+///
+/// The base block is a `\0`-separated list of `K=V` entries terminated
+/// by an extra `\0` (i.e. `……\0\0`). We copy up to but not including
+/// the final terminator, append our own entries, then re-terminate.
+///
+/// Injected keys are simply appended — Windows walks the block first-hit
+/// so later duplicates win. This is intentional : it lets the daily-pause
+/// `PURRPAUSE_FROZEN_TZ` override any pre-existing value in the user's
+/// profile (unlikely but possible).
+fn merge_env_block(base: *mut c_void, extra: &[(&OsStr, &OsStr)]) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+    let mut out = Vec::<u16>::with_capacity(4096);
+
+    // Walk the base block. It's a sequence of NUL-terminated wide
+    // strings ending on an empty string (double-NUL). We copy every
+    // NUL-terminated entry, then trailing double-NUL is added at the
+    // end after our extras.
+    unsafe {
+        let mut p = base as *const u16;
+        loop {
+            // Measure the current entry's length until its NUL.
+            let mut len = 0usize;
+            while *p.add(len) != 0 {
+                len += 1;
+            }
+            if len == 0 {
+                // Empty entry = block terminator.
+                break;
+            }
+            let slice = std::slice::from_raw_parts(p, len);
+            out.extend_from_slice(slice);
+            out.push(0);
+            p = p.add(len + 1);
+        }
+    }
+
+    // Append injected entries as `KEY=VALUE\0`.
+    for (k, v) in extra {
+        for u in k.encode_wide() { out.push(u); }
+        out.push('=' as u16);
+        for u in v.encode_wide() { out.push(u); }
+        out.push(0);
+    }
+
+    // Final terminator for the whole block.
+    out.push(0);
+    out
 }
 
 fn create_env_block(primary: HANDLE) -> Result<*mut c_void> {

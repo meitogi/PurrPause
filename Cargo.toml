@@ -1,6 +1,6 @@
 [package]
 name = "purrpause"
-version = "1.2.1"
+version = "1.3.0"
 edition = "2021"
 license = "MIT"
 description = "Break-reminder overlay for Windows — camouflaged Windows Session Health Service"
@@ -40,10 +40,13 @@ chrono = { version = "0.4.45", default-features = false, features = ["clock", "s
 # IANA TZ database bundled at build time — persisted TZ name in config
 # resists Windows TZ-panel tampering (the whole anti-cheat premise).
 chrono-tz = "0.10.4"
-# SNTP protocol handling for the anti-tamper time authority. Session 1
-# adds only the protocol crate ; the socket adapter (`sntpc-net-std`)
-# lands in session 2 when the sync loop actually spawns.
-sntpc = { version = "0.11.0", default-features = false, features = ["std"] }
+# SNTP protocol handling for the anti-tamper time authority. Session 2
+# wires the sibling socket adapter (`sntpc-net-std`) into the sync loop.
+sntpc = { version = "0.11.0", default-features = false, features = ["std", "sync"] }
+# std::net::UdpSocket adapter implementing sntpc::NtpUdpSocket. Depends on
+# `sntpc ~0.11` — pinned to match. Sync loop calls `sntpc::sync::get_time`
+# with a wrapped socket. Pure-Rust (no C-compilation), cross-platform.
+sntpc-net-std = "1.3.0"
 # ZIP read+write for the Lottie sanitizer. `deflate-flate2` picks the
 # pure-Rust miniz_oxide backend — cross-compiles cleanly under xwin and
 # keeps binary size in check. `.lottie` files use standard DEFLATE.
@@ -98,6 +101,14 @@ webview2-com = "0.39.1"                  # WebView2 runtime detection
 # skips Linux-only backends (xdg-portal, wayland) and keeps the Win32
 # IFileDialog path.
 rfd = { version = "0.17.2", default-features = false }
+# Blocking HTTPS client for the `Date:`-header time fallback when NTP UDP
+# is blocked (school / corporate firewalls). Windows-only : `native-tls`
+# on Windows = Schannel (OS-native TLS), no `ring`/`clang` toolchain
+# needed under `cargo xwin`. The sync loop only spawns on Windows anyway
+# (service is Windows-only) — `time_authority::sync_https` returns an
+# error stub on non-Windows so the caller's fallback path is exercised
+# by unit tests without dragging openssl-sys onto Linux CI.
+ureq = { version = "3.3.0", default-features = false, features = ["native-tls"] }
 
 [dev-dependencies]
 # Scratch temp dirs for migration + tree-walk tests (Linux-runnable).

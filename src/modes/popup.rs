@@ -132,8 +132,10 @@ pub fn run(
     config_override: Option<String>,
     test_countdown_secs: Option<u32>,
     passcode_hash: Option<String>,
+    mode: Option<String>,
+    elapsed_seconds: Option<u32>,
 ) -> anyhow::Result<()> {
-    windows_impl::run(preview, debug, anim_override, config_override, test_countdown_secs, passcode_hash)
+    windows_impl::run(preview, debug, anim_override, config_override, test_countdown_secs, passcode_hash, mode, elapsed_seconds)
 }
 
 #[cfg(not(windows))]
@@ -144,6 +146,8 @@ pub fn run(
     _config_override: Option<String>,
     _test_countdown_secs: Option<u32>,
     _passcode_hash: Option<String>,
+    _mode: Option<String>,
+    _elapsed_seconds: Option<u32>,
 ) -> anyhow::Result<()> {
     anyhow::bail!("popup mode is Windows-only")
 }
@@ -200,12 +204,14 @@ mod windows_impl {
         config_override: Option<String>,
         test_countdown_secs: Option<u32>,
         passcode_hash: Option<String>,
+        mode: Option<String>,
+        elapsed_seconds: Option<u32>,
     ) -> Result<()> {
         // Preview / test spawns from the config UI pass a per-PID
         // temp state file so uncommitted edits show up without an
         // autosave. Regular service-spawned popups leave
         // config_override None → read state.dat.
-        let cfg = match config_override.as_ref() {
+        let cfg_loaded = match config_override.as_ref() {
             Some(path) => {
                 let cfg = crate::config::load_or_default(Path::new(path));
                 // Best-effort cleanup so the temp file doesn't linger.
@@ -213,6 +219,22 @@ mod windows_impl {
                 cfg
             }
             None => crate::config::load_or_default(Path::new(STATE_DAT)),
+        };
+
+        // Daily-pause mode swaps three cfg surfaces at the top so
+        // the rest of run() (render_html, countdown calc, window title)
+        // reads them uniformly. Keeps the diff surgical — no branching
+        // downstream. Interval mode = default = cfg unchanged.
+        let is_daily = mode.as_deref() == Some("daily-pause");
+        let cfg = if is_daily {
+            tracing::info!("popup: --mode daily-pause active");
+            let mut c = cfg_loaded;
+            c.popup_title = c.daily_pause.popup_title.clone();
+            c.popup_subtitle = c.daily_pause.popup_subtitle.clone();
+            c.duration_minutes = c.daily_pause.duration_minutes;
+            c
+        } else {
+            cfg_loaded
         };
 
         // Popup uses palier 0 for the force-minimize opt-in. Skipped
@@ -613,8 +635,15 @@ mod windows_impl {
         // check (popup.html) has already enabled the dismiss button.
         // Poll cadence 500 ms keeps CPU cost negligible ; the timer
         // thread sleeps most of the time.
+        // Cas D respawn : service was killed mid-pause and restarted.
+        // The parent passes the elapsed wall-clock since the original
+        // popup fire, so the dismiss countdown resumes at the right
+        // offset. If elapsed >= duration, `saturating_sub` clamps to 0
+        // and the 500 ms polling loop fires CountdownExpired on the
+        // very first tick → dismiss button immediately active.
+        let elapsed_pre = elapsed_seconds.unwrap_or(0) as u64;
         let timer_proxy = event_loop.create_proxy();
-        let timer_secs = countdown as u64;
+        let timer_secs = (countdown as u64).saturating_sub(elapsed_pre);
         let start_wall = SystemTime::now();
         std::thread::spawn(move || loop {
             std::thread::sleep(Duration::from_millis(500));
