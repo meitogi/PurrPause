@@ -5,11 +5,14 @@
 // coupling with no code-size win.
 
 use std::path::Path;
+use std::str::FromStr;
 use std::time::{Duration, SystemTime};
 
+use chrono_tz::Tz;
 use eframe::egui;
 
-use super::decoration::{ingest_lottie, paint_watermark, spawn_local};
+use super::decoration::{ingest_lottie, paint_watermark, spawn_local, spawn_local_with_env};
+use crate::time_authority;
 use super::Action;
 use crate::config::defaults::{
     DEFAULT_COUNTDOWN_TEMPLATE, DEFAULT_DISMISS_LABEL, DEFAULT_POPUP_SUBTITLE,
@@ -24,6 +27,7 @@ use crate::scheduler;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
     General,
+    DailyPause,
     Animations,
     Messages,
     Notifications,
@@ -34,6 +38,7 @@ impl Tab {
     fn label(self) -> &'static str {
         match self {
             Tab::General => "Général",
+            Tab::DailyPause => "Pause midi",
             Tab::Animations => "Animations",
             Tab::Messages => "Messages",
             Tab::Notifications => "Notifications",
@@ -134,7 +139,11 @@ pub fn ui(
                     egui::RichText::new("💾  Enregistrer").size(16.0),
                 )
                 .min_size(egui::vec2(170.0, 40.0));
-                if ui.add_enabled(state.dirty, save_btn).clicked() {
+                // Block Save on an invalid daily-pause IANA timezone — the
+                // Pause midi tab surfaces the error inline; disabling Save
+                // keeps a bad TZ from ever reaching state.dat.
+                let daily_tz_valid = Tz::from_str(&cfg.daily_pause.timezone).is_ok();
+                if ui.add_enabled(state.dirty && daily_tz_valid, save_btn).clicked() {
                     match crate::config::save(cfg, Path::new(STATE_DAT)) {
                         Ok(()) => {
                             state.dirty = false;
@@ -191,6 +200,7 @@ pub fn ui(
             ui.horizontal_wrapped(|ui| {
                 for t in [
                     Tab::General,
+                    Tab::DailyPause,
                     Tab::Animations,
                     Tab::Messages,
                     Tab::Notifications,
@@ -205,6 +215,7 @@ pub fn ui(
 
             egui::ScrollArea::vertical().show(ui, |ui| match state.active {
                 Tab::General => ui_general(ui, cfg, &mut state.dirty),
+                Tab::DailyPause => ui_daily_pause(ui, cfg, &mut state.dirty),
                 Tab::Animations => ui_animations(ui, cfg, &mut state.dirty),
                 Tab::Messages => ui_messages(ui, cfg, &mut state.dirty),
                 Tab::Notifications => {
@@ -489,7 +500,7 @@ fn ui_general(ui: &mut egui::Ui, cfg: &mut Config, dirty: &mut bool) {
         if ui
             .checkbox(
                 &mut cfg.disabled,
-                egui::RichText::new("⚠  Désactiver les pauses").strong(),
+                egui::RichText::new("⚠  Désactiver les intervals").strong(),
             )
             .changed()
         {
@@ -497,12 +508,194 @@ fn ui_general(ui: &mut egui::Ui, cfg: &mut Config, dirty: &mut bool) {
         }
         ui.label(
             egui::RichText::new(
-                "Aucune popup ne se déclenchera tant que cette case \
-                 est cochée.",
+                "Aucune pause d'intervalle ne se déclenchera tant que \
+                 cette case est cochée.",
             )
             .weak()
             .small(),
         );
+        ui.label(
+            egui::RichText::new(
+                "N'affecte pas la pause midi. Utilisez l'onglet Pause \
+                 midi pour la désactiver.",
+            )
+            .weak()
+            .small(),
+        );
+    });
+}
+
+fn ui_daily_pause(ui: &mut egui::Ui, cfg: &mut Config, dirty: &mut bool) {
+    ui.heading("Pause midi");
+    ui.add_space(8.0);
+
+    // ── Kill-switch (top) ──
+    // Independent of the interval kill-switch on the Général tab. The
+    // checkbox reads "disabled" (checked = off), but the stored field is
+    // `enabled` (checked = on) — so we drive it through a negated temp
+    // bool. Red-tinted frame when the daily pause is off, mirroring the
+    // Général kill-switch styling.
+    let mut daily_disabled = !cfg.daily_pause.enabled;
+    let frame = if daily_disabled {
+        egui::Frame::group(ui.style())
+            .fill(egui::Color32::from_rgba_premultiplied(60, 30, 20, 255))
+            .stroke(egui::Stroke::new(
+                1.5,
+                egui::Color32::from_rgb(220, 120, 60),
+            ))
+    } else {
+        egui::Frame::group(ui.style())
+    };
+    frame.show(ui, |ui| {
+        if ui
+            .checkbox(
+                &mut daily_disabled,
+                egui::RichText::new("⚠  Désactiver la pause midi").strong(),
+            )
+            .changed()
+        {
+            cfg.daily_pause.enabled = !daily_disabled;
+            *dirty = true;
+        }
+        ui.label(
+            egui::RichText::new("Indépendant du kill-switch des intervals.")
+                .weak()
+                .small(),
+        );
+    });
+
+    // ── Horaire ──
+    ui.add_space(12.0);
+    ui.label(egui::RichText::new("Horaire").strong());
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.label("Heure de déclenchement :");
+        if ui
+            .add(egui::DragValue::new(&mut cfg.daily_pause.hour).range(0..=23))
+            .changed()
+        {
+            *dirty = true;
+        }
+        ui.label(":");
+        if ui
+            .add(egui::DragValue::new(&mut cfg.daily_pause.minute).range(0..=59))
+            .changed()
+        {
+            *dirty = true;
+        }
+    });
+
+    ui.add_space(8.0);
+    ui.label("Durée de la pause");
+    if ui
+        .add(egui::Slider::new(&mut cfg.daily_pause.duration_minutes, 15..=120).text("min"))
+        .on_hover_text(
+            "Combien de temps la popup reste affichée avant que le \
+             bouton de fermeture devienne cliquable.",
+        )
+        .changed()
+    {
+        *dirty = true;
+    }
+
+    // ── Fuseau horaire & horloge ──
+    ui.add_space(12.0);
+    ui.label(egui::RichText::new("Fuseau horaire").strong());
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.label("Fuseau (IANA) :");
+        if ui
+            .add(
+                egui::TextEdit::singleline(&mut cfg.daily_pause.timezone)
+                    .hint_text("Europe/Paris")
+                    .desired_width(220.0),
+            )
+            .changed()
+        {
+            *dirty = true;
+        }
+    });
+    let tz_valid = Tz::from_str(&cfg.daily_pause.timezone).is_ok();
+    if !tz_valid {
+        ui.colored_label(
+            egui::Color32::from_rgb(220, 60, 60),
+            "Fuseau IANA invalide (ex : Europe/Paris)",
+        );
+    }
+
+    ui.add_space(4.0);
+    if ui
+        .checkbox(
+            &mut cfg.use_system_clock,
+            "Utiliser l'horloge Windows (désactive l'anti-triche)",
+        )
+        .changed()
+    {
+        *dirty = true;
+    }
+    ui.label(
+        egui::RichText::new(
+            "Recommandé désactivé. Activez seulement si votre réseau \
+             bloque NTP + HTTPS.",
+        )
+        .weak()
+        .small(),
+    );
+
+    // ── Live preview ──
+    // Recomputes each frame from the authoritative clock; a 1 s repaint
+    // request keeps it advancing even when the window is idle so a
+    // day-boundary crossing flips the date without a manual interaction.
+    ui.add_space(12.0);
+    let now_local = time_authority::in_configured_tz(cfg, time_authority::now_authoritative(cfg));
+    let next = time_authority::next_daily_pause_at(cfg, now_local);
+    ui.label(
+        egui::RichText::new(format!(
+            "Prochaine pause midi : {}",
+            next.format("%Y-%m-%d %H:%M")
+        ))
+        .weak(),
+    );
+    ui.ctx().request_repaint_after(Duration::from_secs(1));
+
+    // ── Test ──
+    ui.add_space(12.0);
+    ui.label(egui::RichText::new("Test").strong());
+    ui.add_space(4.0);
+    // Save persists the config before these fire, so no --config-override
+    // is needed. PURRPAUSE_FROZEN_TZ mirrors the service's production
+    // daily-pause spawn (TZ-tamper-proof display).
+    let tz = cfg.daily_pause.timezone.clone();
+    ui.horizontal_wrapped(|ui| {
+        if ui.button("Tester la pause midi maintenant").clicked() {
+            let args = ["--popup", "--no-debug", "--mode", "daily-pause"];
+            if let Err(e) = spawn_local_with_env(&args, &[("PURRPAUSE_FROZEN_TZ", tz.as_str())]) {
+                tracing::warn!(error = %e, "spawn daily-pause popup failed");
+            }
+        }
+    });
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.label("Pré-notifs :");
+        for p in [15u32, 10, 5] {
+            if ui.small_button(format!("T-{p}")).clicked() {
+                let palier = p.to_string();
+                let args = [
+                    "--countdown",
+                    "60",
+                    "--palier",
+                    palier.as_str(),
+                    "--no-debug",
+                    "--mode",
+                    "daily-pause",
+                ];
+                if let Err(e) =
+                    spawn_local_with_env(&args, &[("PURRPAUSE_FROZEN_TZ", tz.as_str())])
+                {
+                    tracing::warn!(error = %e, palier = p, "spawn daily countdown failed");
+                }
+            }
+        }
     });
 }
 
@@ -720,6 +913,51 @@ fn ui_messages(ui: &mut egui::Ui, cfg: &mut Config, dirty: &mut bool) {
                 let d = defaults::d::pre_notif_messages()
                     .remove(&p)
                     .unwrap_or_else(|| format!("Pause dans {p} min"));
+                *entry = d;
+                *dirty = true;
+            }
+        });
+    }
+
+    // ── Pause midi ──
+    ui.add_space(20.0);
+    ui.separator();
+    ui.add_space(8.0);
+    ui.label(egui::RichText::new("Pause midi").strong());
+    ui.add_space(6.0);
+
+    let dp_title = defaults::d::daily_pause_popup_title();
+    string_row(ui, "Titre popup midi", &mut cfg.daily_pause.popup_title, &dp_title, dirty);
+    let dp_subtitle = defaults::d::daily_pause_popup_subtitle();
+    string_row(
+        ui,
+        "Sous-titre popup midi",
+        &mut cfg.daily_pause.popup_subtitle,
+        &dp_subtitle,
+        dirty,
+    );
+
+    ui.add_space(6.0);
+    ui.label(egui::RichText::new("Messages des paliers T-N (pause midi)").strong());
+    // Fixed palier set {15, 10, 5} — no add/remove UI (unlike interval).
+    for p in [15u32, 10, 5] {
+        let entry = cfg
+            .daily_pause
+            .pre_notif_messages
+            .entry(p)
+            .or_insert_with(|| format!("Pause midi dans {p} min"));
+        ui.horizontal(|ui| {
+            ui.label(format!("T-{p} min"));
+            if ui
+                .add(egui::TextEdit::singleline(entry).desired_width(320.0))
+                .changed()
+            {
+                *dirty = true;
+            }
+            if ui.button("Défaut").clicked() {
+                let d = defaults::d::daily_pause_pre_notif_messages()
+                    .remove(&p)
+                    .unwrap_or_else(|| format!("Pause midi dans {p} min"));
                 *entry = d;
                 *dirty = true;
             }

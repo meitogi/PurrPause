@@ -354,6 +354,7 @@ pub(crate) fn reset_sync_for_tests() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Timelike;
     use crate::config::schema::DailyPauseConfig;
 
     fn cfg_with_tz(tz: &str, use_system: bool) -> Config {

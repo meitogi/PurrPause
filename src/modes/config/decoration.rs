@@ -168,6 +168,21 @@ pub fn spawn_local(args: &[&str]) -> Result<()> {
     Ok(())
 }
 
+/// Like `spawn_local`, but also injects the given `KEY=VALUE` env pairs
+/// into the child. Used by the "Pause midi" test buttons to forward
+/// `PURRPAUSE_FROZEN_TZ`, matching the service's production daily-pause
+/// spawn so the popup formats times against the configured IANA TZ
+/// rather than the Windows panel setting.
+pub fn spawn_local_with_env(args: &[&str], env: &[(&str, &str)]) -> Result<()> {
+    let exe = std::env::current_exe().map_err(|e| anyhow!("current_exe: {e}"))?;
+    std::process::Command::new(&exe)
+        .args(args)
+        .envs(env.iter().copied())
+        .spawn()
+        .map_err(|e| anyhow!("spawn {exe:?} {args:?}: {e}"))?;
+    Ok(())
+}
+
 /// Copy `src` into `<exe_dir>/Data/Animations/`, sanitize in-place,
 /// return `(relative_path_under_protocol_namespace, display_name)`. The
 /// returned relative path is `animations/<file>` — the protocol
