@@ -38,6 +38,8 @@ use windows::Win32::System::SystemInformation::GetTickCount64;
 /// Beyond this staleness we treat the probe as dead. 30 s = 6× the
 /// probe's 5 s push cadence, so a healthy probe never hits the
 /// threshold and a crashed one is detected within one service tick.
+/// Also bounds the media flag in `media_playing` — one constant, one
+/// decay convention.
 const MAX_PROBE_STALENESS_MS: u64 = 30_000;
 
 /// Latest input-stamp snapshot materialized by the service tick loop
@@ -52,6 +54,10 @@ pub struct InputStampState {
     /// service side. Used for staleness detection so a dead probe is
     /// caught within one service tick.
     pub received_at_tick_ms: u64,
+    /// WASAPI "any active render session" flag sampled by the probe in
+    /// the user session (session-scoped API, unreadable from Session 0
+    /// — see `busy_detector.rs`).
+    pub playing_audio: bool,
 }
 
 /// Seconds since the last keyboard or mouse input on the interactive
@@ -74,4 +80,19 @@ pub fn idle_seconds(state: Option<&InputStampState>) -> u64 {
     }
     let idle_ms = current_tick.saturating_sub(s.last_input_tick_ms);
     idle_ms / 1000
+}
+
+/// True if the user-session probe last reported an active WASAPI
+/// render session AND the stamp is fresh. Missing / stale state →
+/// false : no worse than the pre-1.6.1 behavior (a Session 0 call
+/// always returned false) and, combined with `idle_seconds` reading 0
+/// on the same stale state, the tick errs toward "assume active"
+/// without double-counting a dead probe as media time.
+pub fn media_playing(state: Option<&InputStampState>) -> bool {
+    let Some(s) = state else {
+        return false;
+    };
+    let current_tick = unsafe { GetTickCount64() };
+    let staleness_ms = current_tick.saturating_sub(s.received_at_tick_ms);
+    crate::signals::media_playing_decision(s.playing_audio, staleness_ms, MAX_PROBE_STALENESS_MS)
 }

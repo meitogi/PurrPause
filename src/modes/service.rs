@@ -194,7 +194,7 @@ mod win {
     use crate::modes::install::{webview2_dir, DIAGNOSTICS_CACHE_DIR, SERVICE_NAME, STATE_DAT};
     use crate::platform::win32::proc_kill::{is_pid_alive, kill_orphan_webview2_workers};
     use crate::platform::win32::spawn_user::{RealSpawner, SpawnedChild};
-    use crate::platform::win32::{busy_detector, gamepad, idle, power_notify};
+    use crate::platform::win32::{gamepad, idle, power_notify};
     use crate::platform::{
         spawn_replacing, spawn_replacing_keyed, spawn_replacing_with_env,
         update_or_spawn_replacing_with_env, UpdateOrSpawn,
@@ -1105,9 +1105,10 @@ mod win {
 
                     // 2b. Ensure the user-session input probe is alive.
                     //     Cheap poll (HANDLE-based try_wait_exited). If
-                    //     dead, respawn — the probe writes the file
-                    //     idle::idle_seconds() reads, so a stale/absent
-                    //     probe would degrade kbd/mouse detection.
+                    //     dead, respawn — the probe pushes the stamps
+                    //     idle::idle_seconds() / idle::media_playing()
+                    //     read, so a stale/absent probe would degrade
+                    //     kbd/mouse + media detection.
                     let probe_alive = input_probe_child
                         .as_ref()
                         .map(|c| c.try_wait_exited().is_none())
@@ -1221,15 +1222,18 @@ mod win {
                     // 3. Idle accumulation. Signals are read once and
                     //    reused by the fire-decision below.
                     let now = SystemTime::now();
-                    let playing_video_or_audio_now = busy_detector::playing_video_or_audio();
                     let gamepad_seen = gamepad::gamepad_active_since_last_call();
                     // Drain any pending input-stamp pushes from the
                     // pipe thread ; keep the newest (stamps are
                     // monotonic). Held state carries across ticks
-                    // when the drain sees nothing.
+                    // when the drain sees nothing. The media flag
+                    // rides in the same stamp (WASAPI is session-
+                    // scoped, unreadable from Session 0), so it must
+                    // be read after the drain.
                     while let Ok(stamp) = stamp_rx.try_recv() {
                         input_stamp = Some(stamp);
                     }
+                    let playing_video_or_audio_now = idle::media_playing(input_stamp.as_ref());
                     let idle_secs = idle::idle_seconds(input_stamp.as_ref());
                     let is_idle_now = if config.count_active_time {
                         signals::idle_tick_should_pause(
@@ -2065,11 +2069,12 @@ mod win {
                     let _ = pipe_tx.send(TickCommand::Shutdown);
                     break;
                 }
-                Message::InputStamp { tick_ms } => {
+                Message::InputStamp { tick_ms, playing_audio } => {
                     let received_at = unsafe { GetTickCount64() };
                     let _ = stamp_tx.send(idle::InputStampState {
                         last_input_tick_ms: tick_ms,
                         received_at_tick_ms: received_at,
+                        playing_audio,
                     });
                 }
             }

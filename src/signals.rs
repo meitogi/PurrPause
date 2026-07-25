@@ -68,6 +68,18 @@ pub fn idle_tick_should_pause(
     idle_secs >= threshold_secs && !gamepad_active && !playing_video_or_audio
 }
 
+/// True when the probe-reported media flag should count as "playing" :
+/// the flag is set AND the stamp it rode in on is still fresh. A stale
+/// stamp means the probe is dead — decay to false rather than freezing
+/// the last value forever.
+pub fn media_playing_decision(
+    playing_audio: bool,
+    staleness_ms: u64,
+    max_staleness_ms: u64,
+) -> bool {
+    playing_audio && staleness_ms <= max_staleness_ms
+}
+
 // -- pincode buffer ---------------------------------------------------
 
 /// Outcome returned by `PincodeBuffer::on_capture_release`.
@@ -246,6 +258,28 @@ mod tests {
     #[test]
     fn idle_pause_all_conditions_ok_is_true() {
         assert!(idle_tick_should_pause(3600, 60, false, false));
+    }
+
+    // -- media_playing_decision ---------------------------------------
+
+    #[test]
+    fn media_playing_fresh_stamp_is_true() {
+        assert!(media_playing_decision(true, 5_000, 30_000));
+    }
+
+    #[test]
+    fn media_playing_at_staleness_boundary_is_true() {
+        assert!(media_playing_decision(true, 30_000, 30_000));
+    }
+
+    #[test]
+    fn media_playing_stale_stamp_decays_to_false() {
+        assert!(!media_playing_decision(true, 30_001, 30_000));
+    }
+
+    #[test]
+    fn media_not_playing_fresh_stamp_is_false() {
+        assert!(!media_playing_decision(false, 0, 30_000));
     }
 
     // -- PincodeBuffer -----------------------------------------------

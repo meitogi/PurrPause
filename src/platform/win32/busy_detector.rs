@@ -2,9 +2,19 @@
 // audio render session counts as screen time, muted or not
 // (design intent : muting a background video is still watching).
 //
-// COM init is scoped to the poll : the service tick runs on a
-// single thread, one CoInitializeEx / CoUninitialize per call
-// keeps COM apartment state out of the tick thread's steady state.
+// # Session 0 pitfall
+//
+// WASAPI audio sessions are per-session, like window stations : a
+// SYSTEM service in Session 0 enumerating render endpoints only sees
+// Session 0's (empty) audio graph, never the interactive user's, so
+// a call from the service tick returns false forever. Same trap as
+// `GetLastInputInfo` (see `idle.rs`) — the caller must therefore be
+// the user-session `--input-probe` child, which samples this at each
+// poll and ships the flag to the service inside `Message::InputStamp`.
+//
+// COM init is scoped to the poll : one CoInitializeEx /
+// CoUninitialize per call keeps COM apartment state out of the
+// probe's poll thread's steady state.
 //
 // Historical note : earlier versions also consumed
 // SHQueryUserNotificationState (QUNS) to catch fullscreen / DND /
@@ -28,12 +38,21 @@ use windows::Win32::System::Com::{
 /// still means the user is watching.
 pub fn playing_video_or_audio() -> bool {
     unsafe {
-        // MULTITHREADED apartment : matches the tick thread which is
+        // MULTITHREADED apartment : matches the poll thread which is
         // not a UI / STA context. Second CoInitializeEx on the same
         // thread with the same flags returns S_FALSE (harmless) ;
         // still call CoUninitialize to balance the ref count.
         let init = CoInitializeEx(None, COINIT_MULTITHREADED);
-        let busy = inner().unwrap_or(false);
+        let busy = match inner() {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "WASAPI busy check failed - assuming not playing"
+                );
+                false
+            }
+        };
         if init.is_ok() {
             CoUninitialize();
         }

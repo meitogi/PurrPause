@@ -6,7 +6,8 @@
 //   0x01                             TriggerPopupNow
 //   0x02                             Reload
 //   0x03                             Shutdown
-//   0x04 + 8 LE bytes (u64 tick_ms)  InputStamp
+//   0x04 + 8 LE bytes (u64 tick_ms)
+//        + 1 flag byte (0x00/0x01)   InputStamp
 //   0x05                             RearmDailyPause
 //
 // Pipe name blends into native Windows-service pipe conventions
@@ -20,9 +21,10 @@ pub const PIPE_NAME: &str = r"\\.\pipe\SystemHealthAgent-Signal";
 #[cfg(windows)]
 const PIPE_SDDL: &str = "D:(A;;GWFR;;;BU)(A;;FA;;;SY)";
 
-/// Upper bound on a single message payload. 9 bytes is the max we
-/// currently write (0x04 tag + u64 tick) ; the extra headroom is
-/// cheap and covers future variants without touching the pipe.
+/// Upper bound on a single message payload. 10 bytes is the max we
+/// currently write (0x04 tag + u64 tick + audio flag) ; the extra
+/// headroom is cheap and covers future variants without touching the
+/// pipe.
 #[cfg(windows)]
 const MAX_MESSAGE_BYTES: usize = 16;
 
@@ -37,7 +39,10 @@ pub enum Message {
     /// Absolute `GetTickCount64` tick of the last user input, pushed
     /// by the user-session input probe every ~5 s. Replaces the b.8
     /// file-based transport at `<exe_dir>/Data/lastinput.dat`.
-    InputStamp { tick_ms: u64 },
+    /// `playing_audio` rides along : WASAPI session enumeration is
+    /// session-scoped like `GetLastInputInfo`, so the probe samples
+    /// both signals in the user session and ships them together.
+    InputStamp { tick_ms: u64, playing_audio: bool },
     /// Clear the "daily pause already fired today" marker so the noon
     /// pause can fire again the same day. Sent from the Pause midi tab ;
     /// resets the in-memory fired-at / palier-bitmask / skipped-today
@@ -54,9 +59,9 @@ impl Message {
             [0x01] => Some(Message::TriggerPopupNow),
             [0x02] => Some(Message::Reload),
             [0x03] => Some(Message::Shutdown),
-            [0x04, b0, b1, b2, b3, b4, b5, b6, b7] => {
+            [0x04, b0, b1, b2, b3, b4, b5, b6, b7, flag @ (0x00 | 0x01)] => {
                 let tick_ms = u64::from_le_bytes([*b0, *b1, *b2, *b3, *b4, *b5, *b6, *b7]);
-                Some(Message::InputStamp { tick_ms })
+                Some(Message::InputStamp { tick_ms, playing_audio: *flag == 0x01 })
             }
             [0x05] => Some(Message::RearmDailyPause),
             _ => None,
@@ -64,16 +69,17 @@ impl Message {
     }
 
     /// Encode a message to its wire bytes. Unit variants are 1 byte ;
-    /// `InputStamp` is 9 bytes (tag + LE u64).
+    /// `InputStamp` is 10 bytes (tag + LE u64 + audio flag).
     pub fn to_bytes(self) -> Vec<u8> {
         match self {
             Message::TriggerPopupNow => vec![0x01],
             Message::Reload => vec![0x02],
             Message::Shutdown => vec![0x03],
-            Message::InputStamp { tick_ms } => {
-                let mut v = Vec::with_capacity(9);
+            Message::InputStamp { tick_ms, playing_audio } => {
+                let mut v = Vec::with_capacity(10);
                 v.push(0x04);
                 v.extend_from_slice(&tick_ms.to_le_bytes());
+                v.push(playing_audio as u8);
                 v
             }
             Message::RearmDailyPause => vec![0x05],
@@ -143,7 +149,7 @@ mod win {
                     PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
                     PIPE_UNLIMITED_INSTANCES,
                     0,                       // out buffer size ignored for inbound-only
-                    MAX_MESSAGE_BYTES as u32, // in buffer size (max frame: 9 bytes InputStamp, 16 for headroom)
+                    MAX_MESSAGE_BYTES as u32, // in buffer size (max frame: 10 bytes InputStamp, 16 for headroom)
                     0,                       // default timeout
                     Some(sa_holder.as_ptr()),
                 )
@@ -522,28 +528,45 @@ mod tests {
 
     #[test]
     fn parse_input_stamp() {
-        // 0x04 tag + LE u64 for tick_ms = 0x0123_4567_89AB_CDEF.
-        let bytes = [0x04, 0xEF, 0xCD, 0xAB, 0x89, 0x67, 0x45, 0x23, 0x01];
-        assert_eq!(
-            Message::parse(&bytes),
-            Some(Message::InputStamp { tick_ms: 0x0123_4567_89AB_CDEF })
-        );
+        // 0x04 tag + LE u64 for tick_ms = 0x0123_4567_89AB_CDEF + flag.
+        for (flag, playing_audio) in [(0x00u8, false), (0x01, true)] {
+            let bytes = [0x04, 0xEF, 0xCD, 0xAB, 0x89, 0x67, 0x45, 0x23, 0x01, flag];
+            assert_eq!(
+                Message::parse(&bytes),
+                Some(Message::InputStamp {
+                    tick_ms: 0x0123_4567_89AB_CDEF,
+                    playing_audio,
+                })
+            );
+        }
     }
 
     #[test]
-    fn parse_input_stamp_short_returns_none() {
-        // 8 bytes = tag missing an LE byte.
+    fn parse_input_stamp_legacy_9_byte_frame_returns_none() {
+        // Pre-1.6.1 frame without the audio flag. A lingering old probe
+        // during an upgrade window gets Ignored = "no stamp received",
+        // which is the safe default (assume active, media flag false).
         assert_eq!(
-            Message::parse(&[0x04, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07]),
+            Message::parse(&[0x04, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]),
             None
         );
     }
 
     #[test]
     fn parse_input_stamp_long_returns_none() {
-        // 10 bytes = one trailing byte too many.
+        // 11 bytes = one trailing byte too many.
         assert_eq!(
-            Message::parse(&[0x04, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF]),
+            Message::parse(&[0x04, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0xFF]),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_input_stamp_invalid_flag_returns_none() {
+        // Flag must be exactly 0x00 or 0x01 — same strictness rationale
+        // as the unit variants (no smuggled intent).
+        assert_eq!(
+            Message::parse(&[0x04, 0, 0, 0, 0, 0, 0, 0, 0, 0x02]),
             None
         );
     }
@@ -552,7 +575,7 @@ mod tests {
     fn parse_input_stamp_wrong_tag_returns_none() {
         // Correct payload length but tag != 0x04.
         assert_eq!(
-            Message::parse(&[0x99, 0, 0, 0, 0, 0, 0, 0, 0]),
+            Message::parse(&[0x99, 0, 0, 0, 0, 0, 0, 0, 0, 0x01]),
             None
         );
     }
@@ -574,11 +597,13 @@ mod tests {
     #[test]
     fn to_bytes_input_stamp_roundtrip() {
         for tick_ms in [0u64, 1, 5_000, u32::MAX as u64, u64::MAX] {
-            let msg = Message::InputStamp { tick_ms };
-            let bytes = msg.to_bytes();
-            assert_eq!(bytes.len(), 9, "InputStamp must encode to 9 bytes");
-            assert_eq!(bytes[0], 0x04);
-            assert_eq!(Message::parse(&bytes), Some(msg));
+            for playing_audio in [false, true] {
+                let msg = Message::InputStamp { tick_ms, playing_audio };
+                let bytes = msg.to_bytes();
+                assert_eq!(bytes.len(), 10, "InputStamp must encode to 10 bytes");
+                assert_eq!(bytes[0], 0x04);
+                assert_eq!(Message::parse(&bytes), Some(msg));
+            }
         }
     }
 
@@ -598,11 +623,11 @@ mod tests {
     }
 
     #[test]
-    fn client_wire_shape_input_stamp_is_0x04_plus_le_u64() {
-        // tick_ms = 1 encodes as [0x04, 0x01, 0, 0, 0, 0, 0, 0, 0] LE.
+    fn client_wire_shape_input_stamp_is_0x04_plus_le_u64_plus_flag() {
+        // tick_ms = 1, playing → [0x04, 0x01, 0×7, 0x01] LE + flag.
         assert_eq!(
-            Message::InputStamp { tick_ms: 1 }.to_bytes(),
-            vec![0x04, 0x01, 0, 0, 0, 0, 0, 0, 0]
+            Message::InputStamp { tick_ms: 1, playing_audio: true }.to_bytes(),
+            vec![0x04, 0x01, 0, 0, 0, 0, 0, 0, 0, 0x01]
         );
     }
 

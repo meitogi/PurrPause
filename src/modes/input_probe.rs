@@ -23,8 +23,12 @@
 // Every `POLL_INTERVAL` (5 s) the probe :
 //   1. reads `GetLastInputInfo` to compute the absolute u64 tick of
 //      the last input,
-//   2. calls `ipc::send(Message::InputStamp { tick_ms })` to push it
-//      to the service (see `ipc.rs` for the wire format).
+//   2. asks WASAPI whether any render session is active (media
+//      playing) — audio sessions are session-scoped exactly like
+//      window stations, so this too must run here and not in the
+//      Session 0 service (see `busy_detector.rs`),
+//   3. calls `ipc::send(Message::InputStamp { tick_ms, playing_audio })`
+//      to push both to the service (see `ipc.rs` for the wire format).
 //
 // The service's pipe thread bridges `InputStamp` onto a dedicated
 // stamp mpsc, and the tick loop drains that at each 5 s tick.
@@ -103,7 +107,8 @@ pub fn run() -> Result<()> {
 fn send_stamp() -> Result<()> {
     let current_tick = unsafe { GetTickCount64() };
     let last_input_tick = read_last_input_tick_abs(current_tick);
-    ipc::send(Message::InputStamp { tick_ms: last_input_tick })
+    let playing_audio = crate::platform::win32::busy_detector::playing_video_or_audio();
+    ipc::send(Message::InputStamp { tick_ms: last_input_tick, playing_audio })
 }
 
 /// Convert `GetLastInputInfo`'s u32 tick (wraps every 49.7 days) into
