@@ -91,8 +91,8 @@ mod win {
     use anyhow::{anyhow, Context, Result};
     use windows::core::{HSTRING, PCWSTR};
     use windows::Win32::Foundation::{
-        CloseHandle, GetLastError, ERROR_IO_PENDING, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED,
-        GENERIC_WRITE, HANDLE, HLOCAL, LocalFree, WAIT_OBJECT_0,
+        CloseHandle, GetLastError, ERROR_FILE_NOT_FOUND, ERROR_IO_PENDING, ERROR_PIPE_BUSY,
+        ERROR_PIPE_CONNECTED, GENERIC_WRITE, HANDLE, HLOCAL, LocalFree, WAIT_OBJECT_0,
     };
     use windows::Win32::Security::Authorization::{
         ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
@@ -367,10 +367,11 @@ mod win {
     ///   - User-session `--input-probe` child (`InputStamp` every ~5 s)
     ///
     /// The pipe SDDL grants `GW+FR` to `BUILTIN\Users` so no elevation
-    /// is required. Retries a few times on `ERROR_PIPE_BUSY` — the pipe
-    /// is message-mode with `PIPE_UNLIMITED_INSTANCES` server-side so
-    /// contention is rare, but a service restart can transiently close
-    /// the pipe.
+    /// is required. Retries a few times on `ERROR_PIPE_BUSY` (instance
+    /// mid-accept) and `ERROR_FILE_NOT_FOUND` (pipe not created yet — the
+    /// service is still starting or restarting) — the pipe is message-mode
+    /// with `PIPE_UNLIMITED_INSTANCES` server-side so contention is rare,
+    /// but a service restart can transiently drop the pipe.
     pub fn send(msg: Message) -> Result<()> {
         let name_wide: HSTRING = PIPE_NAME.into();
         const ATTEMPTS: u32 = 3;
@@ -415,6 +416,15 @@ mod win {
                             std::thread::sleep(std::time::Duration::from_millis(WAIT_MS as u64));
                         }
                         last_err = Some(anyhow!("pipe busy (retrying)"));
+                        continue;
+                    }
+                    if err == ERROR_FILE_NOT_FOUND {
+                        // The pipe isn't created yet — the service is still
+                        // starting or between server-instance re-creations.
+                        // There is no instance to WaitNamedPipeW on, so just
+                        // sleep then retry within this send.
+                        std::thread::sleep(std::time::Duration::from_millis(WAIT_MS as u64));
+                        last_err = Some(anyhow!("pipe not present yet (retrying)"));
                         continue;
                     }
                     return Err(anyhow!("CreateFileW({PIPE_NAME}) failed: {err:?}"));

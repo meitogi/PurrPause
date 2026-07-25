@@ -56,8 +56,15 @@ fn main() -> ExitCode {
             // failure — pop a MessageBox so the user sees WHAT went
             // wrong, especially for the install-flow modes that route
             // to install.log which not everyone thinks to check.
+            //
+            // EXCEPT background daemon helpers (service, watchdog, and the
+            // input-probe the service respawns) : they run unattended, are
+            // resurrected automatically, and must never throw a dialog onto
+            // the user's desktop. They've already logged via tracing above.
             #[cfg(windows)]
-            fatal_error_dialog(&mode, &err);
+            if !matches!(mode, Mode::Service | Mode::Watchdog | Mode::InputProbe) {
+                fatal_error_dialog(&mode, &err);
+            }
             ExitCode::FAILURE
         }
     }

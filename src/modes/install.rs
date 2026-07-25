@@ -266,11 +266,7 @@ fn fresh_install(current_exe: &Path) -> Result<()> {
     register_service(current_exe).context("step 7: register service")?;
     tracing::info!("step 7: service registered");
 
-    // Step 8 : Scheduled Task watchdog.
-    itaskservice::register_watchdog(current_exe).context("step 8: register watchdog")?;
-    tracing::info!("step 8: watchdog task registered");
-
-    // Step 9 : block on first-run wizard — SKIP if state.dat already
+    // Step 8 : block on first-run wizard — SKIP if state.dat already
     // has a passcode. This handles the "PathUpdate failed → FreshInstall
     // fallback" recovery path : the parent already went through the
     // wizard on a previous version, no need to ask again.
@@ -283,20 +279,29 @@ fn fresh_install(current_exe: &Path) -> Result<()> {
             .arg("--config")
             .arg("--first-run")
             .status()
-            .context("step 9: spawn wizard")?;
+            .context("step 8: spawn wizard")?;
         if !status.success() {
-            tracing::warn!(?status, "step 9: wizard cancelled - rolling back");
+            tracing::warn!(?status, "step 8: wizard cancelled - rolling back");
             crate::modes::rollback::run().ok();
             anyhow::bail!("first-run wizard cancelled");
         }
-        tracing::info!("step 9: first-run wizard completed");
+        tracing::info!("step 8: first-run wizard completed");
     } else {
-        tracing::info!("step 9: skipping wizard, passcode already set (recovery path)");
+        tracing::info!("step 8: skipping wizard, passcode already set (recovery path)");
     }
 
-    // Step 10 : start the service.
-    start_service().context("step 10: start service")?;
-    tracing::info!("step 10: service started");
+    // Step 9 : start the service.
+    start_service().context("step 9: start service")?;
+    tracing::info!("step 9: service started");
+
+    // Step 10 : Scheduled Task watchdog — registered LAST, once the
+    // service is already running. Its trigger is due immediately (past
+    // StartBoundary + PT1M repetition), so registering it earlier lets it
+    // start the service during the step-8 wizard window and race step 9's
+    // start (ERROR_SERVICE_ALREADY_RUNNING). Arming it after the start
+    // avoids that race; the watchdog's own start swallows already-running.
+    itaskservice::register_watchdog(current_exe).context("step 10: register watchdog")?;
+    tracing::info!("step 10: watchdog task registered");
 
     // Bonus : open the config UI right after the wizard succeeded, so
     // the parent gets a visible "you're set" moment instead of a
@@ -352,8 +357,22 @@ fn start_service() -> Result<()> {
     let svc = scm
         .open_service(SERVICE_NAME, ServiceAccess::START)
         .context("open service")?;
-    svc.start(&[] as &[&str]).context("start service")?;
-    Ok(())
+
+    // ERROR_SERVICE_ALREADY_RUNNING (1056) — the watchdog task (or a
+    // leftover instance) may have started the service already. An
+    // idempotent start treats that as success rather than a fatal install
+    // failure. This mirrors the watchdog's own tolerant start.
+    const ERROR_SERVICE_ALREADY_RUNNING: i32 = 1056;
+    match svc.start(&[] as &[&str]) {
+        Ok(()) => Ok(()),
+        Err(windows_service::Error::Winapi(e))
+            if e.raw_os_error() == Some(ERROR_SERVICE_ALREADY_RUNNING) =>
+        {
+            tracing::info!("start_service: service already running, treating as success");
+            Ok(())
+        }
+        Err(e) => Err(e).context("start service"),
+    }
 }
 
 #[cfg(windows)]
