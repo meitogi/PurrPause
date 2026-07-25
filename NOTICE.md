@@ -65,7 +65,9 @@ download time and are not enumerated here.
   mounted inside the WebView2 popup.
 
 ### `canvaskit-wasm` (Skia / Skottie) — GPU Lottie runtime
-- **Version** : 0.41.1
+- **Version** : 0.41.1 (the **full** dist build — `bin/full/`, the smallest
+  variant whose runtime actually exposes Skottie's `MakeManagedAnimation` ;
+  the default `bin/` build ships the type but not the compiled binding)
 - **License** : BSD-3-Clause (Copyright Google LLC ; see
   `resources/vendor/skottie/` and the Skia LICENSE)
 - **Location in tree** : `resources/vendor/skottie/canvaskit.js` +
