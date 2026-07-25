@@ -31,13 +31,16 @@ use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED,
 };
 
-/// One WASAPI sweep with diagnostic counts. `endpoints` = active
-/// render endpoints seen, `sessions` = audio sessions across them.
-/// The counts discriminate "no render device at all" (VM audio
-/// unplugged → endpoints 0) from "device fine but no app has an
-/// active session" when `playing` stays false against expectations.
+/// One media sweep with diagnostic counts. `audio` = a WASAPI render
+/// session is active ; `smtc` = a media-transport session reports
+/// Playing. Shipped separately to the service, which combines them
+/// according to the activity-signal toggles in the config. The counts
+/// discriminate "no render device at all" (VM audio unplugged →
+/// endpoints 0) from "device fine but no app has an active session"
+/// when `audio` stays false against expectations.
 pub struct Detection {
-    pub playing: bool,
+    pub audio: bool,
+    pub smtc: bool,
     pub endpoints: u32,
     pub sessions: u32,
 }
@@ -55,20 +58,57 @@ pub fn detect() -> Detection {
         // thread with the same flags returns S_FALSE (harmless) ;
         // still call CoUninitialize to balance the ref count.
         let init = CoInitializeEx(None, COINIT_MULTITHREADED);
-        let detection = match inner() {
+        let mut detection = match inner() {
             Ok(d) => d,
             Err(e) => {
                 tracing::warn!(
                     error = %e,
                     "WASAPI busy check failed - assuming not playing"
                 );
-                Detection { playing: false, endpoints: 0, sessions: 0 }
+                Detection { audio: false, smtc: false, endpoints: 0, sessions: 0 }
             }
         };
+        // SMTC complements WASAPI : a video muted in the PLAYER or the
+        // browser tab stops its audio stream (session goes inactive)
+        // but the transport session still reports Playing — and a muted
+        // video is still screen time. Windows-mixer mute keeps the
+        // WASAPI session active, so that path was already covered.
+        detection.smtc = smtc_playing();
         if init.is_ok() {
             CoUninitialize();
         }
         detection
+    }
+}
+
+/// True if any SMTC (media-transport) session reports Playing. Errors
+/// collapse to false ; the first one logs, subsequent ones stay quiet
+/// so an OS without the API doesn't spam the log every poll.
+fn smtc_playing() -> bool {
+    use windows::Media::Control::{
+        GlobalSystemMediaTransportControlsSessionManager,
+        GlobalSystemMediaTransportControlsSessionPlaybackStatus,
+    };
+    let result = (|| -> windows::core::Result<bool> {
+        let mgr = GlobalSystemMediaTransportControlsSessionManager::RequestAsync()?.join()?;
+        let sessions = mgr.GetSessions()?;
+        for session in &sessions {
+            let status = session.GetPlaybackInfo()?.PlaybackStatus()?;
+            if status == GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    })();
+    match result {
+        Ok(playing) => playing,
+        Err(e) => {
+            static LOGGED: std::sync::Once = std::sync::Once::new();
+            LOGGED.call_once(|| {
+                tracing::warn!(error = %e, "SMTC check failed - relying on WASAPI only");
+            });
+            false
+        }
     }
 }
 
@@ -77,7 +117,7 @@ unsafe fn inner() -> windows::core::Result<Detection> {
         CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_INPROC_SERVER)?;
     let collection = enumerator.EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE)?;
     let count = collection.GetCount()?;
-    let mut playing = false;
+    let mut audio = false;
     let mut total_sessions: u32 = 0;
     for i in 0..count {
         let device = collection.Item(i)?;
@@ -89,9 +129,9 @@ unsafe fn inner() -> windows::core::Result<Detection> {
         for j in 0..sess_count {
             let session = sessions.GetSession(j)?;
             if session.GetState()? == AudioSessionStateActive {
-                playing = true;
+                audio = true;
             }
         }
     }
-    Ok(Detection { playing, endpoints: count, sessions: total_sessions })
+    Ok(Detection { audio, smtc: false, endpoints: count, sessions: total_sessions })
 }

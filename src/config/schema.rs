@@ -87,6 +87,24 @@ pub struct Config {
     #[serde(default = "d::count_active_time")]
     pub count_active_time: bool,
 
+    /// Signaux comptés comme « activité » quand `count_active_time`
+    /// est actif. Tous à `true` par défaut. L'UI empêche de tout
+    /// décocher (le dernier signal coché est verrouillé) ; si un
+    /// state.dat édité à la main les met tous à `false`, le service
+    /// retombe sur le temps calendaire pur.
+    #[serde(default = "d::count_signal")]
+    pub count_keyboard_mouse: bool,
+    /// Activité XInput (boutons / sticks / gâchettes).
+    #[serde(default = "d::count_signal")]
+    pub count_gamepad: bool,
+    /// Session audio WASAPI active — une appli émet du son.
+    #[serde(default = "d::count_signal")]
+    pub count_audio: bool,
+    /// Session SMTC en état « lecture » — couvre la vidéo mutée dans
+    /// le lecteur/l'onglet, dont le flux audio est arrêté.
+    #[serde(default = "d::count_signal")]
+    pub count_media: bool,
+
     // --- Time authority ---
     /// When `true`, the scheduler uses `SystemTime::now()` + Windows
     /// local TZ (public / permissive mode). When `false` (default),

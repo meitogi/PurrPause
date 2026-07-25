@@ -430,7 +430,7 @@ fn ui_general(ui: &mut egui::Ui, cfg: &mut Config, dirty: &mut bool) {
         )
         .on_hover_text(
             "Coché (défaut) : l'intervalle se compte en temps \
-             d'activité (clavier, souris, gamepad, vidéo/audio). \
+             d'activité (signaux cochés ci-dessous). \
              L'inactivité ≥ 1 min met le compteur en pause.\n\
              Décoché : l'intervalle se compte en temps calendaire \
              pur, même quand tu ne fais rien.",
@@ -439,6 +439,60 @@ fn ui_general(ui: &mut egui::Ui, cfg: &mut Config, dirty: &mut bool) {
     {
         *dirty = true;
     }
+
+    // Per-signal toggles. The last checked signal is locked so the
+    // set can never end up empty from the UI (an empty set would
+    // devolve to wall-clock counting — see the schema doc).
+    ui.add_enabled_ui(cfg.count_active_time, |ui| {
+        ui.indent("activity_signals", |ui| {
+            let checked = [
+                cfg.count_keyboard_mouse,
+                cfg.count_gamepad,
+                cfg.count_audio,
+                cfg.count_media,
+            ]
+            .iter()
+            .filter(|b| **b)
+            .count();
+            let mut signal = |ui: &mut egui::Ui, value: &mut bool, label: &str, hover: &str| {
+                let locked = *value && checked == 1;
+                if ui
+                    .add_enabled(!locked, egui::Checkbox::new(value, label))
+                    .on_hover_text(hover)
+                    .changed()
+                {
+                    *dirty = true;
+                }
+            };
+            signal(
+                ui,
+                &mut cfg.count_keyboard_mouse,
+                "Clavier / souris",
+                "Toute frappe ou mouvement de souris compte comme activité.",
+            );
+            signal(
+                ui,
+                &mut cfg.count_gamepad,
+                "Manette",
+                "Toute activité manette (boutons, sticks, gâchettes) compte.",
+            );
+            signal(
+                ui,
+                &mut cfg.count_audio,
+                "Audio en lecture",
+                "Une application qui émet du son compte — vidéo, musique, jeu. \
+                 Muter dans le mixeur Windows compte toujours.",
+            );
+            signal(
+                ui,
+                &mut cfg.count_media,
+                "Média en lecture (même muté)",
+                "Un lecteur multimédia en état « lecture » compte, même si le \
+                 son est coupé dans le lecteur ou l'onglet — YouTube, VLC, \
+                 Spotify…",
+            );
+        });
+    });
 
     // ── Test ──
     ui.add_space(12.0);

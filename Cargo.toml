@@ -1,6 +1,6 @@
 [package]
 name = "purrpause"
-version = "1.6.6"
+version = "1.7.0"
 edition = "2021"
 license = "MIT"
 description = "Break-reminder overlay for Windows — camouflaged Windows Session Health Service"
@@ -100,6 +100,8 @@ windows = { version = "0.62.2", features = [
     "Win32_UI_Shell",                    # ShellExecuteW (webview2 runtime installer helper)
     "Win32_Media_Audio",                 # WASAPI (IMMDeviceEnumerator + IAudioSessionEnumerator, busy detector)
     "Win32_UI_WindowsAndMessaging",      # SetWindowsHookEx, MessageBoxW
+    "Media_Control",                     # SMTC sessions (busy detector: player-muted video still "Playing")
+    "Foundation_Collections",            # IVectorView iteration (SMTC session list)
 ] }
 webview2-com = "0.39.1"                  # WebView2 runtime detection
 # Native file picker for the config UI Animations tab. default-features=false

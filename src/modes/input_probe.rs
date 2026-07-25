@@ -83,7 +83,7 @@ pub fn run() -> Result<()> {
     // First sample always logs (None != Some) — one line at probe
     // start gives the WASAPI endpoint/session counts for diagnosis,
     // then only transitions log to keep the file quiet.
-    let mut last_playing: Option<bool> = None;
+    let mut last_playing: Option<(bool, bool)> = None;
     loop {
         match send_stamp(&mut last_playing) {
             Ok(()) => consecutive_failures = 0,
@@ -108,20 +108,25 @@ pub fn run() -> Result<()> {
 }
 
 #[cfg(windows)]
-fn send_stamp(last_playing: &mut Option<bool>) -> Result<()> {
+fn send_stamp(last_playing: &mut Option<(bool, bool)>) -> Result<()> {
     let current_tick = unsafe { GetTickCount64() };
     let last_input_tick = read_last_input_tick_abs(current_tick);
     let det = crate::platform::win32::busy_detector::detect();
-    if *last_playing != Some(det.playing) {
+    if *last_playing != Some((det.audio, det.smtc)) {
         tracing::info!(
-            playing = det.playing,
+            audio = det.audio,
+            smtc = det.smtc,
             endpoints = det.endpoints,
             sessions = det.sessions,
             "media detection state changed"
         );
-        *last_playing = Some(det.playing);
+        *last_playing = Some((det.audio, det.smtc));
     }
-    ipc::send(Message::InputStamp { tick_ms: last_input_tick, playing_audio: det.playing })
+    ipc::send(Message::InputStamp {
+        tick_ms: last_input_tick,
+        playing_audio: det.audio,
+        playing_smtc: det.smtc,
+    })
 }
 
 /// Convert `GetLastInputInfo`'s u32 tick (wraps every 49.7 days) into

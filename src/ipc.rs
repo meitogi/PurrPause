@@ -7,7 +7,8 @@
 //   0x02                             Reload
 //   0x03                             Shutdown
 //   0x04 + 8 LE bytes (u64 tick_ms)
-//        + 1 flag byte (0x00/0x01)   InputStamp
+//        + 1 flag byte (bit0 audio,
+//          bit1 smtc — 0x00..=0x03)  InputStamp
 //   0x05                             RearmDailyPause
 //
 // Pipe name blends into native Windows-service pipe conventions
@@ -39,10 +40,13 @@ pub enum Message {
     /// Absolute `GetTickCount64` tick of the last user input, pushed
     /// by the user-session input probe every ~5 s. Replaces the b.8
     /// file-based transport at `<exe_dir>/Data/lastinput.dat`.
-    /// `playing_audio` rides along : WASAPI session enumeration is
-    /// session-scoped like `GetLastInputInfo`, so the probe samples
-    /// both signals in the user session and ships them together.
-    InputStamp { tick_ms: u64, playing_audio: bool },
+    /// Media flags ride along : media detection (WASAPI render
+    /// sessions + SMTC transport state) is session-scoped like
+    /// `GetLastInputInfo`, so the probe samples everything in the
+    /// user session and ships it together. The two media bits stay
+    /// separate so the service can apply the per-signal activity
+    /// toggles from the config.
+    InputStamp { tick_ms: u64, playing_audio: bool, playing_smtc: bool },
     /// Clear the "daily pause already fired today" marker so the noon
     /// pause can fire again the same day. Sent from the Pause midi tab ;
     /// resets the in-memory fired-at / palier-bitmask / skipped-today
@@ -59,9 +63,13 @@ impl Message {
             [0x01] => Some(Message::TriggerPopupNow),
             [0x02] => Some(Message::Reload),
             [0x03] => Some(Message::Shutdown),
-            [0x04, b0, b1, b2, b3, b4, b5, b6, b7, flag @ (0x00 | 0x01)] => {
+            [0x04, b0, b1, b2, b3, b4, b5, b6, b7, flag @ 0x00..=0x03] => {
                 let tick_ms = u64::from_le_bytes([*b0, *b1, *b2, *b3, *b4, *b5, *b6, *b7]);
-                Some(Message::InputStamp { tick_ms, playing_audio: *flag == 0x01 })
+                Some(Message::InputStamp {
+                    tick_ms,
+                    playing_audio: flag & 0x01 != 0,
+                    playing_smtc: flag & 0x02 != 0,
+                })
             }
             [0x05] => Some(Message::RearmDailyPause),
             _ => None,
@@ -75,11 +83,11 @@ impl Message {
             Message::TriggerPopupNow => vec![0x01],
             Message::Reload => vec![0x02],
             Message::Shutdown => vec![0x03],
-            Message::InputStamp { tick_ms, playing_audio } => {
+            Message::InputStamp { tick_ms, playing_audio, playing_smtc } => {
                 let mut v = Vec::with_capacity(10);
                 v.push(0x04);
                 v.extend_from_slice(&tick_ms.to_le_bytes());
-                v.push(playing_audio as u8);
+                v.push(playing_audio as u8 | (playing_smtc as u8) << 1);
                 v
             }
             Message::RearmDailyPause => vec![0x05],
@@ -528,14 +536,21 @@ mod tests {
 
     #[test]
     fn parse_input_stamp() {
-        // 0x04 tag + LE u64 for tick_ms = 0x0123_4567_89AB_CDEF + flag.
-        for (flag, playing_audio) in [(0x00u8, false), (0x01, true)] {
+        // 0x04 tag + LE u64 for tick_ms = 0x0123_4567_89AB_CDEF + flag
+        // bitfield (bit0 audio, bit1 smtc).
+        for (flag, playing_audio, playing_smtc) in [
+            (0x00u8, false, false),
+            (0x01, true, false),
+            (0x02, false, true),
+            (0x03, true, true),
+        ] {
             let bytes = [0x04, 0xEF, 0xCD, 0xAB, 0x89, 0x67, 0x45, 0x23, 0x01, flag];
             assert_eq!(
                 Message::parse(&bytes),
                 Some(Message::InputStamp {
                     tick_ms: 0x0123_4567_89AB_CDEF,
                     playing_audio,
+                    playing_smtc,
                 })
             );
         }
@@ -563,10 +578,10 @@ mod tests {
 
     #[test]
     fn parse_input_stamp_invalid_flag_returns_none() {
-        // Flag must be exactly 0x00 or 0x01 — same strictness rationale
-        // as the unit variants (no smuggled intent).
+        // Flag must stay within the two defined bits — same strictness
+        // rationale as the unit variants (no smuggled intent).
         assert_eq!(
-            Message::parse(&[0x04, 0, 0, 0, 0, 0, 0, 0, 0, 0x02]),
+            Message::parse(&[0x04, 0, 0, 0, 0, 0, 0, 0, 0, 0x04]),
             None
         );
     }
@@ -598,11 +613,13 @@ mod tests {
     fn to_bytes_input_stamp_roundtrip() {
         for tick_ms in [0u64, 1, 5_000, u32::MAX as u64, u64::MAX] {
             for playing_audio in [false, true] {
-                let msg = Message::InputStamp { tick_ms, playing_audio };
-                let bytes = msg.to_bytes();
-                assert_eq!(bytes.len(), 10, "InputStamp must encode to 10 bytes");
-                assert_eq!(bytes[0], 0x04);
-                assert_eq!(Message::parse(&bytes), Some(msg));
+                for playing_smtc in [false, true] {
+                    let msg = Message::InputStamp { tick_ms, playing_audio, playing_smtc };
+                    let bytes = msg.to_bytes();
+                    assert_eq!(bytes.len(), 10, "InputStamp must encode to 10 bytes");
+                    assert_eq!(bytes[0], 0x04);
+                    assert_eq!(Message::parse(&bytes), Some(msg));
+                }
             }
         }
     }
@@ -624,10 +641,11 @@ mod tests {
 
     #[test]
     fn client_wire_shape_input_stamp_is_0x04_plus_le_u64_plus_flag() {
-        // tick_ms = 1, playing → [0x04, 0x01, 0×7, 0x01] LE + flag.
+        // tick_ms = 1, audio + smtc → [0x04, 0x01, 0×7, 0x03] LE + bits.
         assert_eq!(
-            Message::InputStamp { tick_ms: 1, playing_audio: true }.to_bytes(),
-            vec![0x04, 0x01, 0, 0, 0, 0, 0, 0, 0, 0x01]
+            Message::InputStamp { tick_ms: 1, playing_audio: true, playing_smtc: true }
+                .to_bytes(),
+            vec![0x04, 0x01, 0, 0, 0, 0, 0, 0, 0, 0x03]
         );
     }
 

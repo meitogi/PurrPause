@@ -58,6 +58,9 @@ pub mod d {
     pub const fn count_active_time() -> bool {
         true
     }
+    pub const fn count_signal() -> bool {
+        true
+    }
     pub fn rotation_mode() -> RotationMode {
         RotationMode::Random
     }

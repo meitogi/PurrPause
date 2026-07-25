@@ -58,6 +58,9 @@ pub struct InputStampState {
     /// the user session (session-scoped API, unreadable from Session 0
     /// — see `busy_detector.rs`).
     pub playing_audio: bool,
+    /// SMTC "any transport session reports Playing" flag — catches a
+    /// video muted in the player/tab whose audio stream is stopped.
+    pub playing_smtc: bool,
 }
 
 /// Seconds since the last keyboard or mouse input on the interactive
@@ -82,17 +85,26 @@ pub fn idle_seconds(state: Option<&InputStampState>) -> u64 {
     idle_ms / 1000
 }
 
-/// True if the user-session probe last reported an active WASAPI
-/// render session AND the stamp is fresh. Missing / stale state →
-/// false : no worse than the pre-1.6.1 behavior (a Session 0 call
-/// always returned false) and, combined with `idle_seconds` reading 0
-/// on the same stale state, the tick errs toward "assume active"
-/// without double-counting a dead probe as media time.
-pub fn media_playing(state: Option<&InputStampState>) -> bool {
+/// True if the user-session probe last reported media playing on an
+/// ENABLED signal (audio / SMTC toggles from the config) AND the stamp
+/// is fresh. Missing / stale state → false : no worse than the
+/// pre-1.6.1 behavior (a Session 0 call always returned false) and,
+/// combined with `idle_seconds` reading 0 on the same stale state, the
+/// tick errs toward "assume active" without double-counting a dead
+/// probe as media time.
+pub fn media_playing(
+    state: Option<&InputStampState>,
+    count_audio: bool,
+    count_media: bool,
+) -> bool {
     let Some(s) = state else {
         return false;
     };
     let current_tick = unsafe { GetTickCount64() };
     let staleness_ms = current_tick.saturating_sub(s.received_at_tick_ms);
-    crate::signals::media_playing_decision(s.playing_audio, staleness_ms, MAX_PROBE_STALENESS_MS)
+    crate::signals::media_playing_decision(
+        s.playing_audio && count_audio || s.playing_smtc && count_media,
+        staleness_ms,
+        MAX_PROBE_STALENESS_MS,
+    )
 }
