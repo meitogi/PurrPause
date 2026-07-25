@@ -12,15 +12,15 @@
 /// per tick, plus one `role=total` aggregate row per tick.
 pub const TSV_HEADER: &str = "timestamp\tfilename\textension\trenderer\tpid\trole\tcpu_ms\tcpu_pct\tgpu_pct\tgpu_mem_bytes\tworkingset_bytes\tprivate_bytes";
 
-/// Renderer label written in every bench row, keyed by the animation's
-/// file extension so rows are comparable across formats in one log:
+/// Renderer label keyed purely by file extension, for the formats where
+/// the extension alone determines the engine:
 ///   `.lottie`                       -> `thorvg-sw`  (software WASM)
 ///   `.svg/.gif/.webp/.png/.apng`    -> `img-native` (WebView `<img>` decode)
 ///   `.webm`                         -> `video-native`
 ///   `.riv`                          -> `rive-gpu`   (WebGL2 GPU renderer)
 /// Unknown extensions map to `thorvg-sw` to match the popup mount's
-/// unknown->Lottie fallback. Skottie adds its own label in a later
-/// rollout session.
+/// unknown->Lottie fallback. `.lottie` here always yields the ThorVG
+/// baseline — a renderer-aware caller uses [`renderer_label`] instead.
 pub fn renderer_label_for_ext(ext: &str) -> &'static str {
     match ext {
         "lottie" => "thorvg-sw",
@@ -28,6 +28,19 @@ pub fn renderer_label_for_ext(ext: &str) -> &'static str {
         "webm" => "video-native",
         "riv" => "rive-gpu",
         _ => "thorvg-sw",
+    }
+}
+
+/// Renderer label taking BOTH the extension and the resolved engine. Only
+/// `.lottie` has two engines for one extension (ThorVG-SW vs Skottie-GPU),
+/// so a Skottie `.lottie` gets `skottie-gpu` while everything else defers
+/// to [`renderer_label_for_ext`]. Written into the `renderer` column so the
+/// same `.lottie` fixture is directly comparable across engines in one log.
+pub fn renderer_label(ext: &str, renderer: crate::config::Renderer) -> &'static str {
+    use crate::config::Renderer;
+    match (ext, renderer) {
+        ("lottie", Renderer::SkottieGpu) => "skottie-gpu",
+        _ => renderer_label_for_ext(ext),
     }
 }
 
@@ -242,6 +255,20 @@ mod tests {
         // Unknown ext mirrors the mount's unknown->Lottie fallback.
         assert_eq!(renderer_label_for_ext("xyz"), "thorvg-sw");
         assert_eq!(renderer_label_for_ext(""), "thorvg-sw");
+    }
+
+    #[test]
+    fn renderer_label_is_renderer_aware_for_lottie() {
+        use crate::config::Renderer;
+        // Same `.lottie` extension, two engines → two labels.
+        assert_eq!(renderer_label("lottie", Renderer::ThorvgSw), "thorvg-sw");
+        assert_eq!(renderer_label("lottie", Renderer::SkottieGpu), "skottie-gpu");
+        // The renderer field is meaningless for non-Lottie formats — they
+        // stay extension-keyed regardless of the entry's renderer value.
+        assert_eq!(renderer_label("riv", Renderer::SkottieGpu), "rive-gpu");
+        assert_eq!(renderer_label("webm", Renderer::ThorvgSw), "video-native");
+        assert_eq!(renderer_label("svg", Renderer::SkottieGpu), "img-native");
+        assert_eq!(renderer_label("xyz", Renderer::ThorvgSw), "thorvg-sw");
     }
 
     #[test]

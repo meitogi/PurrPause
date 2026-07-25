@@ -3,7 +3,7 @@ pub mod defaults;
 pub mod schema;
 
 #[allow(unused_imports)] // AnimationEntry + RotationMode are consumed by the popup / config UI wired later
-pub use schema::{AnimationEntry, Config, PreNotif, RotationMode};
+pub use schema::{AnimationEntry, Config, PreNotif, Renderer, RotationMode};
 
 use std::fs;
 use std::io::Write;
@@ -87,11 +87,27 @@ mod tests {
             display_name: "Chat qui danse".to_string(),
             scale: 1.5,
             offset_y_vh: -10,
+            renderer: Renderer::SkottieGpu,
         });
 
         let text = toml::to_string(&cfg).unwrap();
         let back: Config = toml::from_str(&text).unwrap();
         assert_eq!(cfg, back);
+    }
+
+    #[test]
+    fn animation_entry_defaults_renderer_when_absent() {
+        // Pre-Skottie state.dat has no `renderer` key — #[serde(default)]
+        // must fill in the ThorVG baseline so old configs still load.
+        let legacy = r#"
+            file = "embed:dance-cat"
+            enabled = true
+            display_name = "Chat qui danse"
+            scale = 1.5
+            offset_y_vh = 0
+        "#;
+        let e: AnimationEntry = toml::from_str(legacy).unwrap();
+        assert_eq!(e.renderer, Renderer::ThorvgSw);
     }
 
     #[test]

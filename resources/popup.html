@@ -271,6 +271,7 @@
 </head>
 <body data-remaining-seconds="{{ COUNTDOWN_SECONDS }}"
       data-animation-path="{{ ANIMATION_PATH }}"
+      data-renderer="{{ RENDERER }}"
       data-countdown-template="{{ COUNTDOWN_TEMPLATE }}"
       data-mode="{{ POPUP_MODE }}"
       data-debug="{{ DEBUG_MODE }}"
@@ -962,9 +963,77 @@
       });
     }
 
+    // Skottie (Skia's Lottie player) via CanvasKit/WebGL — the GPU engine
+    // for a `.lottie` when its AnimationEntry.renderer = SkottieGpu. CanvasKit
+    // is a classic (non-module) script exposing a global CanvasKitInit, loaded
+    // lazily here so a ThorVG-rendered `.lottie` pulls zero CanvasKit bytes.
+    //
+    // Skottie needs raw bodymovin JSON, but a `.lottie` is a ZIP container, so
+    // we fetch the popup's virtual `<path>.json` URL — the Rust custom-protocol
+    // handler unzips the largest animations/*.json on the fly. The animation is
+    // contain-fit into the canvas (like Rive's Fit.Contain), then the shared
+    // --stage-scale / --stage-offset-y CSS transform frames it like every format.
+    async function mountSkottie() {
+      await new Promise((resolve, reject) => {
+        const s = document.createElement('script');
+        s.src = './vendor/skottie/canvaskit.js';
+        s.onload = resolve;
+        s.onerror = () => reject(new Error('vendor/skottie/canvaskit.js missing'));
+        document.head.appendChild(s);
+      });
+      const CanvasKit = await CanvasKitInit({
+        locateFile: f => new URL('./vendor/skottie/' + f, location.href).href,
+      });
+
+      const jsonStr = await (await fetch(path + '.json')).text();
+      const anim = CanvasKit.MakeManagedAnimation(jsonStr);
+      if (!anim) { console.error('[skottie] MakeManagedAnimation returned null'); return; }
+
+      const canvas = document.createElement('canvas');
+      canvas.id = 'anim';
+      canvas.className = 'stage';
+      // Match mountLottie's devicePixelRatio:1 — the software baseline paints
+      // at CSS pixels, so the GPU engine must too for a fair A/B and to keep
+      // the working set comparable. Fullscreen kiosk: size once, no resize.
+      canvas.width = window.innerWidth;
+      canvas.height = window.innerHeight;
+      document.body.prepend(canvas);
+
+      const surface =
+        CanvasKit.MakeWebGLCanvasSurface(canvas) || CanvasKit.MakeCanvasSurface(canvas);
+      if (!surface) { console.error('[skottie] no drawing surface (WebGL + raster both failed)'); return; }
+
+      // Contain-fit the animation's native size into the canvas, centered.
+      const size = anim.size();
+      const aw = size[0] || canvas.width;
+      const ah = size[1] || canvas.height;
+      const fit = Math.min(canvas.width / aw, canvas.height / ah);
+      const dw = aw * fit, dh = ah * fit;
+      const dx = (canvas.width - dw) / 2, dy = (canvas.height - dh) / 2;
+      const dst = CanvasKit.LTRBRect(dx, dy, dx + dw, dy + dh);
+
+      const duration = anim.duration(); // seconds
+      const t0 = performance.now();
+      const drawFrame = skCanvas => {
+        const t = duration > 0 ? (((performance.now() - t0) / 1000) % duration) / duration : 0;
+        anim.seek(t);
+        skCanvas.clear(CanvasKit.TRANSPARENT);
+        anim.render(skCanvas, dst);
+        surface.requestAnimationFrame(drawFrame);
+      };
+      console.info('[skottie] loaded:', path, 'size:', aw + 'x' + ah, 'dur:', duration + 's');
+      surface.requestAnimationFrame(drawFrame);
+    }
+
     switch (ext) {
       case 'lottie':
-        mountLottie();
+        // The only format with two engines for one extension : the entry's
+        // renderer (data-renderer) picks Skottie-GPU vs the ThorVG baseline.
+        if ((document.body.dataset.renderer || 'thorvg') === 'skottie') {
+          mountSkottie();
+        } else {
+          mountLottie();
+        }
         break;
       case 'svg':
       case 'gif':
@@ -1019,6 +1088,7 @@
             mountedEl: animEl ? animEl.tagName.toLowerCase() : null,
             riveLoaded: !!window.rive,
             dotlottieLoaded: !!customElements.get('dotlottie-wc'),
+            skottieLoaded: typeof window.CanvasKitInit === 'function',
             vendorResources,
           };
           if (window.ipc && typeof window.ipc.postMessage === 'function') {

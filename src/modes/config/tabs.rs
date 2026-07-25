@@ -21,7 +21,7 @@ use crate::config::defaults::{
     DEFAULT_POPUP_TITLE, DEFAULT_POPUP_WINDOW_TITLE,
     DEFAULT_WIZARD_PASSWORD_HINT, DEFAULT_WIZARD_WELCOME,
 };
-use crate::config::{defaults, AnimationEntry, Config, PreNotif, RotationMode};
+use crate::config::{defaults, AnimationEntry, Config, PreNotif, Renderer, RotationMode};
 use crate::modes::install::STATE_DAT;
 use crate::runtime_dat;
 use crate::scheduler;
@@ -837,6 +837,7 @@ fn ui_animations(ui: &mut egui::Ui, cfg: &mut Config, dirty: &mut bool, bench: &
                             display_name: name,
                             scale: 1.0,
                             offset_y_vh: 0,
+                            renderer: Renderer::ThorvgSw,
                         });
                         *dirty = true;
                     }
@@ -886,6 +887,36 @@ fn ui_animations(ui: &mut egui::Ui, cfg: &mut Config, dirty: &mut bool, bench: &
                     .changed()
                 {
                     row_changed = true;
+                }
+                // Renderer picker — only `.lottie` has two engines (ThorVG-SW
+                // vs Skottie-GPU) ; every other format is dispatched by
+                // extension, so the field is meaningless there. Gate on the
+                // *resolved* path so the `embed:*` defaults (which lack a
+                // literal `.lottie` suffix) still count as Lottie.
+                if crate::modes::popup::resolve_animation_url(&anim.file).ends_with(".lottie") {
+                    ui.separator();
+                    ui.label("Moteur :");
+                    let before = anim.renderer;
+                    egui::ComboBox::from_id_salt(("renderer", i))
+                        .selected_text(match anim.renderer {
+                            Renderer::ThorvgSw => "ThorVG (CPU)",
+                            Renderer::SkottieGpu => "Skottie (GPU)",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut anim.renderer,
+                                Renderer::ThorvgSw,
+                                "ThorVG (CPU)",
+                            );
+                            ui.selectable_value(
+                                &mut anim.renderer,
+                                Renderer::SkottieGpu,
+                                "Skottie (GPU)",
+                            );
+                        });
+                    if anim.renderer != before {
+                        row_changed = true;
+                    }
                 }
             });
         });
@@ -939,6 +970,7 @@ fn ui_animations(ui: &mut egui::Ui, cfg: &mut Config, dirty: &mut bool, bench: &
                                 display_name: name,
                                 scale: 1.0,
                                 offset_y_vh: 0,
+                                renderer: Renderer::ThorvgSw,
                             });
                             *dirty = true;
                         }

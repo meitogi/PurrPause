@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use super::schema::{AnimationEntry, PreNotif, RotationMode};
+use super::schema::{AnimationEntry, PreNotif, Renderer, RotationMode};
 
 /// Empty by default — un-titled fullscreen borderless popup is
 /// cleaner in Alt-Tab / Task Manager (no visible label). The parent
@@ -106,6 +106,12 @@ pub mod d {
     pub fn animation_offset_y_vh() -> i8 {
         0
     }
+    /// Default render engine for a Lottie entry = ThorVG software rasterizer,
+    /// the historical baseline. Old `state.dat` files (pre-Skottie) have no
+    /// `renderer` key and deserialize to this.
+    pub fn animation_renderer() -> Renderer {
+        Renderer::ThorvgSw
+    }
     /// Default `false` = anti-tamper mode ON : `time_authority` queries
     /// NTP/HTTPS and falls back silently to `SystemTime::now()` if
     /// offline. Setting `true` is the escape hatch for public /
@@ -166,6 +172,7 @@ pub mod d {
                 display_name: "Chat qui danse".to_string(),
                 scale: 1.5,
                 offset_y_vh: 0,
+                renderer: Renderer::ThorvgSw,
             },
             AnimationEntry {
                 file: "embed:sleep-cat".to_string(),
@@ -173,6 +180,7 @@ pub mod d {
                 display_name: "Chat qui dort".to_string(),
                 scale: 2.6,
                 offset_y_vh: -11,
+                renderer: Renderer::ThorvgSw,
             },
         ]
     }

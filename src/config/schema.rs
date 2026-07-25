@@ -219,6 +219,21 @@ pub struct AnimationEntry {
     /// Range clamped in the config UI to `-50..=50`.
     #[serde(default = "d::animation_offset_y_vh")]
     pub offset_y_vh: i8,
+    /// Which engine renders this animation. Only meaningful for `.lottie`
+    /// entries — every other format is dispatched purely by extension. Lets
+    /// the same `.lottie` be rendered by ThorVG (software) or Skottie (GPU).
+    #[serde(default = "d::animation_renderer")]
+    pub renderer: Renderer,
+}
+
+/// Render engine for a `.lottie` animation. Ignored for non-Lottie formats
+/// (those are picked by file extension). `ThorvgSw` = the vendored
+/// dotlottie-wc software rasterizer (baseline) ; `SkottieGpu` = Skia's
+/// Skottie via CanvasKit/WebGL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Renderer {
+    ThorvgSw,
+    SkottieGpu,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

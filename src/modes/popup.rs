@@ -9,7 +9,7 @@
 // the popup.html's ES module imports and WASM fetches resolve against a
 // same-origin scheme — WebView2 restricts several APIs on file:// origins.
 
-use crate::config::{AnimationEntry, Config, RotationMode};
+use crate::config::{AnimationEntry, Config, Renderer, RotationMode};
 
 const FALLBACK_ANIM_PATH: &str = "animations/dance-cat.lottie";
 
@@ -68,8 +68,8 @@ pub fn animation_pick(
     }
 }
 
-/// Pure HTML template renderer. Applies eight `str::replace` calls in
-/// deterministic order.
+/// Pure HTML template renderer. Applies a deterministic sequence of
+/// `str::replace` calls, one per `{{ PLACEHOLDER }}` token.
 ///
 /// **No HTML-escaping.** Config strings originate from the passcode-gated
 /// config UI on the same machine — the threat model does not include
@@ -86,9 +86,16 @@ pub fn render_html(
     devtools: bool,
     stage_scale: f32,
     stage_offset_y_vh: i8,
+    renderer: Renderer,
 ) -> String {
     let mode = if preview { "preview" } else { "live" };
     let debug_mode = if debug { "true" } else { "false" };
+    // Lowercase token the popup mount script reads off `data-renderer` to
+    // pick mountLottie (ThorVG) vs mountSkottie (GPU) for a `.lottie`.
+    let renderer_token = match renderer {
+        Renderer::ThorvgSw => "thorvg",
+        Renderer::SkottieGpu => "skottie",
+    };
     // "1" when the popup self-diagnoses (WebGL renderer + conditional-import
     // proof over window.ipc) and keeps the context menu; "0" on a real
     // scheduled popup, which suppresses right-click instead.
@@ -117,17 +124,19 @@ pub fn render_html(
         .replace("{{ DEVTOOLS }}", devtools_flag)
         .replace("{{ STAGE_SCALE }}", &format!("{stage_scale:.2}"))
         .replace("{{ STAGE_OFFSET_Y_VH }}", &stage_offset_y_vh.to_string())
+        .replace("{{ RENDERER }}", renderer_token)
 }
 
-/// Resolve `(scale, offset_y_vh)` for the animation at `anim_file`. If
-/// the config has an `AnimationEntry` for that file, its per-entry
-/// values win. Otherwise fall back to `(1.0, 0)` — the CSS defaults.
-pub fn stage_params(cfg: &Config, anim_file: &str) -> (f32, i8) {
+/// Resolve `(scale, offset_y_vh, renderer)` for the animation at
+/// `anim_file`. If the config has an `AnimationEntry` for that file, its
+/// per-entry values win. Otherwise fall back to `(1.0, 0, ThorvgSw)` — the
+/// CSS + baseline-engine defaults.
+pub fn stage_params(cfg: &Config, anim_file: &str) -> (f32, i8, Renderer) {
     cfg.animations
         .iter()
         .find(|e| e.file == anim_file)
-        .map(|e| (e.scale, e.offset_y_vh))
-        .unwrap_or((1.0, 0))
+        .map(|e| (e.scale, e.offset_y_vh, e.renderer))
+        .unwrap_or((1.0, 0, Renderer::ThorvgSw))
 }
 
 #[cfg(windows)]
@@ -296,7 +305,12 @@ mod windows_impl {
     ///
     /// Tick 1 is a baseline (cpu columns 0 — no previous CPU totals) ;
     /// analysis discards the first row group.
-    fn run_bench_sampler(secs: u32, anim_file: &str, anim_ext: &str) -> Result<()> {
+    fn run_bench_sampler(
+        secs: u32,
+        anim_file: &str,
+        anim_ext: &str,
+        renderer: crate::config::Renderer,
+    ) -> Result<()> {
         use std::io::Write;
 
         let exe = std::env::current_exe().context("current_exe")?;
@@ -351,9 +365,9 @@ mod windows_impl {
                 total.gpu_mem_bytes += row.gpu_mem_bytes;
                 total.workingset_bytes += row.workingset_bytes;
                 total.private_bytes += row.private_bytes;
-                writeln!(file, "{}", crate::bench::tsv_row(&ts, anim_file, anim_ext, crate::bench::renderer_label_for_ext(anim_ext), row))?;
+                writeln!(file, "{}", crate::bench::tsv_row(&ts, anim_file, anim_ext, crate::bench::renderer_label(anim_ext, renderer), row))?;
             }
-            writeln!(file, "{}", crate::bench::tsv_row(&ts, anim_file, anim_ext, crate::bench::renderer_label_for_ext(anim_ext), &total))?;
+            writeln!(file, "{}", crate::bench::tsv_row(&ts, anim_file, anim_ext, crate::bench::renderer_label(anim_ext, renderer), &total))?;
             file.flush()?;
         }
         tracing::info!("bench: sampling window complete");
@@ -442,10 +456,11 @@ mod windows_impl {
             picked_path
         };
 
-        // Resolve per-anim scale + offset. Present in the AnimationEntry
-        // list → use those. Absent (e.g. fallback anim or a testing-only
-        // override that isn't in the config) → CSS defaults (1.0, 0).
-        let (scale, offset_y_vh) = stage_params(&cfg, &anim_path);
+        // Resolve per-anim scale + offset + renderer. Present in the
+        // AnimationEntry list → use those. Absent (e.g. fallback anim or a
+        // testing-only override that isn't in the config) → defaults
+        // (1.0, 0, ThorVG-SW).
+        let (scale, offset_y_vh, renderer) = stage_params(&cfg, &anim_path);
 
         // `anim_path` may be an opaque `embed:*` identifier (default
         // shipped assets) OR a real relative path (user-added). Map
@@ -492,6 +507,7 @@ mod windows_impl {
             devtools,
             scale,
             offset_y_vh,
+            renderer,
         );
 
         tracing::info!(
@@ -860,8 +876,11 @@ mod windows_impl {
         if let Some(secs) = bench_secs {
             let bench_proxy = event_loop.create_proxy();
             let (anim_file, anim_ext) = crate::bench::split_anim_name(&anim_path);
+            // `renderer` (Copy) is the same value threaded into render_html —
+            // so the bench label matches what actually rendered (a `.lottie`
+            // run tagged skottie-gpu vs thorvg-sw per the entry's choice).
             std::thread::spawn(move || {
-                if let Err(e) = run_bench_sampler(secs, &anim_file, &anim_ext) {
+                if let Err(e) = run_bench_sampler(secs, &anim_file, &anim_ext, renderer) {
                     tracing::warn!(error = ?e, "bench sampler failed");
                 }
                 // Sent on the error path too — the popup must always
@@ -1278,6 +1297,38 @@ mod windows_impl {
                 .body(Cow::Owned(rendered_popup_html.as_bytes().to_vec()))
                 .unwrap_or_else(|_| empty_response());
         }
+        // Virtual `<name>.lottie.json` — Skottie (mountSkottie) needs raw
+        // bodymovin JSON, but a `.lottie` is a ZIP. Strip `.json`, load the
+        // real `.lottie` bytes, unzip the largest `animations/*.json` entry
+        // and serve it. Keeps the single `.lottie` source for both engines
+        // (no pre-extracted duplicate on disk / in the schema).
+        if let Some(lottie_path) = path.strip_suffix(".json") {
+            if lottie_path.ends_with(".lottie") {
+                return match crate::embedded::get_any(lottie_path) {
+                    Some(bytes) => match crate::lottie_sanitize::extract_bodymovin_json(&bytes) {
+                        Ok(json) => wry::http::Response::builder()
+                            .status(200)
+                            .header("Content-Type", "application/json")
+                            .body(Cow::Owned(json))
+                            .unwrap_or_else(|_| empty_response()),
+                        Err(e) => {
+                            tracing::warn!(path, error = %e, "skottie: unzip bodymovin JSON failed");
+                            wry::http::Response::builder()
+                                .status(500)
+                                .body(Cow::Owned(Vec::new()))
+                                .unwrap_or_else(|_| empty_response())
+                        }
+                    },
+                    None => {
+                        tracing::warn!(lottie_path, "skottie: source .lottie not found for virtual json");
+                        wry::http::Response::builder()
+                            .status(404)
+                            .body(Cow::Owned(Vec::new()))
+                            .unwrap_or_else(|_| empty_response())
+                    }
+                };
+            }
+        }
         // Lookup order : disk override (dev iterating on shipped
         // assets) → embedded (single-exe default) → disk-only
         // (user-added animations, wildcard files that aren't baked in).
@@ -1364,7 +1415,7 @@ mod windows_impl {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{AnimationEntry, Config, RotationMode};
+    use crate::config::{AnimationEntry, Config, Renderer, RotationMode};
 
     fn anim(name: &str, enabled: bool) -> AnimationEntry {
         AnimationEntry {
@@ -1373,6 +1424,7 @@ mod tests {
             display_name: name.to_string(),
             scale: 1.0,
             offset_y_vh: 0,
+            renderer: Renderer::ThorvgSw,
         }
     }
 
@@ -1460,6 +1512,7 @@ mod tests {
             false,
             1.0,
             0,
+            Renderer::ThorvgSw,
         );
         assert!(!out.contains("{{"));
         assert!(!out.contains("}}"));
@@ -1481,6 +1534,7 @@ mod tests {
             false,
             1.0,
             0,
+            Renderer::ThorvgSw,
         );
         assert!(out.contains("Pause dans {mm}:{ss}"));
     }
@@ -1498,6 +1552,7 @@ mod tests {
             false,
             1.0,
             0,
+            Renderer::ThorvgSw,
         );
         assert!(out.contains(r#"data-remaining-seconds="10""#));
         assert!(out.contains(r#"data-mode="preview""#));
@@ -1517,6 +1572,7 @@ mod tests {
             false,
             1.0,
             0,
+            Renderer::ThorvgSw,
         );
         assert!(out.contains("<title>Windows Session Health</title>"));
         // And live mode should mark data-mode accordingly.
@@ -1541,6 +1597,7 @@ mod tests {
             false,
             1.0,
             0,
+            Renderer::ThorvgSw,
         );
         assert!(out.contains("<title>Windows Session Health (preview)</title>"));
         assert!(out.contains(r#"data-mode="preview""#));
@@ -1550,7 +1607,18 @@ mod tests {
     fn stage_scale_and_offset_substituted() {
         let cfg = Config::default();
         let tpl = r#"<style>:root { --stage-scale: {{ STAGE_SCALE }}; --stage-offset-y: {{ STAGE_OFFSET_Y_VH }}vh; }</style>"#;
-        let out = render_html(tpl, &cfg, "animations/foo.lottie", 60, false, false, false, 1.5, -12);
+        let out = render_html(
+            tpl,
+            &cfg,
+            "animations/foo.lottie",
+            60,
+            false,
+            false,
+            false,
+            1.5,
+            -12,
+            Renderer::ThorvgSw,
+        );
         assert!(out.contains("--stage-scale: 1.50"));
         assert!(out.contains("--stage-offset-y: -12vh"));
         assert!(!out.contains("{{ STAGE_SCALE }}"));
@@ -1564,9 +1632,31 @@ mod tests {
         // menu; "0" (real scheduled popup) suppresses right-click instead.
         let cfg = Config::default();
         let tpl = r#"<body data-devtools="{{ DEVTOOLS }}"></body>"#;
-        let on = render_html(tpl, &cfg, "animations/foo.lottie", 60, false, false, true, 1.0, 0);
+        let on = render_html(
+            tpl,
+            &cfg,
+            "animations/foo.lottie",
+            60,
+            false,
+            false,
+            true,
+            1.0,
+            0,
+            Renderer::ThorvgSw,
+        );
         assert!(on.contains(r#"data-devtools="1""#));
-        let off = render_html(tpl, &cfg, "animations/foo.lottie", 60, false, false, false, 1.0, 0);
+        let off = render_html(
+            tpl,
+            &cfg,
+            "animations/foo.lottie",
+            60,
+            false,
+            false,
+            false,
+            1.0,
+            0,
+            Renderer::ThorvgSw,
+        );
         assert!(off.contains(r#"data-devtools="0""#));
     }
 
@@ -1579,8 +1669,48 @@ mod tests {
             display_name: "Dance".to_string(),
             scale: 2.6,
             offset_y_vh: -11,
+            renderer: Renderer::SkottieGpu,
         });
-        assert_eq!(stage_params(&cfg, "animations/dance.lottie"), (2.6, -11));
-        assert_eq!(stage_params(&cfg, "animations/unknown.lottie"), (1.0, 0));
+        assert_eq!(
+            stage_params(&cfg, "animations/dance.lottie"),
+            (2.6, -11, Renderer::SkottieGpu)
+        );
+        // Unknown file → CSS + baseline-engine defaults.
+        assert_eq!(
+            stage_params(&cfg, "animations/unknown.lottie"),
+            (1.0, 0, Renderer::ThorvgSw)
+        );
+    }
+
+    #[test]
+    fn render_html_emits_renderer_token() {
+        let cfg = Config::default();
+        let tpl = r#"<body data-renderer="{{ RENDERER }}"></body>"#;
+        let thorvg = render_html(
+            tpl,
+            &cfg,
+            "animations/foo.lottie",
+            60,
+            false,
+            false,
+            false,
+            1.0,
+            0,
+            Renderer::ThorvgSw,
+        );
+        assert!(thorvg.contains(r#"data-renderer="thorvg""#));
+        let skottie = render_html(
+            tpl,
+            &cfg,
+            "animations/foo.lottie",
+            60,
+            false,
+            false,
+            false,
+            1.0,
+            0,
+            Renderer::SkottieGpu,
+        );
+        assert!(skottie.contains(r#"data-renderer="skottie""#));
     }
 }

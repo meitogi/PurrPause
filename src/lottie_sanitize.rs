@@ -95,6 +95,32 @@ pub fn sanitize_lottie_bytes(bytes: &[u8]) -> Result<(Vec<u8>, SanitizeReport)> 
     Ok((out.into_inner(), report))
 }
 
+/// Extract the bodymovin JSON from a `.lottie` (dotLottie ZIP) — the
+/// largest `animations/*.json` entry. A `.lottie` is a ZIP container, but
+/// Skottie's `MakeManagedAnimation` wants raw bodymovin JSON, so the popup's
+/// custom-protocol handler serves this on the fly at a virtual
+/// `<name>.lottie.json` URL. Returned bytes are the entry as stored — the
+/// same content ThorVG renders, so both engines composite an identical
+/// source (any white-solid stripping already happened at ingest via
+/// [`sanitize_lottie_in_place`]).
+pub fn extract_bodymovin_json(bytes: &[u8]) -> Result<Vec<u8>> {
+    let cursor = Cursor::new(bytes);
+    let mut zin = zip::ZipArchive::new(cursor).context("open .lottie as ZIP")?;
+    let mut best: Option<Vec<u8>> = None;
+    for i in 0..zin.len() {
+        let mut entry = zin.by_index(i).context("read zip entry")?;
+        if !is_animation_json(entry.name()) {
+            continue;
+        }
+        let mut data = Vec::with_capacity(entry.size() as usize);
+        entry.read_to_end(&mut data).context("read entry bytes")?;
+        if best.as_ref().map_or(true, |b| data.len() > b.len()) {
+            best = Some(data);
+        }
+    }
+    best.context("no animations/*.json entry in .lottie")
+}
+
 fn is_animation_json(name: &str) -> bool {
     name.starts_with("animations/") && name.ends_with(".json")
 }
@@ -239,6 +265,31 @@ mod tests {
         let cleaned = read_anim_entry(&out);
         assert_eq!(cleaned["layers"].as_array().unwrap().len(), 1);
         assert_eq!(cleaned["layers"][0]["nm"], "Cat");
+    }
+
+    #[test]
+    fn extract_bodymovin_json_returns_animation_entry() {
+        let anim = r#"{"w":600,"h":600,"layers":[{"ty":4,"nm":"Cat"}]}"#;
+        let bytes = build_lottie(anim);
+        let json = extract_bodymovin_json(&bytes).unwrap();
+        let v: Value = serde_json::from_slice(&json).unwrap();
+        assert_eq!(v["w"], 600);
+        assert_eq!(v["layers"][0]["nm"], "Cat");
+    }
+
+    #[test]
+    fn extract_bodymovin_json_errors_without_animation() {
+        // A ZIP with only a manifest → no animations/*.json → error.
+        let options: zip::write::SimpleFileOptions =
+            zip::write::SimpleFileOptions::default();
+        let mut out = Cursor::new(Vec::<u8>::new());
+        {
+            let mut zout = zip::ZipWriter::new(&mut out);
+            zout.start_file("manifest.json", options).unwrap();
+            zout.write_all(br#"{"animations":[]}"#).unwrap();
+            zout.finish().unwrap();
+        }
+        assert!(extract_bodymovin_json(&out.into_inner()).is_err());
     }
 
     #[test]

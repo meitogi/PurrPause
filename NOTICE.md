@@ -57,6 +57,23 @@ download time and are not enumerated here.
   `resources/vendor/dotlottie-wc/base-dotlottie-wc-BqyUGr__.js`)
 - **Purpose** : templating layer bundled inside dotlottie-wc.
 
+### `@rive-app/webgl2` — Rive WebGL2 runtime
+- **Version** : 2.39.1
+- **License** : MIT (Copyright Rive Inc.)
+- **Location in tree** : `resources/vendor/rive/rive.js` + `rive.wasm`
+- **Purpose** : GPU (WebGL2) renderer for `.riv` vector animations,
+  mounted inside the WebView2 popup.
+
+### `canvaskit-wasm` (Skia / Skottie) — GPU Lottie runtime
+- **Version** : 0.41.1
+- **License** : BSD-3-Clause (Copyright Google LLC ; see
+  `resources/vendor/skottie/` and the Skia LICENSE)
+- **Location in tree** : `resources/vendor/skottie/canvaskit.js` +
+  `canvaskit.wasm`
+- **Purpose** : Skia's CanvasKit (WebGL) build, including Skottie
+  (`MakeManagedAnimation`), the GPU renderer for `.lottie` animations
+  whose entry selects the Skottie engine.
+
 ## Icon and watermark PNGs
 
 - `resources/cat-icon.png` and `resources/cat-watermark.png` are

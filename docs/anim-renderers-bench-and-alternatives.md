@@ -36,7 +36,18 @@ summed across the tree, so they can exceed 100.
 | WebP | `<img>` (native) | 119.2 | 38.7 | 1011 MB | 332 MB | −25 % |
 | APNG | `<img>` (native) | 123.4 | 35.4 | 1017 MB | 333 MB | −22 % |
 | SVG (SMIL) | `<img>` (native) | 131.9 | 46.8 | 689 MB | 398 MB | −17 % |
-| **Lottie** | dotLottie / ThorVG (WASM, **software**) | **158.7** | 40.4 | 633 MB | 332 MB | baseline |
+| **Lottie (Skottie)** | Skia / CanvasKit (WASM, **GPU**) | _pending_ | _pending_ | _pending_ | _pending_ | _pending_ |
+| **Lottie (ThorVG)** | dotLottie / ThorVG (WASM, **software**) | **158.7** | 40.4 | 633 MB | 332 MB | baseline |
+
+> **Skottie row — pending the session-4 three-way host smoke.** Skottie is
+> Skia's Lottie player, run on the GPU via CanvasKit/WebGL. It renders the
+> **same** `.lottie` fixture as the ThorVG-software baseline — selected per
+> entry via the `renderer` field — so its row is the direct GPU-vs-software
+> comparison for one identical animation. Back-fill `cpu_pct` / `gpu_pct` /
+> working-set / private from `bench.log` (`renderer=skottie-gpu` rows) once the
+> Parallels aarch64 smoke runs, and answer: does GPU-Lottie close the
+> Lottie→Rive CPU gap (159 % → 112 %) now that compositing is confirmed
+> hardware D3D11?
 
 Conditional loading verified: a Lottie popup fetches only
 `vendor/dotlottie-wc/*`, a Rive popup only `vendor/rive/*`, and the
@@ -56,9 +67,11 @@ img/video formats pull **zero** engine bytes (pure native elements).
 - **Raster (GIF / WebP / APNG)** is cheaper on CPU than Lottie but costs
   **~1 GB working set** (every decoded frame held in memory) and carries
   quality limits (GIF = 1-bit alpha). Poor trade.
-- A **GPU-Lottie** renderer (Skottie / CanvasKit, or ThorVG's GL/WebGPU
-  backend) is the one contender not yet measured here — it may close the
-  Lottie→Rive gap. To be benchmarked.
+- A **GPU-Lottie** renderer (Skottie / CanvasKit) is now **wired** (the
+  `renderer` field flips a `.lottie` between ThorVG-software and Skottie-GPU
+  on the same file) — its numbers land with the session-4 three-way host
+  smoke and back-fill the `skottie-gpu` row above. This closes the comparator:
+  it is the last engine, deliberately no third GPU spike beyond it.
 
 **Recommendation (inside the current WebView2 stack)** : prefer **alpha WebM**
 when the content allows it, else **Rive** for vector; avoid ThorVG-software
