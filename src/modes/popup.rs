@@ -311,7 +311,13 @@ mod windows_impl {
             .context("ProcSampler::new")?;
         tracing::info!(secs, log = %log_path.display(), "bench: sampling started");
 
-        let ticks = (secs as u64).saturating_mul(1000) / crate::bench::BENCH_TICK_MS;
+        // secs == 0 : unlimited window — sample until the popup process
+        // exits (the sampler thread dies with it).
+        let ticks = if secs == 0 {
+            u64::MAX
+        } else {
+            (secs as u64).saturating_mul(1000) / crate::bench::BENCH_TICK_MS
+        };
         let mut last_tick = std::time::Instant::now();
         for _ in 0..ticks {
             std::thread::sleep(Duration::from_millis(crate::bench::BENCH_TICK_MS));
@@ -819,8 +825,12 @@ mod windows_impl {
                     tracing::warn!(error = ?e, "bench sampler failed");
                 }
                 // Sent on the error path too — the popup must always
-                // auto-exit once the bench window is over.
-                let _ = bench_proxy.send_event(UserEvent::BenchDone);
+                // auto-exit once the bench window is over. Exception :
+                // the unlimited window (secs == 0) samples alongside a
+                // normally-behaving popup, which owns its own exit.
+                if secs != 0 {
+                    let _ = bench_proxy.send_event(UserEvent::BenchDone);
+                }
             });
         }
 

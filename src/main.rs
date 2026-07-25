@@ -244,7 +244,8 @@ enum Mode {
         /// so the dismiss countdown resumes at the right offset (or
         /// activates immediately if elapsed >= duration).
         elapsed_seconds: Option<u32>,
-        /// `Some(secs)` when spawned with `--bench [--bench-secs N]`
+        /// `Some(secs)` when spawned with `--bench [--bench-secs N]`.
+        /// `N = 0` : unlimited — sample until the popup exits normally.
         /// (config UI Animations tab, Benchmark checkbox). The popup
         /// samples its process tree's CPU/GPU/memory every 500 ms into
         /// `Data\Logs\bench.log` and self-exits after N seconds.
