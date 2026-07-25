@@ -35,7 +35,7 @@ pub fn renderer_label_for_ext(ext: &str) -> &'static str {
 pub const BENCH_TICK_MS: u64 = 500;
 
 /// Bench window when `--bench` is passed without `--bench-secs`.
-pub const DEFAULT_BENCH_SECS: u32 = 10;
+pub const DEFAULT_BENCH_SECS: u32 = 60;
 
 /// One sampled process at one tick. `cpu_pct` / `gpu_pct` are percent
 /// of ONE core / engine-sum and may exceed 100.
