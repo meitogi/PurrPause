@@ -13,6 +13,7 @@
 mod config;
 mod embedded;
 mod ipc;
+mod ipc_popup;
 mod lottie_sanitize;
 mod modes;
 mod password;
@@ -107,6 +108,8 @@ fn mode_needs_webview2(mode: &Mode) -> bool {
             | Mode::Uninstall
             | Mode::Countdown { .. }
             | Mode::Sandbox { .. }
+            // Headless pipe client — no UI at all.
+            | Mode::PopupIpc { .. }
             // Pure-egui config UI — no WebView2 needed.
             | Mode::Config { first_run: false }
     )
@@ -268,6 +271,12 @@ enum Mode {
     /// to the SYSTEM service over the named-pipe IPC every ~5 s. See
     /// modes::input_probe for the Session 0 isolation rationale.
     InputProbe,
+    /// Developer smoke vehicle for the popup content pipe : sends one
+    /// framed `PopupMessage` to the live popup running as `pid`.
+    /// Undocumented in user-facing help ; `Dismiss` / `RestartCountdown`
+    /// have no production sender yet, this flag is how the host smoke
+    /// exercises them against a real WebView2 popup.
+    PopupIpc { pid: u32, spec: Vec<String> },
     /// Passcode-gated uninstall flow.
     Uninstall,
     /// Rollback partial install if wizard was cancelled.
@@ -298,6 +307,13 @@ fn classify_mode(args: &[String]) -> Mode {
         Some("--countdown") => parse_countdown(args),
         Some("--config") => Mode::Config {
             first_run: args.iter().any(|a| a == "--first-run"),
+        },
+        Some("--popup-ipc") => match args.get(1).and_then(|s| s.parse::<u32>().ok()) {
+            Some(pid) => Mode::PopupIpc {
+                pid,
+                spec: args[2..].to_vec(),
+            },
+            None => Mode::Unknown(args.to_vec()),
         },
         Some("--watchdog") => Mode::Watchdog,
         Some("--uninstall") => Mode::Uninstall,
@@ -379,6 +395,36 @@ fn parse_countdown(args: &[String]) -> Mode {
     Mode::Countdown { seconds, palier, debug, config_override, mode }
 }
 
+/// Parse the `--popup-ipc` message spec into a wire message.
+/// Grammar :
+///   dismiss
+///   restart <palier_minutes> <seconds_until>
+///   update <title> <subtitle> <dismiss_label> <duration_secs> <interval|daily-pause>
+fn parse_popup_ipc_spec(spec: &[String]) -> Option<ipc_popup::PopupMessage> {
+    match spec.first().map(String::as_str)? {
+        "dismiss" if spec.len() == 1 => Some(ipc_popup::PopupMessage::Dismiss),
+        "restart" if spec.len() == 3 => Some(ipc_popup::PopupMessage::RestartCountdown {
+            palier_minutes: spec[1].parse().ok()?,
+            seconds_until: spec[2].parse().ok()?,
+        }),
+        "update" if spec.len() == 6 => {
+            let mode = match spec[5].as_str() {
+                "interval" => ipc_popup::PopupContentMode::Interval,
+                "daily-pause" => ipc_popup::PopupContentMode::DailyPause,
+                _ => return None,
+            };
+            Some(ipc_popup::PopupMessage::UpdateContent {
+                title: spec[1].clone(),
+                subtitle: spec[2].clone(),
+                dismiss_label: spec[3].clone(),
+                duration_secs: spec[4].parse().ok()?,
+                mode,
+            })
+        }
+        _ => None,
+    }
+}
+
 fn dispatch(mode: Mode) -> anyhow::Result<()> {
     match mode {
         Mode::InstallOrConfig => modes::install::run()?,
@@ -400,6 +446,14 @@ fn dispatch(mode: Mode) -> anyhow::Result<()> {
             anyhow::bail!("config wizard is Windows-only")
         }
         Mode::Sandbox { preset } => modes::sandbox::run(&preset)?,
+        Mode::PopupIpc { pid, spec } => {
+            let msg = parse_popup_ipc_spec(&spec).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "bad --popup-ipc spec (dismiss | restart <palier> <secs> | update <title> <subtitle> <label> <secs> <interval|daily-pause>)"
+                )
+            })?;
+            ipc_popup::send_to_popup(pid, &msg)?;
+        }
         Mode::Uninstall => modes::uninstall::run()?,
         Mode::Unknown(argv) => {
             eprintln!("Unknown argv: {argv:?}");
@@ -639,6 +693,97 @@ mod tests {
                 config_override: None,
                 mode: Some("daily-pause".to_string()),
             }
+        );
+    }
+
+    #[test]
+    fn popup_ipc_mode_classified() {
+        assert_eq!(
+            classify_mode(&as_args(["--popup-ipc", "1234", "dismiss"])),
+            Mode::PopupIpc {
+                pid: 1234,
+                spec: vec!["dismiss".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn popup_ipc_missing_or_bad_pid_is_unknown() {
+        assert!(matches!(
+            classify_mode(&as_args(["--popup-ipc"])),
+            Mode::Unknown(_)
+        ));
+        assert!(matches!(
+            classify_mode(&as_args(["--popup-ipc", "not-a-pid", "dismiss"])),
+            Mode::Unknown(_)
+        ));
+    }
+
+    #[test]
+    fn parse_popup_ipc_spec_dismiss() {
+        assert_eq!(
+            parse_popup_ipc_spec(&as_args(["dismiss"])),
+            Some(ipc_popup::PopupMessage::Dismiss)
+        );
+    }
+
+    #[test]
+    fn parse_popup_ipc_spec_restart() {
+        assert_eq!(
+            parse_popup_ipc_spec(&as_args(["restart", "15", "900"])),
+            Some(ipc_popup::PopupMessage::RestartCountdown {
+                palier_minutes: 15,
+                seconds_until: 900,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_popup_ipc_spec_update_daily() {
+        assert_eq!(
+            parse_popup_ipc_spec(&as_args([
+                "update", "Pause", "On mange", "Fini", "1800", "daily-pause"
+            ])),
+            Some(ipc_popup::PopupMessage::UpdateContent {
+                title: "Pause".to_string(),
+                subtitle: "On mange".to_string(),
+                dismiss_label: "Fini".to_string(),
+                duration_secs: 1800,
+                mode: ipc_popup::PopupContentMode::DailyPause,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_popup_ipc_spec_update_interval() {
+        assert_eq!(
+            parse_popup_ipc_spec(&as_args(["update", "T", "S", "L", "60", "interval"])),
+            Some(ipc_popup::PopupMessage::UpdateContent {
+                title: "T".to_string(),
+                subtitle: "S".to_string(),
+                dismiss_label: "L".to_string(),
+                duration_secs: 60,
+                mode: ipc_popup::PopupContentMode::Interval,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_popup_ipc_spec_garbage_is_none() {
+        assert_eq!(parse_popup_ipc_spec(&[]), None);
+        assert_eq!(parse_popup_ipc_spec(&as_args(["frob"])), None);
+        // Wrong arity for each verb.
+        assert_eq!(parse_popup_ipc_spec(&as_args(["dismiss", "extra"])), None);
+        assert_eq!(parse_popup_ipc_spec(&as_args(["restart", "15"])), None);
+        assert_eq!(
+            parse_popup_ipc_spec(&as_args(["update", "T", "S", "L", "60"])),
+            None
+        );
+        // Bad numeric / mode values.
+        assert_eq!(parse_popup_ipc_spec(&as_args(["restart", "x", "900"])), None);
+        assert_eq!(
+            parse_popup_ipc_spec(&as_args(["update", "T", "S", "L", "60", "weekly"])),
+            None
         );
     }
 }

@@ -714,9 +714,9 @@
         const tpl = document.body.dataset.countdownTemplate || '{mm}:{ss}';
         return tpl.replace(/\{mm\}/g, m).replace(/\{ss\}/g, r);
       };
-      const initial = parseInt(
+      let initial = parseInt(
         document.body.dataset.remainingSeconds || '0', 10);
-      const startAt = Date.now();
+      let startAt = Date.now();
       const wallRemaining = () => {
         const elapsedSecs = Math.floor((Date.now() - startAt) / 1000);
         return Math.max(0, initial - elapsedSecs);
@@ -748,6 +748,29 @@
           console.log('dismiss');
         }
       });
+
+      // Rust → WebView content-update bridge (service→popup pipe).
+      // Payload is a JSON object built with serde_json on the Rust
+      // side, so quoting / escaping are structurally safe. All fields
+      // optional : a countdown-only restart passes just durationSecs.
+      window.purrpauseApplyUpdate = function (p) {
+        if (!p) return;
+        const titleEl = document.getElementById('title');
+        const subtitleEl = document.getElementById('subtitle');
+        if (titleEl && typeof p.title === 'string') titleEl.textContent = p.title;
+        if (subtitleEl && typeof p.subtitle === 'string') subtitleEl.textContent = p.subtitle;
+        if (typeof p.dismissLabel === 'string') dismiss.textContent = p.dismissLabel;
+        if (typeof p.mode === 'string') document.body.dataset.popupKind = p.mode;
+        if (typeof p.durationSecs === 'number' && isFinite(p.durationSecs)) {
+          initial = Math.max(0, Math.floor(p.durationSecs));
+          startAt = Date.now();
+          if (document.body.dataset.mode !== 'preview') {
+            dismiss.disabled = true;
+            dismiss.classList.remove('pulse');
+          }
+          render();
+        }
+      };
     })();
   </script>
 

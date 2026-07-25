@@ -47,6 +47,30 @@ pub(super) fn clamp_cas_d_elapsed(elapsed_secs: u64, duration_secs: u64) -> u32 
     elapsed_secs.min(duration_secs) as u32
 }
 
+/// Inputs of the session-4 daily↔interval collision decision, resolved
+/// by the tick loop from scheduler state + the live child handle.
+pub(super) struct DailyCollisionInputs {
+    /// The daily pause should fire now : enabled, not fired / skipped
+    /// today, and `now_local` inside `[fire_at, grace_window_end]`.
+    pub daily_due: bool,
+    pub popup_pending: bool,
+    /// HANDLE-based liveness of the tracked popup child.
+    pub popup_child_alive: bool,
+    /// The live child IS already the daily popup (`popup_pid` match) —
+    /// nothing to convert.
+    pub current_popup_is_daily: bool,
+}
+
+/// Should the service mutate the RUNNING popup over its content pipe ?
+/// The scheduler's `popup_pending` guard defers `FireDailyPause` for as
+/// long as a popup is up, so without this path a noon collision would
+/// wait for the interval popup to be dismissed. When true, the tick
+/// loop sends `UpdateContent` over the popup's per-PID pipe (fallback :
+/// kill+respawn) instead of waiting.
+pub(super) fn daily_collision_wants_update(i: &DailyCollisionInputs) -> bool {
+    i.daily_due && i.popup_pending && i.popup_child_alive && !i.current_popup_is_daily
+}
+
 #[cfg(test)]
 mod tick_helper_tests {
     use super::*;
@@ -83,6 +107,62 @@ mod tick_helper_tests {
     fn clamp_cas_d_elapsed_zero_stays_zero() {
         assert_eq!(clamp_cas_d_elapsed(0, 1800), 0);
     }
+
+    fn collision_inputs() -> DailyCollisionInputs {
+        // Baseline = the one combination that DOES trigger the in-place
+        // update ; each test flips one field off it.
+        DailyCollisionInputs {
+            daily_due: true,
+            popup_pending: true,
+            popup_child_alive: true,
+            current_popup_is_daily: false,
+        }
+    }
+
+    #[test]
+    fn collision_updates_when_interval_popup_alive_and_daily_due() {
+        assert!(daily_collision_wants_update(&collision_inputs()));
+    }
+
+    #[test]
+    fn collision_none_when_not_daily_due() {
+        let i = DailyCollisionInputs {
+            daily_due: false,
+            ..collision_inputs()
+        };
+        assert!(!daily_collision_wants_update(&i));
+    }
+
+    #[test]
+    fn collision_none_when_no_popup_pending() {
+        // Not pending = no popup up = the normal FireDailyPause path
+        // owns the fire ; the collision path must stay out.
+        let i = DailyCollisionInputs {
+            popup_pending: false,
+            ..collision_inputs()
+        };
+        assert!(!daily_collision_wants_update(&i));
+    }
+
+    #[test]
+    fn collision_none_when_child_dead() {
+        // Pending true but child gone (crashed / killed) : the retry /
+        // cold-start paths own recovery, not the pipe.
+        let i = DailyCollisionInputs {
+            popup_child_alive: false,
+            ..collision_inputs()
+        };
+        assert!(!daily_collision_wants_update(&i));
+    }
+
+    #[test]
+    fn collision_none_when_current_popup_is_already_daily() {
+        let i = DailyCollisionInputs {
+            current_popup_is_daily: true,
+            ..collision_inputs()
+        };
+        assert!(!daily_collision_wants_update(&i));
+    }
 }
 
 #[cfg(windows)]
@@ -115,7 +195,10 @@ mod win {
     use crate::platform::win32::proc_kill::{is_pid_alive, kill_orphan_webview2_workers};
     use crate::platform::win32::spawn_user::{RealSpawner, SpawnedChild};
     use crate::platform::win32::{busy_detector, gamepad, idle, power_notify};
-    use crate::platform::{spawn_replacing, spawn_replacing_keyed, spawn_replacing_with_env};
+    use crate::platform::{
+        spawn_replacing, spawn_replacing_keyed, spawn_replacing_with_env,
+        update_or_spawn_replacing_with_env, UpdateOrSpawn,
+    };
     use crate::runtime_dat;
     use crate::scheduler::{self, SchedulerDecision};
     use crate::signals;
@@ -1256,6 +1339,137 @@ mod win {
                         *daily_pause_skipped_today,
                     );
 
+                    // 4b. Daily↔interval collision (session 4). While an
+                    //     interval popup is up, the scheduler's
+                    //     popup_pending guard defers FireDailyPause until
+                    //     dismissal ; instead of waiting, mutate the
+                    //     RUNNING popup's DOM over its per-PID content
+                    //     pipe (PID stable, no WebView2 flash). Pipe
+                    //     unreachable → fall back to kill+respawn with
+                    //     the exact fire_popup_daily argv/env. Note : an
+                    //     updated (formerly interval) popup lacks
+                    //     PURRPAUSE_FROZEN_TZ — cosmetic-null today, the
+                    //     popup body renders no TZ-dependent text.
+                    let daily_due = daily_state.enabled
+                        && !fired_today
+                        && !daily_state.skipped_today
+                        && now_local >= daily_state.fire_at_today
+                        && now_local <= daily_state.grace_window_end;
+                    let alive_pid = last_popup_child
+                        .as_ref()
+                        .filter(|c| c.try_wait_exited().is_none())
+                        .map(|c| c.pid);
+                    if super::daily_collision_wants_update(&super::DailyCollisionInputs {
+                        daily_due,
+                        popup_pending: *popup_pending,
+                        popup_child_alive: alive_pid.is_some(),
+                        current_popup_is_daily: alive_pid.is_some()
+                            && *popup_pid == alive_pid,
+                    }) {
+                        let target_pid =
+                            alive_pid.expect("wants_update implies a live child");
+                        let dp = &config.daily_pause;
+                        let msg = crate::ipc_popup::PopupMessage::UpdateContent {
+                            title: dp.popup_title.clone(),
+                            subtitle: dp.popup_subtitle.clone(),
+                            dismiss_label: dp.dismiss_button_label.clone(),
+                            duration_secs: u64::from(dp.duration_minutes) * 60,
+                            mode: crate::ipc_popup::PopupContentMode::DailyPause,
+                        };
+                        let passcode_hash = &config.passcode_hash;
+                        let args: Vec<&OsStr> = if passcode_hash.is_empty() {
+                            vec![
+                                OsStr::new("--popup"),
+                                OsStr::new("--no-debug"),
+                                OsStr::new("--mode"),
+                                OsStr::new("daily-pause"),
+                            ]
+                        } else {
+                            vec![
+                                OsStr::new("--popup"),
+                                OsStr::new("--no-debug"),
+                                OsStr::new("--mode"),
+                                OsStr::new("daily-pause"),
+                                OsStr::new("--passcode-hash"),
+                                OsStr::new(passcode_hash),
+                            ]
+                        };
+                        let env = [(
+                            OsStr::new("PURRPAUSE_FROZEN_TZ"),
+                            OsStr::new(dp.timezone.as_str()),
+                        )];
+                        // Same pre-spawn hygiene as fire_popup_daily : the
+                        // sweep only targets ORPHANED msedgewebview2
+                        // workers (dead parent), so running it while the
+                        // live popup is up is harmless — and the fallback
+                        // spawn inside update_or_spawn then starts clean.
+                        if let Some(exe_parent) = exe.parent() {
+                            kill_orphan_webview2_workers(&webview2_dir(exe_parent));
+                        }
+                        match update_or_spawn_replacing_with_env(
+                            &RealSpawner,
+                            exe,
+                            &args,
+                            &env,
+                            last_popup_child,
+                            target_pid,
+                            &msg,
+                            |pid, m| crate::ipc_popup::send_to_popup(pid, m),
+                        ) {
+                            Ok(UpdateOrSpawn::Updated) => {
+                                tracing::info!(
+                                    pid = target_pid,
+                                    "daily collision: running popup updated in place (no respawn)"
+                                );
+                                stamp_daily_fire_success(
+                                    last_popup,
+                                    paused_secs,
+                                    popup_pending,
+                                    last_heartbeat,
+                                    fired,
+                                    daily_pause_fired_at,
+                                    daily_pause_fired_paliers_bits,
+                                    *daily_pause_skipped_today,
+                                    popup_pid,
+                                    target_pid,
+                                    now_authoritative,
+                                );
+                            }
+                            Ok(UpdateOrSpawn::Spawned(child)) => {
+                                let pid = child.pid;
+                                tracing::info!(
+                                    pid,
+                                    "daily collision: pipe unreachable, fell back to kill+respawn"
+                                );
+                                *last_popup_child = Some(child);
+                                stamp_daily_fire_success(
+                                    last_popup,
+                                    paused_secs,
+                                    popup_pending,
+                                    last_heartbeat,
+                                    fired,
+                                    daily_pause_fired_at,
+                                    daily_pause_fired_paliers_bits,
+                                    *daily_pause_skipped_today,
+                                    popup_pid,
+                                    pid,
+                                    now_authoritative,
+                                );
+                            }
+                            Err(e) => {
+                                // Both the pipe AND the fallback spawn
+                                // failed. Nothing stamped — popup_pending
+                                // stays true, the predecessor stays alive,
+                                // and the next tick retries the whole
+                                // collision resolution.
+                                tracing::warn!(
+                                    error = ?e,
+                                    "daily collision: update and respawn both failed - retrying next tick"
+                                );
+                            }
+                        }
+                    }
+
                     match scheduler::next_event(
                         now,
                         config,
@@ -1647,27 +1861,19 @@ mod win {
         match spawn_replacing_with_env(&RealSpawner, exe, &args, &env, last_popup_child) {
             Ok(child) => {
                 tracing::info!(pid = child.pid, "daily-pause popup child spawned");
-                *last_popup = now;
-                *paused_secs = 0;
-                *popup_pending = true;
-                *last_heartbeat = now;
-                *daily_pause_fired_at = Some(now);
-                *daily_pause_fired_paliers_bits = 0;
-                *popup_pid = Some(child.pid);
-                fired.clear();
-                if let Err(e) = runtime_dat::write(&runtime_dat::RuntimeState {
-                    last_popup: now,
-                    paused_secs: 0,
-                    popup_pending: true,
-                    last_heartbeat: now,
-                    last_clean_shutdown_at: SystemTime::UNIX_EPOCH,
-                    daily_pause_fired_at: *daily_pause_fired_at,
-                    daily_pause_fired_paliers_bits: *daily_pause_fired_paliers_bits,
+                stamp_daily_fire_success(
+                    last_popup,
+                    paused_secs,
+                    popup_pending,
+                    last_heartbeat,
+                    fired,
+                    daily_pause_fired_at,
+                    daily_pause_fired_paliers_bits,
                     daily_pause_skipped_today,
-                    popup_pid: *popup_pid,
-                }) {
-                    tracing::warn!(error = ?e, "write runtime.dat failed (daily fire)");
-                }
+                    popup_pid,
+                    child.pid,
+                    now,
+                );
                 *last_popup_child = Some(child);
                 Ok(())
             }
@@ -1679,6 +1885,48 @@ mod win {
                 }
                 Err(e)
             }
+        }
+    }
+
+    /// Bookkeeping shared by every "the daily pause is now live" outcome :
+    /// classic spawn (`fire_popup_daily`), collision in-place update, and
+    /// collision fallback respawn. `new_pid` is the popup now carrying
+    /// the daily content — freshly spawned or converted in place. Same
+    /// persisted bytes as the historical fire_popup_daily success arm.
+    #[allow(clippy::too_many_arguments)]
+    fn stamp_daily_fire_success(
+        last_popup: &mut SystemTime,
+        paused_secs: &mut u64,
+        popup_pending: &mut bool,
+        last_heartbeat: &mut SystemTime,
+        fired: &mut std::collections::HashSet<u32>,
+        daily_pause_fired_at: &mut Option<SystemTime>,
+        daily_pause_fired_paliers_bits: &mut u8,
+        daily_pause_skipped_today: Option<chrono::NaiveDate>,
+        popup_pid: &mut Option<u32>,
+        new_pid: u32,
+        now: SystemTime,
+    ) {
+        *last_popup = now;
+        *paused_secs = 0;
+        *popup_pending = true;
+        *last_heartbeat = now;
+        *daily_pause_fired_at = Some(now);
+        *daily_pause_fired_paliers_bits = 0;
+        *popup_pid = Some(new_pid);
+        fired.clear();
+        if let Err(e) = runtime_dat::write(&runtime_dat::RuntimeState {
+            last_popup: now,
+            paused_secs: 0,
+            popup_pending: true,
+            last_heartbeat: now,
+            last_clean_shutdown_at: SystemTime::UNIX_EPOCH,
+            daily_pause_fired_at: *daily_pause_fired_at,
+            daily_pause_fired_paliers_bits: *daily_pause_fired_paliers_bits,
+            daily_pause_skipped_today,
+            popup_pid: *popup_pid,
+        }) {
+            tracing::warn!(error = ?e, "write runtime.dat failed (daily fire)");
         }
     }
 

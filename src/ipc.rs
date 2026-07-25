@@ -203,6 +203,15 @@ mod win {
         Ignored,
     }
 
+    /// Byte-level result of one overlapped connect+read cycle, shared
+    /// with the popup content pipe (`ipc_popup`) so the delicate
+    /// overlapped machinery lives in exactly one place.
+    pub(crate) enum AcceptFrame {
+        Cancelled,
+        /// Number of bytes read into the caller's buffer.
+        Frame(usize),
+    }
+
     fn is_cancelled(cancel: HANDLE) -> bool {
         // Zero-timeout wait to peek at the event without blocking.
         let handles = [cancel];
@@ -211,6 +220,21 @@ mod win {
     }
 
     fn accept_once(pipe: HANDLE, cancel: HANDLE) -> Result<AcceptOutcome> {
+        let mut buf = [0u8; MAX_MESSAGE_BYTES];
+        Ok(match accept_frame(pipe, cancel, &mut buf)? {
+            AcceptFrame::Cancelled => AcceptOutcome::Cancelled,
+            AcceptFrame::Frame(n) => match Message::parse(&buf[..n]) {
+                Some(msg) => AcceptOutcome::Message(msg),
+                None => AcceptOutcome::Ignored,
+            },
+        })
+    }
+
+    /// Accept one client connection on an inbound message-mode pipe and
+    /// read one framed message into `buf`, honouring `cancel` at every
+    /// blocking point. The caller owns pipe creation, message parsing,
+    /// and disconnect/close.
+    pub(crate) fn accept_frame(pipe: HANDLE, cancel: HANDLE, buf: &mut [u8]) -> Result<AcceptFrame> {
         let connect_event = unsafe { CreateEventW(None, true, false, PCWSTR::null()) }
             .context("CreateEventW(connect)")?;
 
@@ -249,7 +273,7 @@ mod win {
                     let _ = CancelIoEx(pipe, Some(&overlap));
                     let _ = CloseHandle(connect_event);
                 }
-                return Ok(AcceptOutcome::Cancelled);
+                return Ok(AcceptFrame::Cancelled);
             } else {
                 unsafe { let _ = CloseHandle(connect_event); }
                 return Err(anyhow!("WaitForMultipleObjects(connect): {waited:?}"));
@@ -257,9 +281,8 @@ mod win {
         }
 
         // Read one framed message, again with overlapped semantics so
-        // we can honour the cancel event mid-read. Buffer sized for
-        // the largest known variant plus headroom.
-        let mut buf = [0u8; MAX_MESSAGE_BYTES];
+        // we can honour the cancel event mid-read. The caller sizes the
+        // buffer for its own wire format's largest variant.
         let mut read_overlap = OVERLAPPED::default();
         read_overlap.hEvent = connect_event; // reuse : manual-reset, cleared here
         unsafe { let _ = ResetEvent(connect_event); }
@@ -267,7 +290,7 @@ mod win {
         let read_ret = unsafe {
             ReadFile(
                 pipe,
-                Some(&mut buf),
+                Some(buf),
                 None,
                 Some(&mut read_overlap),
             )
@@ -296,7 +319,7 @@ mod win {
                     let _ = CancelIoEx(pipe, Some(&read_overlap));
                     let _ = CloseHandle(connect_event);
                 }
-                return Ok(AcceptOutcome::Cancelled);
+                return Ok(AcceptFrame::Cancelled);
             } else {
                 unsafe { let _ = CloseHandle(connect_event); }
                 return Err(anyhow!("WaitForMultipleObjects(read): {waited:?}"));
@@ -311,21 +334,19 @@ mod win {
         unsafe { let _ = CloseHandle(connect_event); }
         overlapped_result.context("GetOverlappedResult(read)")?;
 
-        Ok(match Message::parse(&buf[..bytes as usize]) {
-            Some(msg) => AcceptOutcome::Message(msg),
-            None => AcceptOutcome::Ignored,
-        })
+        Ok(AcceptFrame::Frame(bytes as usize))
     }
 
     /// Owns a `PSECURITY_DESCRIPTOR` and the `SECURITY_ATTRIBUTES` struct
-    /// that references it. `LocalFree`s on drop.
-    struct SecAttrs {
+    /// that references it. `LocalFree`s on drop. Shared with the popup
+    /// content pipe (`ipc_popup`).
+    pub(crate) struct SecAttrs {
         sd: PSECURITY_DESCRIPTOR,
         sa: SECURITY_ATTRIBUTES,
     }
 
     impl SecAttrs {
-        fn from_sddl(sddl: &str) -> Result<Self> {
+        pub(crate) fn from_sddl(sddl: &str) -> Result<Self> {
             let sddl_wide: HSTRING = sddl.into();
             let mut sd = PSECURITY_DESCRIPTOR::default();
             unsafe {
@@ -346,7 +367,7 @@ mod win {
             Ok(Self { sd, sa })
         }
 
-        fn as_ptr(&self) -> *const SECURITY_ATTRIBUTES {
+        pub(crate) fn as_ptr(&self) -> *const SECURITY_ATTRIBUTES {
             &self.sa as *const _
         }
     }
@@ -402,8 +423,8 @@ mod win {
                 _ => {
                     let err = unsafe { GetLastError() };
                     if err == ERROR_PIPE_BUSY {
-                        // Server is busy accepting another client ; wait
-                        // for its default timeout then retry.
+                        // An instance exists but is mid-accept ; wait for
+                        // its default timeout then retry.
                         let waited = unsafe {
                             WaitNamedPipeW(
                                 PCWSTR::from_raw(name_wide.as_ptr()),
@@ -434,7 +455,7 @@ mod win {
         Err(last_err.unwrap_or_else(|| anyhow!("send: exhausted retries")))
     }
 
-    fn write_frame(handle: HANDLE, bytes: &[u8]) -> Result<()> {
+    pub(crate) fn write_frame(handle: HANDLE, bytes: &[u8]) -> Result<()> {
         let mut written: u32 = 0;
         let ok = unsafe {
             WriteFile(handle, Some(bytes), Some(&mut written), None)
@@ -449,6 +470,9 @@ mod win {
 
 #[cfg(windows)]
 pub use win::{create_cancel_event, run_server, send, SendableHandle};
+
+#[cfg(windows)]
+pub(crate) use win::{accept_frame, write_frame, AcceptFrame, SecAttrs};
 
 #[cfg(not(windows))]
 pub fn send(_msg: Message) -> anyhow::Result<()> {

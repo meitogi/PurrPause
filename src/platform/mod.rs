@@ -85,6 +85,43 @@ pub(crate) fn spawn_replacing_with_env<S: Spawner>(
     Ok(new_child)
 }
 
+/// Outcome of [`update_or_spawn_replacing_with_env`] : the pipe update
+/// kept the running child (PID stable, no WebView2 flash) or the
+/// fallback spawned a replacement.
+pub(crate) enum UpdateOrSpawn<C> {
+    Updated,
+    Spawned(C),
+}
+
+/// Collision kernel (session 4) : try the in-place pipe update first ;
+/// on any send error fall back to [`spawn_replacing_with_env`]
+/// (spawn-first, kill-on-success — a stale popup beats none at all).
+/// `send` is injected so Linux tests can fake the pipe ; the generic
+/// `M` keeps `platform/` free of an `ipc_popup` dependency.
+pub(crate) fn update_or_spawn_replacing_with_env<S: Spawner, M>(
+    spawner: &S,
+    exe: &Path,
+    args: &[&OsStr],
+    env: &[(&OsStr, &OsStr)],
+    predecessor: &mut Option<S::Child>,
+    target_pid: u32,
+    msg: &M,
+    send: impl FnOnce(u32, &M) -> Result<()>,
+) -> Result<UpdateOrSpawn<S::Child>> {
+    match send(target_pid, msg) {
+        Ok(()) => Ok(UpdateOrSpawn::Updated),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                target_pid,
+                "popup pipe update failed ; falling back to kill+respawn"
+            );
+            let child = spawn_replacing_with_env(spawner, exe, args, env, predecessor)?;
+            Ok(UpdateOrSpawn::Spawned(child))
+        }
+    }
+}
+
 /// Same, keyed. Only the same-key predecessor is terminated ; other keys
 /// remain untouched (widget palier isolation).
 pub(crate) fn spawn_replacing_keyed<S: Spawner, K: Hash + Eq + Copy>(
@@ -235,6 +272,111 @@ mod tests {
         }
         // 4 spawns → 3 terminations of the first 3 PIDs, in order.
         assert_eq!(spawner.terminated(), vec![1000, 1001, 1002]);
+    }
+
+    // -------- update_or_spawn_replacing_with_env (session-4 collision kernel) --------
+
+    #[test]
+    fn update_or_spawn_pipe_ok_keeps_predecessor_and_spawns_nothing() {
+        let spawner = FakeSpawner::new();
+        let mut prev: Option<FakeChild> = None;
+        let c1 = spawn_replacing(&spawner, dummy_exe(), &[], &mut prev).unwrap();
+        let c1_pid = c1.pid();
+        prev = Some(c1);
+
+        let outcome = update_or_spawn_replacing_with_env(
+            &spawner,
+            dummy_exe(),
+            &[],
+            &[],
+            &mut prev,
+            c1_pid,
+            &"payload",
+            |_, _| Ok(()),
+        )
+        .unwrap();
+
+        assert!(matches!(outcome, UpdateOrSpawn::Updated));
+        // Predecessor kept, nothing terminated, nothing spawned.
+        assert_eq!(prev.as_ref().unwrap().pid(), c1_pid);
+        assert!(spawner.terminated().is_empty());
+    }
+
+    #[test]
+    fn update_or_spawn_pipe_fail_spawns_and_terminates_predecessor() {
+        let spawner = FakeSpawner::new();
+        let mut prev: Option<FakeChild> = None;
+        let c1 = spawn_replacing(&spawner, dummy_exe(), &[], &mut prev).unwrap();
+        let c1_pid = c1.pid();
+        prev = Some(c1);
+
+        let outcome = update_or_spawn_replacing_with_env(
+            &spawner,
+            dummy_exe(),
+            &[],
+            &[],
+            &mut prev,
+            c1_pid,
+            &"payload",
+            |_, _| anyhow::bail!("pipe down"),
+        )
+        .unwrap();
+
+        match outcome {
+            UpdateOrSpawn::Spawned(child) => assert_eq!(child.pid(), 1001),
+            UpdateOrSpawn::Updated => panic!("expected fallback spawn"),
+        }
+        assert_eq!(spawner.terminated(), vec![c1_pid]);
+    }
+
+    #[test]
+    fn update_or_spawn_pipe_fail_and_spawn_fail_preserves_predecessor() {
+        let spawner = FakeSpawner::new();
+        let mut prev: Option<FakeChild> = None;
+        let c1 = spawn_replacing(&spawner, dummy_exe(), &[], &mut prev).unwrap();
+        let c1_pid = c1.pid();
+        prev = Some(c1);
+
+        spawner.fail_next_spawn();
+        let result = update_or_spawn_replacing_with_env(
+            &spawner,
+            dummy_exe(),
+            &[],
+            &[],
+            &mut prev,
+            c1_pid,
+            &"payload",
+            |_, _| anyhow::bail!("pipe down"),
+        );
+
+        assert!(result.is_err());
+        // Predecessor MUST survive intact, untouched.
+        assert_eq!(prev.as_ref().unwrap().pid(), c1_pid);
+        assert!(spawner.terminated().is_empty());
+    }
+
+    #[test]
+    fn update_or_spawn_send_receives_target_pid_and_msg() {
+        let spawner = FakeSpawner::new();
+        let mut prev: Option<FakeChild> = None;
+        let seen = std::cell::RefCell::new((0u32, String::new()));
+
+        let _ = update_or_spawn_replacing_with_env(
+            &spawner,
+            dummy_exe(),
+            &[],
+            &[],
+            &mut prev,
+            4242,
+            &"the message".to_string(),
+            |pid, m: &String| {
+                *seen.borrow_mut() = (pid, m.clone());
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(&*seen.borrow(), &(4242, "the message".to_string()));
     }
 
     // -------- spawn_replacing_keyed (widget palier state machine) --------

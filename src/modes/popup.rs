@@ -161,7 +161,7 @@ mod windows_impl {
     use anyhow::{Context, Result};
 
     use tao::event::{Event, WindowEvent};
-    use tao::event_loop::{ControlFlow, EventLoopBuilder};
+    use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
     // WindowExtWindows / WindowBuilderExtWindows are imported inside
     // the run() body where the shadow-dance uses them.
     use tao::window::{Fullscreen, WindowBuilder};
@@ -200,6 +200,79 @@ mod windows_impl {
         /// hook silently absorbs further attempts for the rest of this
         /// popup's lifetime.
         PincodeVerdictLocked,
+        /// Service (or the `--popup-ipc` debug CLI) mutated this popup's
+        /// content over the per-PID pipe : daily↔interval collision
+        /// resolution without a respawn. Swaps the visible texts and
+        /// restarts the dismiss countdown with the new duration.
+        IpcUpdateContent {
+            title: String,
+            subtitle: String,
+            dismiss_label: String,
+            duration_secs: u64,
+            mode: crate::ipc_popup::PopupContentMode,
+        },
+        /// Remote dismiss over the pipe. Exits through the same clean
+        /// path as [`UserEvent::Dismiss`] (exit code 0).
+        IpcDismiss,
+        /// Restart only the visible countdown / unlock timer.
+        /// `palier_minutes` is informational (logged).
+        IpcRestartCountdown { palier_minutes: u32, seconds_until: u64 },
+    }
+
+    /// Install the LL keyboard hook (pincode-capturing variant when a
+    /// hash is present). Skipped in debug mode. Extracted from the run()
+    /// body so the IPC re-lock path (a daily-pause UpdateContent landing
+    /// on an already-unlocked popup) can re-install the exact same hook ;
+    /// both call sites run on the tao main thread, satisfying the
+    /// SetWindowsHookEx same-thread rule.
+    fn install_popup_keyboard_hook(
+        debug: bool,
+        passcode_hash: Option<&str>,
+        cap: usize,
+        proxy: EventLoopProxy<UserEvent>,
+    ) -> Result<Option<keyboard_hook::KeyboardHookGuard>> {
+        if debug {
+            tracing::info!("popup: skipping keyboard hook (--debug)");
+            return Ok(None);
+        }
+        let hash_present = passcode_hash.map(|h| !h.is_empty()).unwrap_or(false);
+        let guard = if hash_present && cap > 0 {
+            let g = keyboard_hook::install_keyboard_hook_with_pincode(
+                move |ev| {
+                    let ue = match ev {
+                        keyboard_hook::PincodeEvent::Digit(i) => {
+                            UserEvent::PincodeDigitAccepted(i)
+                        }
+                        keyboard_hook::PincodeEvent::Submit(s) => {
+                            UserEvent::PincodeSubmit(s)
+                        }
+                        keyboard_hook::PincodeEvent::Cancel => UserEvent::PincodeCancel,
+                    };
+                    let _ = proxy.send_event(ue);
+                },
+                cap,
+            )
+            .context("install keyboard hook (with pincode)")?;
+            tracing::info!(cap, "popup: keyboard hook installed with pincode capture");
+            g
+        } else {
+            let g = keyboard_hook::install_keyboard_hook()
+                .context("install keyboard hook")?;
+            tracing::info!(
+                "popup: keyboard hook installed (no pincode - passcode_hash empty)"
+            );
+            g
+        };
+        Ok(Some(guard))
+    }
+
+    /// Seconds since the unix epoch, wall-clock. Basis for the resettable
+    /// countdown deadline shared with the timer thread.
+    fn epoch_secs_now() -> u64 {
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_secs()
     }
 
     pub fn run(
@@ -588,45 +661,13 @@ mod windows_impl {
         // capturing variant with a closure that maps hook events to
         // tao proxy events. Empty / absent hash ⇒ install the plain
         // hook (shortcut suppression only, no unlock path).
-        let mut kb_guard = if debug {
-            tracing::info!("popup: skipping keyboard hook (--debug)");
-            None
-        } else {
-            let hash_present = passcode_hash
-                .as_deref()
-                .map(|h| !h.is_empty())
-                .unwrap_or(false);
-            let cap = cfg.passcode_length as usize;
-            let guard = if hash_present && cap > 0 {
-                let proxy = event_loop.create_proxy();
-                let g = keyboard_hook::install_keyboard_hook_with_pincode(
-                    move |ev| {
-                        let ue = match ev {
-                            keyboard_hook::PincodeEvent::Digit(i) => {
-                                UserEvent::PincodeDigitAccepted(i)
-                            }
-                            keyboard_hook::PincodeEvent::Submit(s) => {
-                                UserEvent::PincodeSubmit(s)
-                            }
-                            keyboard_hook::PincodeEvent::Cancel => UserEvent::PincodeCancel,
-                        };
-                        let _ = proxy.send_event(ue);
-                    },
-                    cap,
-                )
-                .context("install keyboard hook (with pincode)")?;
-                tracing::info!(cap, "popup: keyboard hook installed with pincode capture");
-                g
-            } else {
-                let g = keyboard_hook::install_keyboard_hook()
-                    .context("install keyboard hook")?;
-                tracing::info!(
-                    "popup: keyboard hook installed (no pincode - passcode_hash empty)"
-                );
-                g
-            };
-            Some(guard)
-        };
+        let pincode_cap = cfg.passcode_length as usize;
+        let mut kb_guard = install_popup_keyboard_hook(
+            debug,
+            passcode_hash.as_deref(),
+            pincode_cap,
+            event_loop.create_proxy(),
+        )?;
 
         // Post-countdown unlock timer. After `countdown` seconds
         // (WALL-CLOCK, so system suspend counts) the dismiss button
@@ -647,21 +688,78 @@ mod windows_impl {
         // offset. If elapsed >= duration, `saturating_sub` clamps to 0
         // and the 500 ms polling loop fires CountdownExpired on the
         // very first tick → dismiss button immediately active.
+        // Session 4 : the deadline is a shared atomic (unix epoch secs)
+        // instead of a fixed target so an inbound IPC UpdateContent /
+        // RestartCountdown can re-arm the unlock timer on the live
+        // popup. The thread loops forever (it must survive a re-arm ;
+        // it dies with the process) and de-dupes on the deadline VALUE
+        // so one distinct deadline fires exactly one CountdownExpired.
+        // Degenerate edge : re-arming to the exact epoch second that
+        // already fired is skipped by the de-dupe — requires a
+        // 0-duration re-arm within the same second, acceptable.
         let elapsed_pre = elapsed_seconds.unwrap_or(0) as u64;
         let timer_proxy = event_loop.create_proxy();
-        let timer_secs = (countdown as u64).saturating_sub(elapsed_pre);
-        let start_wall = SystemTime::now();
-        std::thread::spawn(move || loop {
-            std::thread::sleep(Duration::from_millis(500));
-            let elapsed = SystemTime::now()
-                .duration_since(start_wall)
-                .unwrap_or(Duration::ZERO)
-                .as_secs();
-            if elapsed >= timer_secs {
-                let _ = timer_proxy.send_event(UserEvent::CountdownExpired);
-                break;
+        let deadline = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+            epoch_secs_now() + (countdown as u64).saturating_sub(elapsed_pre),
+        ));
+        let timer_deadline = std::sync::Arc::clone(&deadline);
+        std::thread::spawn(move || {
+            use std::sync::atomic::Ordering;
+            let mut fired_for: u64 = 0;
+            loop {
+                std::thread::sleep(Duration::from_millis(500));
+                let d = timer_deadline.load(Ordering::Relaxed);
+                if epoch_secs_now() >= d && fired_for != d {
+                    if timer_proxy.send_event(UserEvent::CountdownExpired).is_err() {
+                        break;
+                    }
+                    fired_for = d;
+                }
             }
         });
+
+        // Per-PID content pipe. Runs for EVERY popup (interval popups
+        // are exactly the ones a daily-pause collision must mutate).
+        // The reader thread owns only a Send proxy ; the parsed
+        // messages' owned Strings move through send_event into the
+        // main thread, which is the sole owner of the webview. Thread
+        // lives until process exit — event_loop.run diverges, so there
+        // is no teardown path to wire.
+        {
+            let ipc_proxy = event_loop.create_proxy();
+            std::thread::spawn(move || {
+                let map = move |msg: crate::ipc_popup::PopupMessage| {
+                    use crate::ipc_popup::PopupMessage as PM;
+                    let ue = match msg {
+                        PM::UpdateContent {
+                            title,
+                            subtitle,
+                            dismiss_label,
+                            duration_secs,
+                            mode,
+                        } => UserEvent::IpcUpdateContent {
+                            title,
+                            subtitle,
+                            dismiss_label,
+                            duration_secs,
+                            mode,
+                        },
+                        PM::Dismiss => UserEvent::IpcDismiss,
+                        PM::RestartCountdown {
+                            palier_minutes,
+                            seconds_until,
+                        } => UserEvent::IpcRestartCountdown {
+                            palier_minutes,
+                            seconds_until,
+                        },
+                    };
+                    let _ = ipc_proxy.send_event(ue);
+                };
+                if let Err(e) = crate::ipc_popup::run_popup_server(map) {
+                    tracing::warn!(error = ?e, "popup ipc server exited");
+                }
+            });
+        }
 
         // Cold-start focus insurance. A daily-pause popup respawned at
         // service boot (Cas D, identified by `--elapsed-seconds`) can
@@ -701,6 +799,10 @@ mod windows_impl {
         // Submit arm — the original event proxy was moved into the hook
         // closure above.
         let locked_proxy = event_loop.create_proxy();
+        // Third proxy, held for the IPC re-lock path : an UpdateContent
+        // landing on an already-unlocked popup re-installs the keyboard
+        // hook, which needs a fresh proxy for its pincode closure.
+        let hook_proxy = event_loop.create_proxy();
         tracing::info!("popup: entering event loop");
 
         event_loop.run(move |event, _target, control_flow| {
@@ -782,6 +884,115 @@ mod windows_impl {
                         "window.purrpauseOnEvent&&window.purrpauseOnEvent({kind:'locked'})",
                     );
                     keyboard_hook::mark_locked();
+                }
+                Event::UserEvent(UserEvent::IpcUpdateContent {
+                    title,
+                    subtitle,
+                    dismiss_label,
+                    duration_secs,
+                    mode: content_mode,
+                }) => {
+                    tracing::info!(
+                        ?content_mode,
+                        duration_secs,
+                        "popup: IPC UpdateContent received - mutating content in place"
+                    );
+                    let payload = serde_json::json!({
+                        "title": title,
+                        "subtitle": subtitle,
+                        "dismissLabel": dismiss_label,
+                        "durationSecs": duration_secs,
+                        "mode": match content_mode {
+                            crate::ipc_popup::PopupContentMode::DailyPause => "daily-pause",
+                            crate::ipc_popup::PopupContentMode::Interval => "interval",
+                        },
+                    });
+                    let _ = webview.evaluate_script(&format!(
+                        "window.purrpauseApplyUpdate&&window.purrpauseApplyUpdate({payload})"
+                    ));
+                    deadline.store(
+                        epoch_secs_now() + duration_secs,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    if countdown_expired {
+                        // The previous content had already unlocked
+                        // (post-countdown). A fresh pause re-locks :
+                        // hook back on, topmost back on, focus stolen.
+                        countdown_expired = false;
+                        window_style::POPUP_UNLOCKED
+                            .store(false, std::sync::atomic::Ordering::Relaxed);
+                        window.set_always_on_top(true);
+                        if kb_guard.is_none() {
+                            match install_popup_keyboard_hook(
+                                debug,
+                                passcode_hash.as_deref(),
+                                pincode_cap,
+                                hook_proxy.clone(),
+                            ) {
+                                Ok(g) => kb_guard = g,
+                                Err(e) => tracing::warn!(
+                                    error = ?e,
+                                    "popup: re-lock hook re-install failed"
+                                ),
+                            }
+                        }
+                        if let Err(e) = window_style::force_foreground(hwnd) {
+                            tracing::warn!(error = ?e, "popup: re-lock force_foreground failed");
+                        }
+                        window.set_focus();
+                    }
+                }
+                Event::UserEvent(UserEvent::IpcRestartCountdown {
+                    palier_minutes,
+                    seconds_until,
+                }) => {
+                    tracing::info!(
+                        palier_minutes,
+                        seconds_until,
+                        "popup: IPC RestartCountdown received"
+                    );
+                    let payload = serde_json::json!({ "durationSecs": seconds_until });
+                    let _ = webview.evaluate_script(&format!(
+                        "window.purrpauseApplyUpdate&&window.purrpauseApplyUpdate({payload})"
+                    ));
+                    deadline.store(
+                        epoch_secs_now() + seconds_until,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    if countdown_expired {
+                        // Same re-lock as the UpdateContent arm — a
+                        // shared closure can't borrow the captured
+                        // &muts across arms, so the block is duplicated.
+                        countdown_expired = false;
+                        window_style::POPUP_UNLOCKED
+                            .store(false, std::sync::atomic::Ordering::Relaxed);
+                        window.set_always_on_top(true);
+                        if kb_guard.is_none() {
+                            match install_popup_keyboard_hook(
+                                debug,
+                                passcode_hash.as_deref(),
+                                pincode_cap,
+                                hook_proxy.clone(),
+                            ) {
+                                Ok(g) => kb_guard = g,
+                                Err(e) => tracing::warn!(
+                                    error = ?e,
+                                    "popup: re-lock hook re-install failed"
+                                ),
+                            }
+                        }
+                        if let Err(e) = window_style::force_foreground(hwnd) {
+                            tracing::warn!(error = ?e, "popup: re-lock force_foreground failed");
+                        }
+                        window.set_focus();
+                    }
+                }
+                Event::UserEvent(UserEvent::IpcDismiss) => {
+                    tracing::info!("popup dismissed via IPC");
+                    // Same clean-exit path as UserEvent::Dismiss : exit
+                    // code 0, the service's try_wait_exited treats it
+                    // as a normal dismiss.
+                    *control_flow = ControlFlow::Exit;
                 }
                 Event::UserEvent(UserEvent::CountdownExpired) => {
                     // Break-enforcement window over. Uninstall the LL

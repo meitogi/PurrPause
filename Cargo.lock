@@ -3219,7 +3219,7 @@ checksum = "3d595e54a326bc53c1c197b32d295e14b169e3cfeaa8dc82b529f947fba6bcf5"
 
 [[package]]
 name = "purrpause"
-version = "1.4.8"
+version = "1.5.0"
 dependencies = [
  "anyhow",
  "argon2",

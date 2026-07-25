@@ -487,8 +487,12 @@ impl Default for DailyPauseState {
 ///
 /// `popup_pending` is a top-level guard : when true, NO decision is
 /// emitted — countdown spawns are suppressed while a popup is up, and
-/// even the daily-pause fire waits for the current popup to close
-/// (session 2 dispatches an explicit collision-resolution path).
+/// even the daily-pause fire is deferred here. The daily↔interval
+/// collision is resolved SERVICE-side (session 4) : the tick loop
+/// detects "daily due + interval popup alive" before calling this
+/// kernel and mutates the running popup over its content pipe
+/// (fallback : kill+respawn), so this guard never starves the noon
+/// pause.
 ///
 /// `daily_pause_state` provides the TZ-pre-resolved state for the
 /// daily lunch pause (fire moment, grace window, already-fired
@@ -511,9 +515,10 @@ pub fn next_event(
     now_local: DateTime<Tz>,
 ) -> SchedulerDecision {
     // Top-level guard : no fresh spawns while a popup is up. Kills
-    // pre-notif countdowns AND defers the daily-pause fire — session 2
-    // handles the collision by dismissing the current popup and
-    // re-firing on the next tick.
+    // pre-notif countdowns AND defers the daily-pause fire — the
+    // service tick loop resolves the daily↔interval collision before
+    // calling this kernel (in-place pipe update, session 4), so a
+    // Nothing here never delays the noon pause.
     if popup_pending {
         return SchedulerDecision::Nothing;
     }
