@@ -301,6 +301,29 @@ pub fn resolve_cold_start(
     }
 }
 
+/// Should a positive clock-shift gap (suspend, hibernate, VM freeze)
+/// reset the interval cycle instead of shifting `last_popup` forward ?
+///
+/// Same rule as [`resolve_cold_start`]'s absence-covered-break branch :
+/// an absence at least as long as the break the popup would force IS
+/// the break — start a fresh cycle at wake instead of banking the gap.
+/// Sub-duration gaps keep the shift behavior (the user just closed the
+/// lid for a moment ; their active time is preserved).
+pub fn suspend_gap_resets_cycle(gap_secs: u64, popup_duration_secs: u64) -> bool {
+    gap_secs >= popup_duration_secs
+}
+
+/// Cap `paused_secs` at the wall-clock elapsed since `last_popup`.
+///
+/// Invariant : paused time accrues at most 1 s per elapsed second, so
+/// `paused_secs <= elapsed` always — which bounds the popup countdown
+/// (`last_popup + interval + paused_secs - now`) at `interval`. Any
+/// state above the cap is corruption (e.g. the pre-1.6.4 double
+/// suspend-compensation) ; clamping self-heals a bad runtime.dat.
+pub fn clamp_paused_to_elapsed(paused_secs: u64, elapsed_secs: u64) -> u64 {
+    paused_secs.min(elapsed_secs)
+}
+
 /// Compare wall-clock and unbiased-interrupt-time deltas across a tick
 /// and return the divergence in seconds if it exceeds `jump_threshold_secs`.
 ///
@@ -1738,6 +1761,45 @@ mod tests {
         let dec = resolve_cold_start(inputs, &cfg, false);
         assert_eq!(dec.last_popup, epoch_plus(lp_secs));
         assert!(!dec.popup_pending);
+    }
+
+    // -------- suspend_gap_resets_cycle + clamp_paused_to_elapsed --------
+
+    #[test]
+    fn suspend_gap_below_duration_keeps_shift() {
+        // 9 min sleep, 10 min popup — lid-closed moment, active time
+        // preserved via shift.
+        assert!(!suspend_gap_resets_cycle(9 * 60, 10 * 60));
+    }
+
+    #[test]
+    fn suspend_gap_exactly_at_duration_resets() {
+        // Boundary matches resolve_cold_start's downtime-at-duration
+        // behavior : the absence covered the break.
+        assert!(suspend_gap_resets_cycle(10 * 60, 10 * 60));
+    }
+
+    #[test]
+    fn suspend_gap_above_duration_resets() {
+        // 70 min Parallels freeze, 10 min popup → fresh cycle at wake.
+        assert!(suspend_gap_resets_cycle(70 * 60, 10 * 60));
+    }
+
+    #[test]
+    fn clamp_paused_within_elapsed_unchanged() {
+        assert_eq!(clamp_paused_to_elapsed(300, 900), 300);
+    }
+
+    #[test]
+    fn clamp_paused_at_elapsed_unchanged() {
+        assert_eq!(clamp_paused_to_elapsed(900, 900), 900);
+    }
+
+    #[test]
+    fn clamp_paused_above_elapsed_clamps() {
+        // Corrupted runtime.dat (pre-1.6.4 double suspend
+        // compensation) : 81 min banked 7 min into the cycle.
+        assert_eq!(clamp_paused_to_elapsed(4876, 420), 420);
     }
 
     // -------- compute_clock_shift + shift_systemtime --------

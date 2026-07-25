@@ -1025,12 +1025,15 @@ mod win {
                             power_notify::PowerEvent::Resume(ts) => {
                                 if let Some(sus) = suspended_at.take() {
                                     if let Ok(delta) = ts.duration_since(sus) {
-                                        let delta_secs = delta.as_secs();
-                                        *paused_secs += delta_secs;
+                                        // Log only. Gap compensation is owned by
+                                        // the clock-shift detector below (1b) —
+                                        // wall vs unbiased time diverges by the
+                                        // sleep too, so absorbing it here as well
+                                        // double-counted the gap (popup pushed by
+                                        // 2× the sleep, countdown above interval).
                                         tracing::info!(
-                                            sleep_secs = delta_secs,
-                                            paused_secs_after = *paused_secs,
-                                            "power resume: sleep duration absorbed into paused_secs"
+                                            sleep_secs = delta.as_secs(),
+                                            "power resume: gap left to the clock-shift detector"
                                         );
                                     }
                                 } else {
@@ -1070,18 +1073,57 @@ mod win {
                             } else {
                                 "clock_advanced"
                             };
-                            let last_popup_before = *last_popup;
-                            *last_popup =
-                                scheduler::shift_systemtime(*last_popup, divergence);
-                            tracing::warn!(
-                                divergence_secs = divergence,
-                                wall_delta_secs,
-                                unbiased_delta_secs,
-                                cause_hint,
-                                last_popup_before = ?last_popup_before,
-                                last_popup_after = ?*last_popup,
-                                "clock jump detected, last_popup shifted to preserve active-time"
-                            );
+                            let popup_duration_secs =
+                                u64::from(config.duration_minutes).saturating_mul(60);
+                            if divergence > 0
+                                && scheduler::suspend_gap_resets_cycle(
+                                    divergence as u64,
+                                    popup_duration_secs,
+                                )
+                            {
+                                // Absence covered the break — same rule as the
+                                // cold-start path : fresh cycle from wake, the
+                                // gap is the pause. (A positive divergence from
+                                // a mere clock-advance also lands here : the
+                                // anti-cheat concern is rewinds, and a forward
+                                // jump ≥ the popup duration is indistinguishable
+                                // from a suspend on VMs anyway.)
+                                *last_popup = now_wall;
+                                *paused_secs = 0;
+                                fired.clear();
+                                tracing::warn!(
+                                    divergence_secs = divergence,
+                                    wall_delta_secs,
+                                    unbiased_delta_secs,
+                                    cause_hint,
+                                    "clock jump >= popup duration - break taken, cycle reset at wake"
+                                );
+                                let _ = runtime_dat::write(&runtime_dat::RuntimeState {
+                                    last_popup: *last_popup,
+                                    paused_secs: 0,
+                                    popup_pending: *popup_pending,
+                                    last_heartbeat: *last_heartbeat,
+                                    last_clean_shutdown_at: SystemTime::UNIX_EPOCH,
+                                    daily_pause_fired_at: *daily_pause_fired_at,
+                                    daily_pause_fired_paliers_bits:
+                                        *daily_pause_fired_paliers_bits,
+                                    daily_pause_skipped_today: *daily_pause_skipped_today,
+                                    popup_pid: *popup_pid,
+                                });
+                            } else {
+                                let last_popup_before = *last_popup;
+                                *last_popup =
+                                    scheduler::shift_systemtime(*last_popup, divergence);
+                                tracing::warn!(
+                                    divergence_secs = divergence,
+                                    wall_delta_secs,
+                                    unbiased_delta_secs,
+                                    cause_hint,
+                                    last_popup_before = ?last_popup_before,
+                                    last_popup_after = ?*last_popup,
+                                    "clock jump detected, last_popup shifted to preserve active-time"
+                                );
+                            }
                         }
                     }
                     prev_wall = Some(now_wall);
@@ -1355,6 +1397,27 @@ mod win {
                     };
                     if is_idle_now {
                         *paused_secs += tick_delta_secs;
+                    }
+                    // Invariant guard : paused time accrues at most 1 s
+                    // per elapsed second, so paused_secs can never
+                    // exceed the elapsed since last_popup — which also
+                    // bounds the popup countdown at the interval. Any
+                    // excess is corrupted state (e.g. runtime.dat
+                    // written by the pre-1.6.4 double suspend
+                    // compensation) ; clamping self-heals it.
+                    let elapsed_since_last = now
+                        .duration_since(*last_popup)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    let clamped_paused =
+                        scheduler::clamp_paused_to_elapsed(*paused_secs, elapsed_since_last);
+                    if clamped_paused != *paused_secs {
+                        tracing::warn!(
+                            paused_secs = *paused_secs,
+                            elapsed_since_last,
+                            "paused_secs above elapsed - clamping (corrupted state self-heal)"
+                        );
+                        *paused_secs = clamped_paused;
                     }
                     if was_idle != Some(is_idle_now) {
                         tracing::info!(
