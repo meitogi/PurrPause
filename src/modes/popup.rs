@@ -182,6 +182,11 @@ mod windows_impl {
     enum UserEvent {
         Dismiss,
         CountdownExpired,
+        /// Cold-start focus insurance : re-assert foreground + focus so
+        /// the popup grabs keyboard input once the session goes
+        /// interactive after a reboot/logon (the spawn-time
+        /// force_foreground can land too early to stick).
+        ReassertForeground,
         /// One accepted digit — WebView should render one more asterisk.
         /// Payload is the 0-based index of the newly-added asterisk.
         PincodeDigitAccepted(u32),
@@ -231,6 +236,7 @@ mod windows_impl {
             let mut c = cfg_loaded;
             c.popup_title = c.daily_pause.popup_title.clone();
             c.popup_subtitle = c.daily_pause.popup_subtitle.clone();
+            c.dismiss_button_label = c.daily_pause.dismiss_button_label.clone();
             c.duration_minutes = c.daily_pause.duration_minutes;
             c
         } else {
@@ -657,6 +663,32 @@ mod windows_impl {
             }
         });
 
+        // Cold-start focus insurance. A daily-pause popup respawned at
+        // service boot (Cas D, identified by `--elapsed-seconds`) can
+        // appear right as the session becomes interactive after the
+        // logon sequence — the spawn-time force_foreground then lands
+        // before the desktop accepts input and the popup stays visible
+        // but WITHOUT keyboard focus, so the WebView pincode capture
+        // never sees keystrokes. Re-assert foreground + focus every
+        // 500 ms for the first few seconds so the popup grabs input as
+        // soon as the session is ready. Scoped to the respawn case so
+        // normal (session-active) fires are untouched.
+        if elapsed_seconds.is_some() {
+            const FOCUS_REASSERT_TICKS: u32 = 12; // ~6 s at 500 ms.
+            let focus_proxy = event_loop.create_proxy();
+            std::thread::spawn(move || {
+                for _ in 0..FOCUS_REASSERT_TICKS {
+                    std::thread::sleep(Duration::from_millis(500));
+                    if focus_proxy
+                        .send_event(UserEvent::ReassertForeground)
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+        }
+
         let mut countdown_expired = false;
         // Popup-scoped 3-strike counter for Alt+pincode verifies.
         // Semantics differ from `modes::config::lockout::Lockout` (which
@@ -682,6 +714,17 @@ mod windows_impl {
                 Event::UserEvent(UserEvent::Dismiss) => {
                     tracing::info!("popup dismissed by user");
                     *control_flow = ControlFlow::Exit;
+                }
+                Event::UserEvent(UserEvent::ReassertForeground) => {
+                    // Cold-start focus insurance tick. Skip once the
+                    // break window ended — the popup then intentionally
+                    // drops always-on-top and shouldn't grab focus back.
+                    if !countdown_expired {
+                        if let Err(e) = window_style::force_foreground(hwnd) {
+                            tracing::warn!(error = ?e, "popup: cold-start force_foreground retry failed");
+                        }
+                        window.set_focus();
+                    }
                 }
                 Event::UserEvent(UserEvent::PincodeDigitAccepted(idx)) => {
                     let js = format!(

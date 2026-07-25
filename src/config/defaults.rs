@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use super::schema::{AnimationEntry, RotationMode};
+use super::schema::{AnimationEntry, PreNotif, RotationMode};
 
 /// Empty by default — un-titled fullscreen borderless popup is
 /// cleaner in Alt-Tab / Task Manager (no visible label). The parent
@@ -19,7 +19,6 @@ pub const DEFAULT_POPUP_SUBTITLE: &str =
     "Prends 5 minutes pour t'étirer, boire, regarder au loin.";
 pub const DEFAULT_DISMISS_LABEL: &str = "J'ai fait ma pause";
 pub const DEFAULT_COUNTDOWN_TEMPLATE: &str = "Dismiss dans {mm}:{ss}";
-pub const DEFAULT_WIDGET_COUNTDOWN_TEMPLATE: &str = "Pause dans {mm}:{ss}";
 pub const DEFAULT_WIZARD_WELCOME: &str =
     "Bienvenue. Configure les rappels de pause avant de continuer.";
 pub const DEFAULT_WIZARD_PASSWORD_HINT: &str =
@@ -28,6 +27,7 @@ pub const DEFAULT_DAILY_PAUSE_TIMEZONE: &str = "Europe/Paris";
 pub const DEFAULT_DAILY_PAUSE_POPUP_TITLE: &str = "Pause midi";
 pub const DEFAULT_DAILY_PAUSE_POPUP_SUBTITLE: &str =
     "C'est l'heure de manger. À tout à l'heure !";
+pub const DEFAULT_DAILY_PAUSE_DISMISS_LABEL: &str = "J'ai fini de manger";
 
 pub mod d {
     use super::*;
@@ -76,15 +76,16 @@ pub mod d {
     pub fn countdown_template() -> String {
         DEFAULT_COUNTDOWN_TEMPLATE.to_string()
     }
-    pub fn widget_countdown_template() -> String {
-        DEFAULT_WIDGET_COUNTDOWN_TEMPLATE.to_string()
-    }
-    pub fn pre_notif_messages() -> HashMap<u32, String> {
+    pub fn pre_notif_messages() -> HashMap<u32, PreNotif> {
+        let pn = |title: &str, body: &str| PreNotif {
+            title: title.to_string(),
+            body: body.to_string(),
+        };
         let mut m = HashMap::new();
-        m.insert(15, "Prochaine pause dans 15 min".to_string());
-        m.insert(10, "Plus que 10 min avant la pause".to_string());
-        m.insert(5, "Pause dans 5 min !".to_string());
-        m.insert(1, "Pause dans 1 min !".to_string());
+        m.insert(15, pn("Pause bientôt", "Pause dans {mm}:{ss}"));
+        m.insert(10, pn("Pause bientôt", "Pause dans {mm}:{ss}"));
+        m.insert(5, pn("Pause imminente", "Pause dans {mm}:{ss}"));
+        m.insert(1, pn("Pause imminente", "Pause dans {mm}:{ss}"));
         m
     }
     pub fn wizard_welcome() -> String {
@@ -130,11 +131,18 @@ pub mod d {
     pub fn daily_pause_popup_subtitle() -> String {
         DEFAULT_DAILY_PAUSE_POPUP_SUBTITLE.to_string()
     }
-    pub fn daily_pause_pre_notif_messages() -> HashMap<u32, String> {
+    pub fn daily_pause_dismiss_button_label() -> String {
+        DEFAULT_DAILY_PAUSE_DISMISS_LABEL.to_string()
+    }
+    pub fn daily_pause_pre_notif_messages() -> HashMap<u32, PreNotif> {
+        let pn = |title: &str, body: &str| PreNotif {
+            title: title.to_string(),
+            body: body.to_string(),
+        };
         let mut m = HashMap::new();
-        m.insert(15, "Pause midi dans 15 min".to_string());
-        m.insert(10, "Pause midi dans 10 min".to_string());
-        m.insert(5, "Pause midi dans 5 min !".to_string());
+        m.insert(15, pn("Pause midi", "Pause midi dans {mm}:{ss}"));
+        m.insert(10, pn("Pause midi", "Pause midi dans {mm}:{ss}"));
+        m.insert(5, pn("Pause midi", "Pause midi dans {mm}:{ss}"));
         m
     }
     /// Default AnimationEntry list — the two `.lottie` files shipped

@@ -3,7 +3,7 @@ pub mod defaults;
 pub mod schema;
 
 #[allow(unused_imports)] // AnimationEntry + RotationMode are consumed by the popup / config UI wired later
-pub use schema::{AnimationEntry, Config, RotationMode};
+pub use schema::{AnimationEntry, Config, PreNotif, RotationMode};
 
 use std::fs;
 use std::io::Write;
@@ -129,6 +129,36 @@ mod tests {
             let back: Config = toml::from_str(&text).unwrap();
             assert_eq!(back.count_active_time, value);
         }
+    }
+
+    #[test]
+    fn pre_notif_messages_legacy_string_upgrades_to_body() {
+        // A pre-1.4.3 state.dat stored one bare string per palier. It must
+        // deserialize (legacy string → body, empty title) instead of
+        // failing and wiping the whole Config via load_or_default.
+        let legacy = "[pre_notif_messages]\n15 = \"Prochaine pause dans 15 min\"\n";
+        let cfg: Config = toml::from_str(legacy).unwrap();
+        let pn = cfg.pre_notif_messages.get(&15).expect("palier 15 present");
+        assert_eq!(pn.title, "");
+        assert_eq!(pn.body, "Prochaine pause dans 15 min");
+    }
+
+    #[test]
+    fn pre_notif_messages_new_table_form_roundtrips() {
+        let mut cfg = Config::default();
+        cfg.pre_notif_messages.clear();
+        cfg.pre_notif_messages.insert(
+            15,
+            crate::config::PreNotif {
+                title: "Titre".to_string(),
+                body: "Corps".to_string(),
+            },
+        );
+        let text = toml::to_string(&cfg).unwrap();
+        let back: Config = toml::from_str(&text).unwrap();
+        let pn = back.pre_notif_messages.get(&15).unwrap();
+        assert_eq!(pn.title, "Titre");
+        assert_eq!(pn.body, "Corps");
     }
 
     #[test]

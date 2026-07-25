@@ -153,6 +153,7 @@ mod win {
         Trigger,
         Reload,
         Shutdown,
+        RearmDaily,
     }
 
     define_windows_service!(ffi_service_main, service_main);
@@ -286,6 +287,11 @@ mod win {
                     // while a popup was displayed).
                     let was_clean_shutdown =
                         state.last_clean_shutdown_at >= state.last_heartbeat;
+                    // Was the interrupted popup the daily lunch pause? Its
+                    // long duration must drive the reset/relaunch decision
+                    // (else a short reboot mid-midi full-resets it).
+                    let is_daily_popup = state.popup_pending
+                        && daily_popup_was_interrupted(&config, state.daily_pause_fired_at);
                     let d = scheduler::resolve_cold_start(
                         scheduler::ResolveInputs {
                             now,
@@ -298,6 +304,7 @@ mod win {
                             was_clean_shutdown,
                         },
                         &config,
+                        is_daily_popup,
                     );
                     // Rule identification for bug-report clarity.
                     // Discriminants :
@@ -447,6 +454,15 @@ mod win {
             }
         }
 
+        // Was the interrupted popup the daily lunch pause? If so, the Cas
+        // D block below owns its respawn and the interval relaunch further
+        // down must be skipped — otherwise it spawn_replacing's the
+        // resumed midi popup with an interval one (reboot-mid-midi showed
+        // the classic popup + no midi after, because the interval fire
+        // reset last_popup and daily_pause_fired_at stayed set).
+        let was_daily_popup = popup_pending
+            && daily_popup_was_interrupted(&config, daily_pause_fired_at);
+
         // Cas D respawn : same-day daily pause was up when the service
         // died. If the popup process is still alive → skip (Cas D.4). If
         // dead → respawn with `--elapsed-seconds=<N>` so the dismiss
@@ -519,7 +535,7 @@ mod win {
         // in that case and the tick loop's cold-start-retry branch
         // (step 2c) drives the actual refire once the OS finishes the
         // logon sequence.
-        if relaunch_now {
+        if relaunch_now && !was_daily_popup {
             tracing::info!("cold-start relaunch: refiring popup for user rebooted mid-popup");
             if let Err(e) = fire_popup(
                 &exe,
@@ -730,6 +746,27 @@ mod win {
                         tracing::warn!(error = ?e, "trigger popup failed");
                     }
                 }
+                Ok(TickCommand::RearmDaily) => {
+                    tracing::info!(
+                        "RearmDailyPause received - clearing today's daily-pause fired marker"
+                    );
+                    *daily_pause_fired_at = None;
+                    *daily_pause_fired_paliers_bits = 0;
+                    *daily_pause_skipped_today = None;
+                    if let Err(e) = runtime_dat::write(&runtime_dat::RuntimeState {
+                        last_popup: *last_popup,
+                        paused_secs: *paused_secs,
+                        popup_pending: *popup_pending,
+                        last_heartbeat: *last_heartbeat,
+                        last_clean_shutdown_at: SystemTime::UNIX_EPOCH,
+                        daily_pause_fired_at: None,
+                        daily_pause_fired_paliers_bits: 0,
+                        daily_pause_skipped_today: None,
+                        popup_pid: *popup_pid,
+                    }) {
+                        tracing::warn!(error = ?e, "write runtime.dat failed (rearm daily)");
+                    }
+                }
                 Ok(TickCommand::Reload) => {
                     tracing::info!("config reload triggered");
                     let state_path = PathBuf::from(STATE_DAT);
@@ -873,6 +910,38 @@ mod win {
                                 if exit_code == 0 {
                                     *popup_pending = false;
                                     *popup_retry = None;
+                                    // Pause midi has absolute priority : when the
+                                    // DAILY popup closes, reset the interval timer
+                                    // to NOW so a full interval elapses AFTER lunch
+                                    // (the pause itself doesn't count toward it).
+                                    // popup_pid is stamped only by fire_popup_daily,
+                                    // never by interval fires, so a match on the
+                                    // exited child unambiguously identifies the
+                                    // daily popup.
+                                    if *popup_pid == Some(child.pid) {
+                                        let reset_now = SystemTime::now();
+                                        *last_popup = reset_now;
+                                        *paused_secs = 0;
+                                        fired.clear();
+                                        *popup_pid = None;
+                                        // Persist immediately so a crash before the
+                                        // next heartbeat doesn't lose the reset.
+                                        let _ = runtime_dat::write(&runtime_dat::RuntimeState {
+                                            last_popup: reset_now,
+                                            paused_secs: 0,
+                                            popup_pending: false,
+                                            last_heartbeat: *last_heartbeat,
+                                            last_clean_shutdown_at: SystemTime::UNIX_EPOCH,
+                                            daily_pause_fired_at: *daily_pause_fired_at,
+                                            daily_pause_fired_paliers_bits:
+                                                *daily_pause_fired_paliers_bits,
+                                            daily_pause_skipped_today: *daily_pause_skipped_today,
+                                            popup_pid: None,
+                                        });
+                                        tracing::info!(
+                                            "daily pause popup closed - interval timer reset to now (lunch over)"
+                                        );
+                                    }
                                     tracing::info!(
                                         exit_code,
                                         paused_secs = *paused_secs,
@@ -998,7 +1067,47 @@ mod win {
                     //     child in `last_popup_child`). Retry each tick
                     //     until spawn succeeds.
                     if *popup_pending && last_popup_child.is_none() {
-                        if let Err(e) = fire_popup(
+                        // A daily lunch pause interrupted by a service
+                        // death resumes as the MIDI popup — with the
+                        // elapsed offset so the dismiss timer picks up
+                        // where it left off (15 min into a 30 min pause →
+                        // 15 min left) — never as an interval popup.
+                        if daily_popup_was_interrupted(config, *daily_pause_fired_at) {
+                            let fired_at =
+                                daily_pause_fired_at.expect("was_interrupted implies Some");
+                            let now_utc = time_authority::now_authoritative(config);
+                            let duration_secs =
+                                config.daily_pause.duration_minutes as u64 * 60;
+                            let raw_elapsed = now_utc
+                                .duration_since(fired_at)
+                                .unwrap_or(Duration::ZERO)
+                                .as_secs();
+                            let elapsed_secs =
+                                super::clamp_cas_d_elapsed(raw_elapsed, duration_secs);
+                            match respawn_daily_popup_cold_start(
+                                exe,
+                                elapsed_secs,
+                                config,
+                                last_popup_child,
+                            ) {
+                                Ok(pid) => {
+                                    *popup_pid = Some(pid);
+                                }
+                                Err(e) => {
+                                    if crate::platform::win32::spawn_user::is_user_session_not_ready(&e) {
+                                        tracing::info!(
+                                            error = %e,
+                                            "daily cold-start respawn retry deferred - user session not ready"
+                                        );
+                                    } else {
+                                        tracing::warn!(
+                                            error = ?e,
+                                            "daily cold-start respawn retry failed - will retry on next tick"
+                                        );
+                                    }
+                                }
+                            }
+                        } else if let Err(e) = fire_popup(
                             exe,
                             last_popup,
                             paused_secs,
@@ -1624,6 +1733,24 @@ mod win {
     /// no `tick_loop` state has been constructed yet. Returns the new
     /// child's PID on success so the caller can persist it to
     /// `runtime.dat` via the cold-start write path.
+    /// True when the popup interrupted by a service death was the daily
+    /// lunch pause — a `daily_pause_fired_at` from today's local date.
+    /// Routes the cold-start refire (pre-loop relaunch AND tick-loop 2c
+    /// retry) to the daily respawn instead of an interval popup, so a
+    /// reboot mid-midi resumes the MIDI pause, never a classic one.
+    fn daily_popup_was_interrupted(
+        config: &Config,
+        daily_pause_fired_at: Option<SystemTime>,
+    ) -> bool {
+        let Some(fired_at) = daily_pause_fired_at else {
+            return false;
+        };
+        let now_local =
+            time_authority::in_configured_tz(config, time_authority::now_authoritative(config));
+        let fired_local = time_authority::in_configured_tz(config, fired_at);
+        fired_local.date_naive() == now_local.date_naive()
+    }
+
     fn respawn_daily_popup_cold_start(
         exe: &Path,
         elapsed_secs: u32,
@@ -1682,6 +1809,9 @@ mod win {
                 }
                 Message::Reload => {
                     let _ = pipe_tx.send(TickCommand::Reload);
+                }
+                Message::RearmDailyPause => {
+                    let _ = pipe_tx.send(TickCommand::RearmDaily);
                 }
                 Message::Shutdown => {
                     let _ = pipe_tx.send(TickCommand::Shutdown);

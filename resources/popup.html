@@ -562,7 +562,7 @@
         post('pincode:web:visibility:' + document.visibilityState);
       });
 
-      push('row-focus', stamp() + ' JS pincode ready cap=' + CAP +
+      push('row-focus', stamp() + ' JS pincode ready' +
            ' hasFocus=' + document.hasFocus());
       post('pincode:web:boot:hasFocus=' + document.hasFocus());
     })();

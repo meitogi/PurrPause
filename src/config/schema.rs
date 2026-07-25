@@ -8,6 +8,47 @@ use serde::{Deserialize, Serialize};
 
 use super::defaults::d;
 
+/// One pre-notification message shown in the T-N countdown widget : a
+/// title line above a body line (both above the live counter).
+/// Configured per palier, independently for the interval and the
+/// daily-pause pre-notifs.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PreNotif {
+    pub title: String,
+    pub body: String,
+}
+
+impl<'de> Deserialize<'de> for PreNotif {
+    /// Accepts BOTH the `{ title, body }` table AND a legacy bare string
+    /// (pre-1.4.3 configs stored a single string per palier). A legacy
+    /// string becomes the `body` with an empty `title`, so an existing
+    /// state.dat upgrades in place instead of failing to deserialize
+    /// (which would reset the whole config via `load_or_default`).
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Legacy(String),
+            Full {
+                #[serde(default)]
+                title: String,
+                #[serde(default)]
+                body: String,
+            },
+        }
+        Ok(match Raw::deserialize(deserializer)? {
+            Raw::Legacy(body) => PreNotif {
+                title: String::new(),
+                body,
+            },
+            Raw::Full { title, body } => PreNotif { title, body },
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Config {
     // --- Timings ---
@@ -93,14 +134,11 @@ pub struct Config {
     #[serde(default = "d::countdown_template")]
     pub countdown_template: String,
 
-    /// Compte à rebours affiché DANS le widget T-N top-right (temps
-    /// restant avant que la pause fire). Placeholders identiques.
-    #[serde(default = "d::widget_countdown_template")]
-    pub widget_countdown_template: String,
-
-    /// Key = palier in minutes (15/10/5), value = user-visible string.
+    /// Key = palier in minutes (15/10/5/1), value = title + body. The
+    /// body is a countdown template ({mm}/{ss}/{total_min}) shown live
+    /// under the title in the T-N widget.
     #[serde(default = "d::pre_notif_messages")]
-    pub pre_notif_messages: HashMap<u32, String>,
+    pub pre_notif_messages: HashMap<u32, PreNotif>,
 
     #[serde(default = "d::wizard_welcome")]
     pub wizard_welcome: String,
@@ -216,12 +254,19 @@ pub struct DailyPauseConfig {
     #[serde(default = "d::daily_pause_popup_subtitle")]
     pub popup_subtitle: String,
 
+    /// Dismiss-button label — independent of
+    /// [`Config::dismiss_button_label`] so the daily pause reads
+    /// distinctly (« J'ai fini de manger » vs the interval's
+    /// « J'ai fait ma pause »).
+    #[serde(default = "d::daily_pause_dismiss_button_label")]
+    pub dismiss_button_label: String,
+
     /// Pre-notification messages keyed by palier minutes. Keys are
     /// always `{15, 10, 5}` — the palier set is fixed for the daily
     /// pause (unlike the interval paliers). Missing keys mean the
     /// countdown widget shows an empty message ; use the defaults.
     #[serde(default = "d::daily_pause_pre_notif_messages")]
-    pub pre_notif_messages: HashMap<u32, String>,
+    pub pre_notif_messages: HashMap<u32, PreNotif>,
 }
 
 impl Default for DailyPauseConfig {

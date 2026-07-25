@@ -7,6 +7,7 @@
 //   0x02                             Reload
 //   0x03                             Shutdown
 //   0x04 + 8 LE bytes (u64 tick_ms)  InputStamp
+//   0x05                             RearmDailyPause
 //
 // Pipe name blends into native Windows-service pipe conventions
 // (`SystemEventsBroker-*`, `TrustedInstaller-Rpc`, ...). Explicit SDDL
@@ -37,6 +38,12 @@ pub enum Message {
     /// by the user-session input probe every ~5 s. Replaces the b.8
     /// file-based transport at `<exe_dir>/Data/lastinput.dat`.
     InputStamp { tick_ms: u64 },
+    /// Clear the "daily pause already fired today" marker so the noon
+    /// pause can fire again the same day. Sent from the Pause midi tab ;
+    /// resets the in-memory fired-at / palier-bitmask / skipped-today
+    /// state the running service holds (a bare runtime.dat edit would be
+    /// ignored until the next service boot).
+    RearmDailyPause,
 }
 
 impl Message {
@@ -51,6 +58,7 @@ impl Message {
                 let tick_ms = u64::from_le_bytes([*b0, *b1, *b2, *b3, *b4, *b5, *b6, *b7]);
                 Some(Message::InputStamp { tick_ms })
             }
+            [0x05] => Some(Message::RearmDailyPause),
             _ => None,
         }
     }
@@ -68,6 +76,7 @@ impl Message {
                 v.extend_from_slice(&tick_ms.to_le_bytes());
                 v
             }
+            Message::RearmDailyPause => vec![0x05],
         }
     }
 }
@@ -456,6 +465,11 @@ mod tests {
     }
 
     #[test]
+    fn parse_rearm_daily_pause_byte() {
+        assert_eq!(Message::parse(&[0x05]), Some(Message::RearmDailyPause));
+    }
+
+    #[test]
     fn parse_empty_returns_none() {
         assert_eq!(Message::parse(&[]), None);
     }
@@ -511,7 +525,12 @@ mod tests {
 
     #[test]
     fn to_bytes_roundtrip_unit_variants() {
-        for m in [Message::TriggerPopupNow, Message::Reload, Message::Shutdown] {
+        for m in [
+            Message::TriggerPopupNow,
+            Message::Reload,
+            Message::Shutdown,
+            Message::RearmDailyPause,
+        ] {
             let bytes = m.to_bytes();
             assert_eq!(bytes.len(), 1, "{m:?} must encode to 1 byte");
             assert_eq!(Message::parse(&bytes), Some(m));

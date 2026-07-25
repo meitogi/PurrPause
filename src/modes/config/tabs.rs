@@ -16,10 +16,10 @@ use crate::time_authority;
 use super::Action;
 use crate::config::defaults::{
     DEFAULT_COUNTDOWN_TEMPLATE, DEFAULT_DISMISS_LABEL, DEFAULT_POPUP_SUBTITLE,
-    DEFAULT_POPUP_TITLE, DEFAULT_POPUP_WINDOW_TITLE, DEFAULT_WIDGET_COUNTDOWN_TEMPLATE,
+    DEFAULT_POPUP_TITLE, DEFAULT_POPUP_WINDOW_TITLE,
     DEFAULT_WIZARD_PASSWORD_HINT, DEFAULT_WIZARD_WELCOME,
 };
-use crate::config::{defaults, AnimationEntry, Config, RotationMode};
+use crate::config::{defaults, AnimationEntry, Config, PreNotif, RotationMode};
 use crate::modes::install::STATE_DAT;
 use crate::runtime_dat;
 use crate::scheduler;
@@ -213,7 +213,12 @@ pub fn ui(
             });
             ui.separator();
 
-            egui::ScrollArea::vertical().show(ui, |ui| match state.active {
+            // Always show the scrollbar so long tabs (Messages) visibly
+            // signal there is more content below the fold — otherwise the
+            // cut-off reads as "nothing more here".
+            egui::ScrollArea::vertical()
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+                .show(ui, |ui| match state.active {
                 Tab::General => ui_general(ui, cfg, &mut state.dirty),
                 Tab::DailyPause => ui_daily_pause(ui, cfg, &mut state.dirty),
                 Tab::Animations => ui_animations(ui, cfg, &mut state.dirty),
@@ -333,8 +338,6 @@ fn format_local_hhmm(t: SystemTime) -> Option<String> {
 }
 
 fn ui_general(ui: &mut egui::Ui, cfg: &mut Config, dirty: &mut bool) {
-    ui.heading("Général");
-    ui.add_space(8.0);
 
     // ── Cycle ──
     ui.label(egui::RichText::new("Cycle").strong());
@@ -472,6 +475,13 @@ fn ui_general(ui: &mut egui::Ui, cfg: &mut Config, dirty: &mut bool) {
                 args.push("--config-override".into());
                 args.push(override_path.to_string_lossy().to_string());
             }
+            // Forward the passcode hash exactly like the service does
+            // (fire_popup), so the Ctrl+Shift+pincode escape can actually
+            // verify from this locked test popup. Empty = no passcode set.
+            if !cfg.passcode_hash.is_empty() {
+                args.push("--passcode-hash".into());
+                args.push(cfg.passcode_hash.clone());
+            }
             let args_ref: Vec<&str> = args.iter().map(String::as_str).collect();
             if let Err(e) = spawn_local(&args_ref) {
                 tracing::warn!(error = %e, "spawn --popup test-prod failed");
@@ -526,43 +536,6 @@ fn ui_general(ui: &mut egui::Ui, cfg: &mut Config, dirty: &mut bool) {
 }
 
 fn ui_daily_pause(ui: &mut egui::Ui, cfg: &mut Config, dirty: &mut bool) {
-    ui.heading("Pause midi");
-    ui.add_space(8.0);
-
-    // ── Kill-switch (top) ──
-    // Independent of the interval kill-switch on the Général tab. The
-    // checkbox reads "disabled" (checked = off), but the stored field is
-    // `enabled` (checked = on) — so we drive it through a negated temp
-    // bool. Red-tinted frame when the daily pause is off, mirroring the
-    // Général kill-switch styling.
-    let mut daily_disabled = !cfg.daily_pause.enabled;
-    let frame = if daily_disabled {
-        egui::Frame::group(ui.style())
-            .fill(egui::Color32::from_rgba_premultiplied(60, 30, 20, 255))
-            .stroke(egui::Stroke::new(
-                1.5,
-                egui::Color32::from_rgb(220, 120, 60),
-            ))
-    } else {
-        egui::Frame::group(ui.style())
-    };
-    frame.show(ui, |ui| {
-        if ui
-            .checkbox(
-                &mut daily_disabled,
-                egui::RichText::new("⚠  Désactiver la pause midi").strong(),
-            )
-            .changed()
-        {
-            cfg.daily_pause.enabled = !daily_disabled;
-            *dirty = true;
-        }
-        ui.label(
-            egui::RichText::new("Indépendant du kill-switch des intervals.")
-                .weak()
-                .small(),
-        );
-    });
 
     // ── Horaire ──
     ui.add_space(12.0);
@@ -662,20 +635,40 @@ fn ui_daily_pause(ui: &mut egui::Ui, cfg: &mut Config, dirty: &mut bool) {
     ui.add_space(12.0);
     ui.label(egui::RichText::new("Test").strong());
     ui.add_space(4.0);
-    // Save persists the config before these fire, so no --config-override
-    // is needed. PURRPAUSE_FROZEN_TZ mirrors the service's production
-    // daily-pause spawn (TZ-tamper-proof display).
+    // PURRPAUSE_FROZEN_TZ mirrors the service's production daily-pause
+    // spawn (TZ-tamper-proof display).
     let tz = cfg.daily_pause.timezone.clone();
+    // Main test popup + the three pré-notif paliers, all on one row.
     ui.horizontal_wrapped(|ui| {
         if ui.button("Tester la pause midi maintenant").clicked() {
-            let args = ["--popup", "--no-debug", "--mode", "daily-pause"];
-            if let Err(e) = spawn_local_with_env(&args, &[("PURRPAUSE_FROZEN_TZ", tz.as_str())]) {
+            let mut args: Vec<String> = vec![
+                "--popup".into(),
+                "--no-debug".into(),
+                "--mode".into(),
+                "daily-pause".into(),
+            ];
+            // Preview the CURRENT (possibly unsaved) config like the
+            // "Test prod" button — same snapshot means the popup sees the
+            // same `passcode_length` (= the pincode hook's `cap`), so the
+            // escape behaves identically here and there. Without it this
+            // popup read state.dat and could run against a stale `cap`.
+            if let Some(override_path) = write_preview_override(cfg) {
+                args.push("--config-override".into());
+                args.push(override_path.to_string_lossy().to_string());
+            }
+            // Forward the passcode hash like the service (fire_popup_daily)
+            // so the pincode escape can verify from this test popup.
+            if !cfg.passcode_hash.is_empty() {
+                args.push("--passcode-hash".into());
+                args.push(cfg.passcode_hash.clone());
+            }
+            let args_ref: Vec<&str> = args.iter().map(String::as_str).collect();
+            if let Err(e) =
+                spawn_local_with_env(&args_ref, &[("PURRPAUSE_FROZEN_TZ", tz.as_str())])
+            {
                 tracing::warn!(error = %e, "spawn daily-pause popup failed");
             }
         }
-    });
-    ui.add_space(4.0);
-    ui.horizontal(|ui| {
         ui.label("Pré-notifs :");
         for p in [15u32, 10, 5] {
             if ui.small_button(format!("T-{p}")).clicked() {
@@ -697,11 +690,66 @@ fn ui_daily_pause(ui: &mut egui::Ui, cfg: &mut Config, dirty: &mut bool) {
             }
         }
     });
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        if ui.button("Reset aujourd'hui").clicked() {
+            #[cfg(windows)]
+            if let Err(e) = crate::ipc::send(crate::ipc::Message::RearmDailyPause) {
+                tracing::warn!(error = %e, "IPC RearmDailyPause failed");
+            }
+        }
+        ui.label(
+            egui::RichText::new(
+                "Efface le marqueur « déjà déclenchée aujourd'hui » : la pause midi \
+                 pourra se déclencher à nouveau le jour même.",
+            )
+            .weak()
+            .small(),
+        );
+    });
+
+    // ── Kill-switch (bottom) ──
+    // Independent of the interval kill-switch on the Général tab. The
+    // checkbox reads "disabled" (checked = off), but the stored field is
+    // `enabled` (checked = on) — so we drive it through a negated temp
+    // bool. Red-tinted frame when the daily pause is off, mirroring the
+    // Général kill-switch styling. Isolated at the very bottom of the tab
+    // like the Général one, behind the same space/separator/space lead-in.
+    ui.add_space(20.0);
+    ui.separator();
+    ui.add_space(20.0);
+
+    let mut daily_disabled = !cfg.daily_pause.enabled;
+    let frame = if daily_disabled {
+        egui::Frame::group(ui.style())
+            .fill(egui::Color32::from_rgba_premultiplied(60, 30, 20, 255))
+            .stroke(egui::Stroke::new(
+                1.5,
+                egui::Color32::from_rgb(220, 120, 60),
+            ))
+    } else {
+        egui::Frame::group(ui.style())
+    };
+    frame.show(ui, |ui| {
+        if ui
+            .checkbox(
+                &mut daily_disabled,
+                egui::RichText::new("⚠  Désactiver la pause midi").strong(),
+            )
+            .changed()
+        {
+            cfg.daily_pause.enabled = !daily_disabled;
+            *dirty = true;
+        }
+        ui.label(
+            egui::RichText::new("Indépendant du kill-switch des intervals.")
+                .weak()
+                .small(),
+        );
+    });
 }
 
 fn ui_animations(ui: &mut egui::Ui, cfg: &mut Config, dirty: &mut bool) {
-    ui.heading("Animations");
-    ui.add_space(4.0);
     ui.label("Coche pour activer. Glisser-déposer un .lottie pour l'ajouter.");
     ui.add_space(6.0);
     rotation_row(ui, cfg, dirty);
@@ -844,8 +892,6 @@ fn rotation_row(ui: &mut egui::Ui, cfg: &mut Config, dirty: &mut bool) {
 }
 
 fn ui_messages(ui: &mut egui::Ui, cfg: &mut Config, dirty: &mut bool) {
-    ui.heading("Messages");
-    ui.add_space(6.0);
     ui.label("Toutes les chaînes affichées à l'utilisateur.");
     ui.add_space(10.0);
 
@@ -867,19 +913,6 @@ fn ui_messages(ui: &mut egui::Ui, cfg: &mut Config, dirty: &mut bool) {
         }
         ui.label("Compteur popup (avant dismiss)");
     });
-    ui.horizontal(|ui| {
-        if ui
-            .add(egui::TextEdit::singleline(&mut cfg.widget_countdown_template).desired_width(300.0))
-            .changed()
-        {
-            *dirty = true;
-        }
-        if ui.button("Défaut").clicked() {
-            cfg.widget_countdown_template = DEFAULT_WIDGET_COUNTDOWN_TEMPLATE.to_string();
-            *dirty = true;
-        }
-        ui.label("Compteur widget T-N (avant pause)");
-    });
     ui.label(egui::RichText::new("  placeholders : {mm}, {ss}, {total_min}").weak());
 
     ui.add_space(6.0);
@@ -897,26 +930,17 @@ fn ui_messages(ui: &mut egui::Ui, cfg: &mut Config, dirty: &mut bool) {
     let mut paliers = cfg.pre_notification_minutes.clone();
     paliers.sort_unstable_by(|a, b| b.cmp(a));
     for p in paliers {
+        let default = defaults::d::pre_notif_messages()
+            .remove(&p)
+            .unwrap_or_else(|| PreNotif {
+                title: String::new(),
+                body: format!("Pause dans {p} min"),
+            });
         let entry = cfg
             .pre_notif_messages
             .entry(p)
-            .or_insert_with(|| format!("Pause dans {p} min"));
-        ui.horizontal(|ui| {
-            ui.label(format!("T-{p} min"));
-            if ui
-                .add(egui::TextEdit::singleline(entry).desired_width(320.0))
-                .changed()
-            {
-                *dirty = true;
-            }
-            if ui.button("Défaut").clicked() {
-                let d = defaults::d::pre_notif_messages()
-                    .remove(&p)
-                    .unwrap_or_else(|| format!("Pause dans {p} min"));
-                *entry = d;
-                *dirty = true;
-            }
-        });
+            .or_insert_with(|| default.clone());
+        pre_notif_row(ui, p, entry, default, dirty);
     }
 
     // ── Pause midi ──
@@ -936,33 +960,73 @@ fn ui_messages(ui: &mut egui::Ui, cfg: &mut Config, dirty: &mut bool) {
         &dp_subtitle,
         dirty,
     );
+    let dp_dismiss = defaults::d::daily_pause_dismiss_button_label();
+    string_row(
+        ui,
+        "Bouton dismiss midi",
+        &mut cfg.daily_pause.dismiss_button_label,
+        &dp_dismiss,
+        dirty,
+    );
 
     ui.add_space(6.0);
     ui.label(egui::RichText::new("Messages des paliers T-N (pause midi)").strong());
     // Fixed palier set {15, 10, 5} — no add/remove UI (unlike interval).
     for p in [15u32, 10, 5] {
+        let default = defaults::d::daily_pause_pre_notif_messages()
+            .remove(&p)
+            .unwrap_or_else(|| PreNotif {
+                title: String::new(),
+                body: format!("Pause midi dans {p} min"),
+            });
         let entry = cfg
             .daily_pause
             .pre_notif_messages
             .entry(p)
-            .or_insert_with(|| format!("Pause midi dans {p} min"));
-        ui.horizontal(|ui| {
-            ui.label(format!("T-{p} min"));
+            .or_insert_with(|| default.clone());
+        pre_notif_row(ui, p, entry, default, dirty);
+    }
+}
+
+/// Editor for one palier pre-notif : a title line + a body line (both
+/// shown in the countdown widget) plus a "Défaut" reset. Shared by the
+/// interval and daily-pause palier lists.
+fn pre_notif_row(
+    ui: &mut egui::Ui,
+    palier: u32,
+    entry: &mut PreNotif,
+    default: PreNotif,
+    dirty: &mut bool,
+) {
+    ui.horizontal(|ui| {
+        ui.label(format!("T-{palier} min"));
+        ui.vertical(|ui| {
             if ui
-                .add(egui::TextEdit::singleline(entry).desired_width(320.0))
+                .add(
+                    egui::TextEdit::singleline(&mut entry.title)
+                        .desired_width(300.0)
+                        .hint_text("Titre"),
+                )
                 .changed()
             {
                 *dirty = true;
             }
-            if ui.button("Défaut").clicked() {
-                let d = defaults::d::daily_pause_pre_notif_messages()
-                    .remove(&p)
-                    .unwrap_or_else(|| format!("Pause midi dans {p} min"));
-                *entry = d;
+            if ui
+                .add(
+                    egui::TextEdit::singleline(&mut entry.body)
+                        .desired_width(300.0)
+                        .hint_text("Corps — décompte, ex : Pause dans {mm}:{ss}"),
+                )
+                .changed()
+            {
                 *dirty = true;
             }
         });
-    }
+        if ui.button("Défaut").clicked() {
+            *entry = default;
+            *dirty = true;
+        }
+    });
 }
 
 fn string_row(
@@ -993,8 +1057,6 @@ fn ui_notifications(
     dirty: &mut bool,
     new_palier_buffer: &mut u32,
 ) {
-    ui.heading("Notifications");
-    ui.add_space(6.0);
     ui.label("Paliers d'alerte avant la pause (minutes restantes).");
     ui.add_space(10.0);
 
@@ -1049,9 +1111,10 @@ fn ui_notifications(
             if !cfg.pre_notification_minutes.contains(&v) {
                 cfg.pre_notification_minutes.push(v);
                 cfg.pre_notification_minutes.sort_unstable_by(|a, b| b.cmp(a));
-                cfg.pre_notif_messages
-                    .entry(v)
-                    .or_insert_with(|| format!("Pause dans {v} min"));
+                cfg.pre_notif_messages.entry(v).or_insert_with(|| PreNotif {
+                    title: String::new(),
+                    body: format!("Pause dans {v} min"),
+                });
                 *dirty = true;
             }
         }
@@ -1109,8 +1172,6 @@ fn ui_security(
     change_pwd: &mut Option<ChangePwdDialog>,
     trigger_uninstall: &mut bool,
 ) {
-    ui.heading("Sécurité");
-    ui.add_space(8.0);
 
     ui.horizontal(|ui| {
         if ui.button("Changer le mot de passe…").clicked() {
@@ -1195,8 +1256,6 @@ pub fn ui_uninstall(
     state: &mut UninstallState,
     cfg: &Config,
 ) -> Option<Action> {
-    ui.heading("Désinstaller");
-    ui.add_space(6.0);
     ui.label(
         "Cette action va arrêter le service, supprimer la tâche planifiée et effacer le dossier de configuration.",
     );

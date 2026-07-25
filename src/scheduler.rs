@@ -209,7 +209,11 @@ pub struct ColdStartDecision {
 ///    `last_popup`, credit `downtime = now - last_heartbeat` into
 ///    `paused_secs`, no relaunch. Clock skew (`now < last_heartbeat`)
 ///    treated as zero downtime, never negative.
-pub fn resolve_cold_start(inputs: ResolveInputs, config: &Config) -> ColdStartDecision {
+pub fn resolve_cold_start(
+    inputs: ResolveInputs,
+    config: &Config,
+    is_daily_popup: bool,
+) -> ColdStartDecision {
     let ResolveInputs {
         now,
         last_popup,
@@ -228,8 +232,22 @@ pub fn resolve_cold_start(inputs: ResolveInputs, config: &Config) -> ColdStartDe
     );
 
     let elapsed = now.duration_since(last_popup).unwrap_or(Duration::ZERO);
-    let reset_threshold_secs =
-        (f64::from(config.reset_threshold_hours) * 3600.0) as u64;
+    // The daily lunch pause is a long, time-anchored popup with its OWN
+    // duration. The interval threshold / duration would wrongly treat a
+    // short reboot mid-midi as "break taken" and full-reset it (popup not
+    // relaunched, daily_pause_fired_at stuck → no midi after). When the
+    // interrupted popup was the daily pause, reason with the daily
+    // duration for both the long-downtime reset and the absence-covered
+    // -break checks.
+    let (reset_threshold_secs, popup_duration_secs) = if is_daily_popup {
+        let d = u64::from(config.daily_pause.duration_minutes).saturating_mul(60);
+        (d, d)
+    } else {
+        (
+            (f64::from(config.reset_threshold_hours) * 3600.0) as u64,
+            u64::from(config.duration_minutes).saturating_mul(60),
+        )
+    };
 
     if elapsed.as_secs() >= reset_threshold_secs {
         return ColdStartDecision {
@@ -253,8 +271,6 @@ pub fn resolve_cold_start(inputs: ResolveInputs, config: &Config) -> ColdStartDe
         let downtime = now
             .duration_since(last_heartbeat)
             .unwrap_or(Duration::ZERO);
-        let popup_duration_secs = u64::from(config.duration_minutes)
-            .saturating_mul(60);
         if downtime.as_secs() >= popup_duration_secs {
             // The absence itself was longer than the break the popup
             // was going to force. Treat as taken — fresh cycle from now,
@@ -533,6 +549,21 @@ pub fn next_event(
                     seconds_until,
                 };
             }
+        }
+    }
+
+    // Pause midi has absolute priority : once we're inside its window
+    // (from the earliest pre-notif at T-15 through the end of the grace
+    // window) and it hasn't fired yet today, suppress ALL interval
+    // activity so no interval popup or pre-notif countdown lands on top
+    // of the lunch pause. The daily fire / daily-countdown branches above
+    // already emit the daily decisions at their exact moments ; this
+    // guard covers the gaps between them.
+    if daily_pause_state.enabled && !daily_pause_state.fired_today {
+        let window_start =
+            daily_pause_state.fire_at_today - ChronoDuration::minutes(15);
+        if now_local >= window_start && now_local <= daily_pause_state.grace_window_end {
+            return SchedulerDecision::Nothing;
         }
     }
 
@@ -1443,7 +1474,7 @@ mod tests {
         let lp_secs = now_secs - (threshold_secs + 10 * 60);
         let hb_secs = now_secs - 60;
         let inputs = cold_inputs(now_secs, lp_secs, hb_secs, 1234, false, false);
-        let dec = resolve_cold_start(inputs, &cfg);
+        let dec = resolve_cold_start(inputs, &cfg, false);
         assert_eq!(dec.last_popup, epoch_plus(now_secs));
         assert_eq!(dec.paused_secs, 0);
         assert!(!dec.popup_pending);
@@ -1459,7 +1490,7 @@ mod tests {
         let lp_secs = now_secs - 5 * 60; // 5 min elapsed, far below 2 h.
         let hb_secs = now_secs - 30;
         let inputs = cold_inputs(now_secs, lp_secs, hb_secs, 0, true, false);
-        let dec = resolve_cold_start(inputs, &cfg);
+        let dec = resolve_cold_start(inputs, &cfg, false);
         assert_eq!(dec.last_popup, epoch_plus(now_secs));
         assert_eq!(dec.paused_secs, 0);
         assert!(!dec.popup_pending);
@@ -1478,7 +1509,7 @@ mod tests {
         let lp_secs = now_secs - 5 * 60;
         let hb_secs = now_secs - 30;
         let inputs = cold_inputs(now_secs, lp_secs, hb_secs, 400, true, true);
-        let dec = resolve_cold_start(inputs, &cfg);
+        let dec = resolve_cold_start(inputs, &cfg, false);
         assert_eq!(dec.last_popup, epoch_plus(lp_secs));
         assert_eq!(dec.paused_secs, 400); // unchanged, no downtime credit
         assert!(dec.popup_pending);
@@ -1496,7 +1527,7 @@ mod tests {
         let lp_secs = now_secs - 5 * 60; // 5 min elapsed, below threshold.
         let hb_secs = now_secs - 120; // 2 min absence, above the 60 s bar.
         let inputs = cold_inputs(now_secs, lp_secs, hb_secs, 0, true, true);
-        let dec = resolve_cold_start(inputs, &cfg);
+        let dec = resolve_cold_start(inputs, &cfg, false);
         assert_eq!(dec.last_popup, epoch_plus(now_secs));
         assert_eq!(dec.paused_secs, 0);
         assert!(!dec.popup_pending);
@@ -1513,7 +1544,7 @@ mod tests {
         let lp_secs = now_secs - 5 * 60;
         let hb_secs = now_secs - 60; // exactly the popup duration.
         let inputs = cold_inputs(now_secs, lp_secs, hb_secs, 0, true, true);
-        let dec = resolve_cold_start(inputs, &cfg);
+        let dec = resolve_cold_start(inputs, &cfg, false);
         assert_eq!(dec.last_popup, epoch_plus(now_secs));
         assert!(!dec.relaunch_now);
     }
@@ -1529,11 +1560,64 @@ mod tests {
         let lp_secs = now_secs - 5 * 60;
         let hb_secs = now_secs - 30; // 30 s absence, well below 300 s.
         let inputs = cold_inputs(now_secs, lp_secs, hb_secs, 400, true, true);
-        let dec = resolve_cold_start(inputs, &cfg);
+        let dec = resolve_cold_start(inputs, &cfg, false);
         assert_eq!(dec.last_popup, epoch_plus(lp_secs));
         assert_eq!(dec.paused_secs, 400);
         assert!(dec.popup_pending);
         assert!(dec.relaunch_now);
+    }
+
+    #[test]
+    fn resolve_cold_start_daily_popup_uses_daily_duration_and_relaunches() {
+        // Reboot mid-midi : the interval popup duration is short (1 min)
+        // but the daily pause is long (30 min). With is_daily_popup=true
+        // the absence-covered-break check must use the DAILY duration → a
+        // 4 min reboot is BELOW it → relaunch (resume the midi), NOT the
+        // interval-duration full reset an interval popup would get.
+        let mut cfg = config_with(2.0, vec![], false);
+        cfg.duration_minutes = 1; // 60 s interval bar.
+        cfg.daily_pause.duration_minutes = 30; // 1800 s daily bar.
+        let now_secs = 100_000;
+        let lp_secs = now_secs - 4 * 60;
+        let hb_secs = now_secs - 4 * 60; // 240 s : > 60 s interval, < 1800 s daily.
+
+        let interval = resolve_cold_start(
+            cold_inputs(now_secs, lp_secs, hb_secs, 0, true, true),
+            &cfg,
+            false,
+        );
+        assert!(
+            !interval.relaunch_now,
+            "interval popup full-resets on a 4 min reboot (downtime >= interval duration)"
+        );
+
+        let daily = resolve_cold_start(
+            cold_inputs(now_secs, lp_secs, hb_secs, 0, true, true),
+            &cfg,
+            true,
+        );
+        assert!(daily.relaunch_now, "daily popup relaunches within its own duration");
+        assert!(daily.popup_pending);
+        assert_eq!(daily.last_popup, epoch_plus(lp_secs));
+    }
+
+    #[test]
+    fn resolve_cold_start_daily_popup_downtime_beyond_daily_duration_full_reset() {
+        // Away longer than the whole daily pause → the break is taken →
+        // full reset, no relaunch (anti-cheat still holds for the midi).
+        let mut cfg = config_with(2.0, vec![], false);
+        cfg.daily_pause.duration_minutes = 30; // 1800 s.
+        let now_secs = 100_000;
+        let lp_secs = now_secs - 40 * 60;
+        let hb_secs = now_secs - 40 * 60; // 2400 s > 1800 s daily.
+        let dec = resolve_cold_start(
+            cold_inputs(now_secs, lp_secs, hb_secs, 0, true, true),
+            &cfg,
+            true,
+        );
+        assert!(!dec.relaunch_now);
+        assert!(!dec.popup_pending);
+        assert_eq!(dec.last_popup, epoch_plus(now_secs));
     }
 
     #[test]
@@ -1548,7 +1632,7 @@ mod tests {
         let lp_secs = now_secs - (threshold_secs + 60);
         let hb_secs = now_secs - 30;
         let inputs = cold_inputs(now_secs, lp_secs, hb_secs, 0, true, true);
-        let dec = resolve_cold_start(inputs, &cfg);
+        let dec = resolve_cold_start(inputs, &cfg, false);
         assert_eq!(dec.last_popup, epoch_plus(now_secs));
         assert!(!dec.popup_pending);
         assert!(!dec.relaunch_now);
@@ -1564,7 +1648,7 @@ mod tests {
         let lp_secs = now_secs - 30 * 60;
         let hb_secs = now_secs - 27_000;
         let inputs = cold_inputs(now_secs, lp_secs, hb_secs, 100, false, false);
-        let dec = resolve_cold_start(inputs, &cfg);
+        let dec = resolve_cold_start(inputs, &cfg, false);
         assert_eq!(dec.last_popup, epoch_plus(lp_secs));
         assert_eq!(dec.paused_secs, 100 + 27_000);
         assert!(!dec.popup_pending);
@@ -1579,7 +1663,7 @@ mod tests {
         let lp_secs = now_secs;
         let hb_secs = now_secs;
         let inputs = cold_inputs(now_secs, lp_secs, hb_secs, 0, false, false);
-        let dec = resolve_cold_start(inputs, &cfg);
+        let dec = resolve_cold_start(inputs, &cfg, false);
         assert_eq!(dec.last_popup, epoch_plus(lp_secs));
         assert_eq!(dec.paused_secs, 0);
     }
@@ -1593,7 +1677,7 @@ mod tests {
         let lp_secs = now_secs - threshold_secs;
         let hb_secs = now_secs - 60;
         let inputs = cold_inputs(now_secs, lp_secs, hb_secs, 0, false, false);
-        let dec = resolve_cold_start(inputs, &cfg);
+        let dec = resolve_cold_start(inputs, &cfg, false);
         assert_eq!(dec.last_popup, epoch_plus(now_secs));
         assert_eq!(dec.paused_secs, 0);
     }
@@ -1608,7 +1692,7 @@ mod tests {
         let lp_secs = now_secs - 5 * 3600;
         let hb_secs = now_secs - 1000;
         let inputs = cold_inputs(now_secs, lp_secs, hb_secs, 0, false, false);
-        let dec = resolve_cold_start(inputs, &cfg);
+        let dec = resolve_cold_start(inputs, &cfg, false);
         assert_eq!(dec.last_popup, epoch_plus(lp_secs));
         assert_eq!(dec.paused_secs, 1000);
     }
@@ -1622,7 +1706,7 @@ mod tests {
         let lp_secs = now_secs - 3600;
         let hb_secs = now_secs + 10_000; // future.
         let inputs = cold_inputs(now_secs, lp_secs, hb_secs, 500, false, false);
-        let dec = resolve_cold_start(inputs, &cfg);
+        let dec = resolve_cold_start(inputs, &cfg, false);
         assert_eq!(dec.paused_secs, 500);
     }
 
@@ -1635,7 +1719,7 @@ mod tests {
         let lp_secs = now_secs + 10_000; // future.
         let hb_secs = now_secs - 60;
         let inputs = cold_inputs(now_secs, lp_secs, hb_secs, 0, false, false);
-        let dec = resolve_cold_start(inputs, &cfg);
+        let dec = resolve_cold_start(inputs, &cfg, false);
         assert_eq!(dec.last_popup, epoch_plus(lp_secs));
         assert!(!dec.popup_pending);
     }

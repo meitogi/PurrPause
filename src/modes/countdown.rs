@@ -1,8 +1,9 @@
 // Countdown widget — small top-right always-on-top notification rendered
 // with eframe/egui. Spawned by the service at each palier boundary
-// before the popup (T-15 / T-10 / T-5 / T-1). Two lines : palier
-// message (from Config::pre_notif_messages[palier]) + live counter
-// (from Config::countdown_template, 500ms refresh).
+// before the popup (T-15 / T-10 / T-5 / T-1). Two lines, both per-palier
+// configurable via Config::pre_notif_messages[palier] : a title on top +
+// a body that IS the live countdown line (the body is a template holding
+// {mm}/{ss}/{total_min}, substituted every 500ms).
 //
 // Two pure helpers (format_countdown, resolve_palier_message) live
 // outside the #[cfg(windows)] gate so they run under Linux `cargo test`.
@@ -13,7 +14,7 @@
 // its `fired_paliers` set — the next palier boundary spawns a fresh
 // widget on its own schedule.
 
-use crate::config::Config;
+use crate::config::{Config, PreNotif};
 
 /// Substitutes `{mm}`, `{ss}`, `{total_min}` in the template. Unknown
 /// placeholders pass through unchanged. `{ss}` is zero-padded to two
@@ -39,16 +40,16 @@ pub fn format_countdown(template: &str, remaining_seconds: u64) -> String {
 /// 1, or a custom user value) — the config UI will guarantee an entry
 /// exists for every palier in `pre_notification_minutes`, but state.dat
 /// edited by hand can drift.
-pub fn resolve_palier_message(cfg: &Config, palier: u32, mode: Option<&str>) -> String {
+pub fn resolve_palier_message(cfg: &Config, palier: u32, mode: Option<&str>) -> PreNotif {
     let source = if mode == Some("daily-pause") {
         &cfg.daily_pause.pre_notif_messages
     } else {
         &cfg.pre_notif_messages
     };
-    source
-        .get(&palier)
-        .cloned()
-        .unwrap_or_else(|| format!("Pause dans {palier} min"))
+    source.get(&palier).cloned().unwrap_or_else(|| PreNotif {
+        title: String::new(),
+        body: format!("Pause dans {palier} min"),
+    })
 }
 
 #[cfg(windows)]
@@ -95,7 +96,7 @@ mod windows_impl {
     use super::{format_countdown, resolve_palier_message};
 
     const WIDTH: f32 = 320.0;
-    const HEIGHT: f32 = 90.0;
+    const HEIGHT: f32 = 96.0;
     const MARGIN: i32 = 20;
 
     // Throttle for runtime.dat + config re-reads inside ui(). Repaint stays
@@ -189,16 +190,25 @@ mod windows_impl {
         };
 
         let spawn_deadline = Instant::now() + Duration::from_secs(seconds);
-        let message = resolve_palier_message(&cfg, palier, mode.as_deref());
-        let template = cfg.widget_countdown_template.clone();
+        let pre = resolve_palier_message(&cfg, palier, mode.as_deref());
         let title = cfg.popup_window_title.clone();
+        let is_daily = mode.as_deref() == Some("daily-pause");
 
         // Sync is enabled in prod (widget spawned by service, well-known
         // paths live). Preview mode from the Config UI passes
         // config_override which is deleted right after the initial read
         // above — subsequent re-reads would default the config and lie
         // about interval, so preview keeps the frozen-Instant behaviour.
-        let sync = if config_override.is_none() {
+        //
+        // Daily-pause pre-notifs count down to a FLAT wall-clock moment
+        // (the noon hour), NOT the interval's active-time deadline. Live
+        // sync recomputes `next_popup_at` (last_popup + interval +
+        // paused_secs), so leaving it on for a daily widget makes the
+        // counter drift as if the pause moved with active time — the
+        // reported bug. Disable sync in daily mode so the frozen
+        // spawn_deadline (the correct wall-clock seconds_until the
+        // service passed) is authoritative.
+        let sync = if config_override.is_none() && !is_daily {
             Some(SyncState {
                 runtime_dat_path: PathBuf::from(runtime_dat::PATH),
                 config_path: PathBuf::from(STATE_DAT),
@@ -238,7 +248,12 @@ mod windows_impl {
                         }
                     }
                 }
-                Ok(Box::new(CountdownApp::new(spawn_deadline, message, template, sync)))
+                Ok(Box::new(CountdownApp::new(
+                    spawn_deadline,
+                    pre.title,
+                    pre.body,
+                    sync,
+                )))
             }),
         )
         .map_err(|e| anyhow!("eframe: {e}"))
@@ -266,19 +281,22 @@ mod windows_impl {
         // successful sync, and forever in preview mode where sync is
         // deliberately disabled.
         spawn_deadline: Instant,
-        message: String,
-        template: String,
+        title: String,
+        // Countdown-template body : holds {mm}/{ss}/{total_min}, rendered
+        // live under the title. Replaces the old separate static message +
+        // global widget_countdown_template counter.
+        body: String,
         sync: Option<SyncState>,
     }
 
     impl CountdownApp {
         fn new(
             spawn_deadline: Instant,
-            message: String,
-            template: String,
+            title: String,
+            body: String,
             sync: Option<SyncState>,
         ) -> Self {
-            Self { spawn_deadline, message, template, sync }
+            Self { spawn_deadline, title, body, sync }
         }
 
         // Re-read runtime.dat + config if the throttle allows. Any read
@@ -360,19 +378,26 @@ mod windows_impl {
             // background so nothing touches the corners.
             let content_rect = rect.shrink(12.0);
 
-            let counter = format_countdown(&self.template, remaining);
+            // Two lines : title on top, then the body rendered as the live
+            // countdown ({mm}/{ss}/{total_min} substituted). An empty title
+            // collapses to just the countdown line.
+            let body = format_countdown(&self.body, remaining);
+            let mut y = 0.0;
+            if !self.title.is_empty() {
+                ui.painter().text(
+                    content_rect.min,
+                    egui::Align2::LEFT_TOP,
+                    &self.title,
+                    egui::FontId::proportional(16.0),
+                    egui::Color32::from_rgba_premultiplied(245, 245, 250, 255),
+                );
+                y += 30.0;
+            }
             ui.painter().text(
-                content_rect.min,
+                content_rect.min + egui::vec2(0.0, y),
                 egui::Align2::LEFT_TOP,
-                &self.message,
-                egui::FontId::proportional(14.0),
-                egui::Color32::from_rgba_premultiplied(240, 240, 245, 255),
-            );
-            ui.painter().text(
-                content_rect.min + egui::vec2(0.0, 28.0),
-                egui::Align2::LEFT_TOP,
-                counter,
-                egui::FontId::monospace(24.0),
+                body,
+                egui::FontId::proportional(22.0),
                 egui::Color32::from_rgb(255, 183, 77),
             );
 
@@ -468,43 +493,54 @@ mod tests {
         );
     }
 
+    fn pn(title: &str, body: &str) -> PreNotif {
+        PreNotif {
+            title: title.to_string(),
+            body: body.to_string(),
+        }
+    }
+
     #[test]
     fn resolve_palier_message_known_palier() {
         let cfg = Config::default();
-        // Default HashMap ships 15/10/5/1.
-        assert_eq!(
-            resolve_palier_message(&cfg, 15, None),
-            "Prochaine pause dans 15 min"
-        );
-        assert_eq!(resolve_palier_message(&cfg, 1, None), "Pause dans 1 min !");
+        // Default HashMap ships 15/10/5/1 ; the body is a countdown
+        // template (holds {mm}/{ss}), the title differentiates urgency.
+        let p15 = resolve_palier_message(&cfg, 15, None);
+        assert_eq!(p15.title, "Pause bientôt");
+        assert_eq!(p15.body, "Pause dans {mm}:{ss}");
+        assert_eq!(resolve_palier_message(&cfg, 1, None).title, "Pause imminente");
     }
 
     #[test]
     fn resolve_palier_message_unknown_palier_templated_fallback() {
         let cfg = Config::default();
-        assert_eq!(resolve_palier_message(&cfg, 7, None), "Pause dans 7 min");
+        let pre = resolve_palier_message(&cfg, 7, None);
+        assert_eq!(pre.body, "Pause dans 7 min");
+        assert_eq!(pre.title, "");
     }
 
     #[test]
     fn resolve_palier_message_empty_map_falls_back() {
         let mut cfg = Config::default();
         cfg.pre_notif_messages = HashMap::new();
-        assert_eq!(resolve_palier_message(&cfg, 15, None), "Pause dans 15 min");
-        assert_eq!(resolve_palier_message(&cfg, 1, None), "Pause dans 1 min");
+        assert_eq!(resolve_palier_message(&cfg, 15, None).body, "Pause dans 15 min");
+        assert_eq!(resolve_palier_message(&cfg, 1, None).body, "Pause dans 1 min");
     }
 
     #[test]
     fn resolve_palier_message_daily_pause_reads_daily_map() {
         let mut cfg = Config::default();
-        cfg.daily_pause.pre_notif_messages.insert(15, "Repas dans 15 min".to_string());
-        cfg.pre_notif_messages.insert(15, "Interval-specific 15".to_string());
-        assert_eq!(
-            resolve_palier_message(&cfg, 15, Some("daily-pause")),
-            "Repas dans 15 min"
-        );
+        cfg.daily_pause
+            .pre_notif_messages
+            .insert(15, pn("Repas", "Repas dans 15 min"));
+        cfg.pre_notif_messages
+            .insert(15, pn("Interval", "Interval-specific 15"));
+        let daily = resolve_palier_message(&cfg, 15, Some("daily-pause"));
+        assert_eq!(daily.title, "Repas");
+        assert_eq!(daily.body, "Repas dans 15 min");
         // Interval mode still uses the interval map even when daily has an entry.
         assert_eq!(
-            resolve_palier_message(&cfg, 15, None),
+            resolve_palier_message(&cfg, 15, None).body,
             "Interval-specific 15"
         );
     }
@@ -514,7 +550,7 @@ mod tests {
         let cfg = Config::default();
         // Daily map defaults are empty for palier 7.
         assert_eq!(
-            resolve_palier_message(&cfg, 7, Some("daily-pause")),
+            resolve_palier_message(&cfg, 7, Some("daily-pause")).body,
             "Pause dans 7 min"
         );
     }
