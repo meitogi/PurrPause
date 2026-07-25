@@ -5,8 +5,9 @@
 //     drops the pastel-pink circle in cat-icon.png)
 //   * shared spawn_local helper for the "Prévisualiser popup",
 //     "Tester animation" and "Désinstaller" buttons
-//   * ingest_lottie : file-picker / drag-drop handler that copies +
-//     sanitizes a `.lottie` into `<exe_dir>/resources/animations/`
+//   * ingest_animation : file-picker / drag-drop handler that copies a
+//     supported animation (see ANIM_EXTS) into
+//     `<exe_dir>/resources/animations/`, sanitizing only `.lottie`
 //
 // PNG decoding + auto-crop of transparent borders is Linux-runnable
 // (used by unit tests below) so the crop logic is verified on every
@@ -183,12 +184,27 @@ pub fn spawn_local_with_env(args: &[&str], env: &[(&str, &str)]) -> Result<()> {
     Ok(())
 }
 
-/// Copy `src` into `<exe_dir>/Data/Animations/`, sanitize in-place,
-/// return `(relative_path_under_protocol_namespace, display_name)`. The
-/// returned relative path is `animations/<file>` — the protocol
-/// namespace path served by the custom protocol handler, not a disk
-/// path. Disk layout is `<exe_dir>/Data/Animations/<file>`.
-pub fn ingest_lottie(src: &Path) -> Result<(String, String)> {
+/// File extensions the config UI accepts as animations. The popup detects
+/// the engine by extension too (see `resources/popup.html` mount script),
+/// so the import gate and the mount must agree on this set.
+pub const ANIM_EXTS: &[&str] = &["lottie", "svg", "gif", "webp", "png", "apng", "webm"];
+
+/// True when `path`'s extension (case-insensitive) is an accepted animation
+/// format.
+pub fn is_supported_anim(path: &Path) -> bool {
+    path.extension()
+        .and_then(|s| s.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .is_some_and(|e| ANIM_EXTS.contains(&e.as_str()))
+}
+
+/// Copy `src` into `<exe_dir>/Data/Animations/`, sanitizing `.lottie`
+/// in-place (other formats are copied verbatim), and return
+/// `(relative_path_under_protocol_namespace, display_name)`. The returned
+/// relative path is `animations/<file>` — the protocol namespace path
+/// served by the custom protocol handler, not a disk path. Disk layout is
+/// `<exe_dir>/Data/Animations/<file>`.
+pub fn ingest_animation(src: &Path) -> Result<(String, String)> {
     let exe = std::env::current_exe().map_err(|e| anyhow!("current_exe: {e}"))?;
     let exe_parent = exe.parent().ok_or_else(|| anyhow!("exe has no parent"))?;
     let dest_dir = crate::modes::install::animations_dir(exe_parent);
@@ -202,13 +218,24 @@ pub fn ingest_lottie(src: &Path) -> Result<(String, String)> {
     let dest = dest_dir.join(&file_name);
     std::fs::copy(src, &dest).map_err(|e| anyhow!("copy {src:?} → {dest:?}: {e}"))?;
 
-    let report = crate::lottie_sanitize::sanitize_lottie_in_place(&dest)
-        .map_err(|e| anyhow!("sanitize {dest:?}: {e}"))?;
-    tracing::info!(
-        stripped = report.stripped_layers,
-        inspected = report.inspected_files,
-        "lottie ingested"
-    );
+    // Only `.lottie` is a ZIP+JSON container the sanitizer understands;
+    // raster/video formats are not archives and would fail Zip parsing.
+    let ext = dest
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    if ext == "lottie" {
+        let report = crate::lottie_sanitize::sanitize_lottie_in_place(&dest)
+            .map_err(|e| anyhow!("sanitize {dest:?}: {e}"))?;
+        tracing::info!(
+            stripped = report.stripped_layers,
+            inspected = report.inspected_files,
+            "lottie ingested"
+        );
+    } else {
+        tracing::info!(ext = %ext, "animation ingested (no sanitize)");
+    }
 
     let display_name = src
         .file_stem()

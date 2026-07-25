@@ -96,13 +96,16 @@
     }
 
     /* Cat fills the entire viewport as a background layer.
-       Native aspect ratio preserved via dotlottie-wc's default fit=contain.
+       Native aspect ratio preserved: dotlottie-wc has its own default
+       fit=contain (object-fit is a no-op on the custom element), while
+       <img>/<video> stages letterbox via object-fit: contain below.
        Text sits on top as a floating overlay. */
     .stage {
       position: fixed;
       inset: 0;
       width: 100vw;
       height: 100vh;
+      object-fit: contain;
       z-index: 1;
       pointer-events: none;
       /* Zoom + vertical offset the raw Lottie canvas. Applied bottom-up:
@@ -832,34 +835,85 @@
   </script>
 
   <!--
-    dotlottie-wc web component + local WASM (fully vendored — no CDN fetch).
+    Animation mount — engine chosen by the file extension of
+    document.body.dataset.animationPath:
+      .lottie                       → <dotlottie-wc> (ThorVG software WASM)
+      .svg .gif .webp .png .apng    → <img>   (native raster/vector decode)
+      .webm                         → <video> (VP9/VP8 alpha, WebView2-composited)
+      unknown                       → Lottie fallback + console warning
 
-    Order matters: setWasmUrl() must run BEFORE any <dotlottie-wc> constructor.
-    If the element is in the initial HTML, custom-element registration (triggered
-    by the module import) upgrades it synchronously, its constructor calls
-    _initWasm() with the default CDN URL, and setWasmUrl() runs too late.
-    Fix: mount the element from JS AFTER setWasmUrl().
+    The ~1.8 MB dotlottie-wc bundle is imported ONLY inside mountLottie(), so a
+    non-Lottie popup pulls zero dotlottie bytes. Every branch keeps the same
+    id='anim' / class='stage' contract (stage scale/offset CSS + z-index key off
+    .stage; the in-place IPC update keys off #anim).
   -->
   <script type="module">
-    const { setWasmUrl } = await import('./vendor/dotlottie-wc/index.js');
-    setWasmUrl(new URL('./vendor/dotlottie-wc/dotlottie-player.wasm', location.href).href);
+    const path = document.body.dataset.animationPath || '';
+    const ext = (path.split('.').pop() || '').toLowerCase();
 
-    const el = document.createElement('dotlottie-wc');
-    el.id = 'anim';
-    el.className = 'stage';
-    // Force devicePixelRatio: 1 so the WASM software renderer paints ~4× fewer
-    // pixels per frame on Retina displays. Lottie is vector, CSS upscale stays
-    // crisp — big perf win at large --stage-scale values.
-    el.setAttribute('renderconfig', JSON.stringify({ devicePixelRatio: 1 }));
-    el.setAttribute('src', document.body.dataset.animationPath || '');
-    el.setAttribute('autoplay', '');
-    el.setAttribute('loop', '');
-    // Surface load/error events so a silent WASM or fetch failure is visible.
-    el.addEventListener('ready', () => console.info('[dotlottie] ready'));
-    el.addEventListener('load', () => console.info('[dotlottie] loaded:', el.getAttribute('src')));
-    el.addEventListener('loadError', e => console.error('[dotlottie] load error:', e.detail || e));
-    // Prepend so it stays below the bouncer/dismiss by DOM order too (z-index also handles this).
-    document.body.prepend(el);
+    // <dotlottie-wc> web component + local WASM (fully vendored — no CDN fetch).
+    // Order matters: setWasmUrl() must run BEFORE the <dotlottie-wc> constructor.
+    // Registration (triggered by the module import) upgrades the element
+    // synchronously and its constructor calls _initWasm() with the default CDN
+    // URL, so we import + setWasmUrl() first, then build the element from JS.
+    async function mountLottie() {
+      const { setWasmUrl } = await import('./vendor/dotlottie-wc/index.js');
+      setWasmUrl(new URL('./vendor/dotlottie-wc/dotlottie-player.wasm', location.href).href);
+
+      const el = document.createElement('dotlottie-wc');
+      el.id = 'anim';
+      el.className = 'stage';
+      // Force devicePixelRatio: 1 so the WASM software renderer paints ~4× fewer
+      // pixels per frame on Retina displays. Lottie is vector, CSS upscale stays
+      // crisp — big perf win at large --stage-scale values.
+      el.setAttribute('renderconfig', JSON.stringify({ devicePixelRatio: 1 }));
+      el.setAttribute('src', path);
+      el.setAttribute('autoplay', '');
+      el.setAttribute('loop', '');
+      // Surface load/error events so a silent WASM or fetch failure is visible.
+      el.addEventListener('ready', () => console.info('[dotlottie] ready'));
+      el.addEventListener('load', () => console.info('[dotlottie] loaded:', el.getAttribute('src')));
+      el.addEventListener('loadError', e => console.error('[dotlottie] load error:', e.detail || e));
+      // Prepend so it stays below the bouncer/dismiss by DOM order too (z-index also handles this).
+      document.body.prepend(el);
+    }
+
+    // Raster/vector via <img> or alpha video via <video>. Both letterbox to the
+    // viewport via .stage's object-fit: contain.
+    function mountMedia(tag) {
+      const el = document.createElement(tag);
+      el.id = 'anim';
+      el.className = 'stage';
+      if (tag === 'video') {
+        el.autoplay = true;
+        el.loop = true;
+        el.muted = true;
+        el.playsInline = true;
+      }
+      el.addEventListener('load', () => console.info('[media] loaded:', path));
+      el.addEventListener('error', e => console.error('[media] load error:', e));
+      el.src = path;
+      document.body.prepend(el);
+    }
+
+    switch (ext) {
+      case 'lottie':
+        mountLottie();
+        break;
+      case 'svg':
+      case 'gif':
+      case 'webp':
+      case 'png':
+      case 'apng':
+        mountMedia('img');
+        break;
+      case 'webm':
+        mountMedia('video');
+        break;
+      default:
+        console.warn('[mount] unknown animation extension', JSON.stringify(ext), '— falling back to Lottie');
+        mountLottie();
+    }
   </script>
 </body>
 </html>

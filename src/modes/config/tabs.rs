@@ -11,7 +11,9 @@ use std::time::{Duration, SystemTime};
 use chrono_tz::Tz;
 use eframe::egui;
 
-use super::decoration::{ingest_lottie, paint_watermark, spawn_local, spawn_local_with_env};
+use super::decoration::{
+    ingest_animation, is_supported_anim, paint_watermark, spawn_local, spawn_local_with_env,
+};
 use crate::time_authority;
 use super::Action;
 use crate::config::defaults::{
@@ -810,7 +812,7 @@ fn ui_daily_pause(ui: &mut egui::Ui, cfg: &mut Config, dirty: &mut bool) {
 }
 
 fn ui_animations(ui: &mut egui::Ui, cfg: &mut Config, dirty: &mut bool, bench: &mut bool) {
-    ui.label("Coche pour activer. Glisser-déposer un .lottie pour l'ajouter.");
+    ui.label("Coche pour activer. Glisser-déposer une animation (.lottie, .svg, .gif, .webp, .png/.apng, .webm) pour l'ajouter.");
     ui.add_space(6.0);
     rotation_row(ui, cfg, dirty);
     ui.add_space(8.0);
@@ -826,8 +828,8 @@ fn ui_animations(ui: &mut egui::Ui, cfg: &mut Config, dirty: &mut bool, bench: &
     let dropped: Vec<_> = ui.ctx().input(|i| i.raw.dropped_files.clone());
     for f in dropped {
         if let Some(path) = f.path {
-            if path.extension().and_then(|s| s.to_str()).unwrap_or("") == "lottie" {
-                match ingest_lottie(&path) {
+            if is_supported_anim(&path) {
+                match ingest_animation(&path) {
                     Ok((dest_rel, name)) => {
                         cfg.animations.push(AnimationEntry {
                             file: dest_rel,
@@ -925,11 +927,11 @@ fn ui_animations(ui: &mut egui::Ui, cfg: &mut Config, dirty: &mut bool, bench: &
     ui.horizontal(|ui| {
         if ui.button("Ajouter…").clicked() {
             if let Some(picked) = rfd::FileDialog::new()
-                .add_filter("Lottie", &["lottie"])
+                .add_filter("Animations", super::decoration::ANIM_EXTS)
                 .pick_files()
             {
                 for path in picked {
-                    match ingest_lottie(&path) {
+                    match ingest_animation(&path) {
                         Ok((dest_rel, name)) => {
                             cfg.animations.push(AnimationEntry {
                                 file: dest_rel,
@@ -940,7 +942,7 @@ fn ui_animations(ui: &mut egui::Ui, cfg: &mut Config, dirty: &mut bool, bench: &
                             });
                             *dirty = true;
                         }
-                        Err(e) => tracing::warn!(error = %e, path = %path.display(), "add lottie failed"),
+                        Err(e) => tracing::warn!(error = %e, path = %path.display(), "add animation failed"),
                     }
                 }
             }

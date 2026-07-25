@@ -12,9 +12,22 @@
 /// per tick, plus one `role=total` aggregate row per tick.
 pub const TSV_HEADER: &str = "timestamp\tfilename\textension\trenderer\tpid\trole\tcpu_ms\tcpu_pct\tgpu_pct\tgpu_mem_bytes\tworkingset_bytes\tprivate_bytes";
 
-/// Renderer label written in every row. Hard-coded until the
-/// extension->engine mapping lands (rollout sessions 2-4).
-pub const RENDERER_LABEL: &str = "thorvg-sw";
+/// Renderer label written in every bench row, keyed by the animation's
+/// file extension so rows are comparable across formats in one log:
+///   `.lottie`                       -> `thorvg-sw`  (software WASM)
+///   `.svg/.gif/.webp/.png/.apng`    -> `img-native` (WebView `<img>` decode)
+///   `.webm`                         -> `video-native`
+/// Unknown extensions map to `thorvg-sw` to match the popup mount's
+/// unknown->Lottie fallback. GPU vector engines (Rive/Skottie) add their
+/// own labels in later rollout sessions.
+pub fn renderer_label_for_ext(ext: &str) -> &'static str {
+    match ext {
+        "lottie" => "thorvg-sw",
+        "svg" | "gif" | "webp" | "png" | "apng" => "img-native",
+        "webm" => "video-native",
+        _ => "thorvg-sw",
+    }
+}
 
 /// Sampling cadence.
 pub const BENCH_TICK_MS: u64 = 500;
@@ -199,7 +212,7 @@ mod tests {
             workingset_bytes: 2_097_152,
             private_bytes: 3_145_728,
         };
-        let line = tsv_row("2026-07-25T12:00:00.000", "dance-cat.lottie", "lottie", RENDERER_LABEL, &row);
+        let line = tsv_row("2026-07-25T12:00:00.000", "dance-cat.lottie", "lottie", renderer_label_for_ext("lottie"), &row);
         let fields: Vec<&str> = line.split('\t').collect();
         assert_eq!(fields.len(), TSV_HEADER.split('\t').count());
         assert_eq!(fields[0], "2026-07-25T12:00:00.000");
@@ -214,6 +227,18 @@ mod tests {
         assert_eq!(fields[9], "1048576");
         assert_eq!(fields[10], "2097152");
         assert_eq!(fields[11], "3145728");
+    }
+
+    #[test]
+    fn renderer_label_maps_extension_to_engine() {
+        assert_eq!(renderer_label_for_ext("lottie"), "thorvg-sw");
+        for ext in ["svg", "gif", "webp", "png", "apng"] {
+            assert_eq!(renderer_label_for_ext(ext), "img-native", "ext {ext}");
+        }
+        assert_eq!(renderer_label_for_ext("webm"), "video-native");
+        // Unknown ext mirrors the mount's unknown->Lottie fallback.
+        assert_eq!(renderer_label_for_ext("xyz"), "thorvg-sw");
+        assert_eq!(renderer_label_for_ext(""), "thorvg-sw");
     }
 
     #[test]

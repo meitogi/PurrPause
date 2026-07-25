@@ -4,7 +4,7 @@
 //
 //   1. Disk override :
 //      - For `animations/*` names → `<exe_dir>/Data/Animations/<basename>`
-//        (user drag-drop store, populated by config UI's ingest_lottie).
+//        (user drag-drop store, populated by config UI's ingest_animation).
 //      - For every other name → `<exe_dir>/resources/<name>` (dev
 //        override so a parent can hot-swap popup.html / icons without
 //        a rebuild).

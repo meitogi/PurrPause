@@ -345,9 +345,9 @@ mod windows_impl {
                 total.gpu_mem_bytes += row.gpu_mem_bytes;
                 total.workingset_bytes += row.workingset_bytes;
                 total.private_bytes += row.private_bytes;
-                writeln!(file, "{}", crate::bench::tsv_row(&ts, anim_file, anim_ext, crate::bench::RENDERER_LABEL, row))?;
+                writeln!(file, "{}", crate::bench::tsv_row(&ts, anim_file, anim_ext, crate::bench::renderer_label_for_ext(anim_ext), row))?;
             }
-            writeln!(file, "{}", crate::bench::tsv_row(&ts, anim_file, anim_ext, crate::bench::RENDERER_LABEL, &total))?;
+            writeln!(file, "{}", crate::bench::tsv_row(&ts, anim_file, anim_ext, crate::bench::renderer_label_for_ext(anim_ext), &total))?;
             file.flush()?;
         }
         tracing::info!("bench: sampling window complete");
@@ -1273,7 +1273,11 @@ mod windows_impl {
             "json" | "lottie" => "application/json",
             "css" => "text/css; charset=utf-8",
             "png" => "image/png",
+            "apng" => "image/apng",
+            "gif" => "image/gif",
+            "webp" => "image/webp",
             "svg" => "image/svg+xml",
+            "webm" => "video/webm",
             _ => "application/octet-stream",
         }
     }
