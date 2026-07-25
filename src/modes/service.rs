@@ -47,6 +47,23 @@ pub(super) fn clamp_cas_d_elapsed(elapsed_secs: u64, duration_secs: u64) -> u32 
     elapsed_secs.min(duration_secs) as u32
 }
 
+/// Did a config reload move the daily-pause window itself ? Only the
+/// fields defining WHEN the pause happens count — text / message edits
+/// must not invalidate per-day state. A changed window clears the
+/// skipped-today marker and the palier bits (they refer to the old
+/// window), but never `fired_today` : the pause already happened today
+/// and auto-refiring would risk a double lunch — the Rearm button owns
+/// the explicit re-fire.
+pub(super) fn daily_window_changed(
+    old: &crate::config::schema::DailyPauseConfig,
+    new: &crate::config::schema::DailyPauseConfig,
+) -> bool {
+    old.hour != new.hour
+        || old.minute != new.minute
+        || old.duration_minutes != new.duration_minutes
+        || old.timezone != new.timezone
+}
+
 /// Inputs of the session-4 daily↔interval collision decision, resolved
 /// by the tick loop from scheduler state + the live child handle.
 pub(super) struct DailyCollisionInputs {
@@ -162,6 +179,71 @@ mod tick_helper_tests {
             ..collision_inputs()
         };
         assert!(!daily_collision_wants_update(&i));
+    }
+
+    // -- daily_window_changed -----------------------------------------
+    //
+    // Reload-reconciliation behavior pinned by these tests + the
+    // scheduler suite : window changed → skipped marker + palier bits
+    // cleared (fresh chance at the new time, full pre-notifs) ;
+    // `fired_today` never cleared (no double lunch — Rearm button owns
+    // re-fire) ; a new window already in the past is re-stamped
+    // skipped by the Cas C block on the next tick.
+
+    fn daily_cfg() -> crate::config::schema::DailyPauseConfig {
+        crate::config::schema::DailyPauseConfig {
+            hour: 12,
+            minute: 0,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn daily_window_unchanged_for_identical_configs() {
+        assert!(!daily_window_changed(&daily_cfg(), &daily_cfg()));
+    }
+
+    #[test]
+    fn daily_window_changed_on_hour() {
+        let new = crate::config::schema::DailyPauseConfig { hour: 14, ..daily_cfg() };
+        assert!(daily_window_changed(&daily_cfg(), &new));
+    }
+
+    #[test]
+    fn daily_window_changed_on_minute() {
+        let new = crate::config::schema::DailyPauseConfig { minute: 30, ..daily_cfg() };
+        assert!(daily_window_changed(&daily_cfg(), &new));
+    }
+
+    #[test]
+    fn daily_window_changed_on_duration() {
+        let old = daily_cfg();
+        let new = crate::config::schema::DailyPauseConfig {
+            duration_minutes: old.duration_minutes + 30,
+            ..daily_cfg()
+        };
+        assert!(daily_window_changed(&old, &new));
+    }
+
+    #[test]
+    fn daily_window_changed_on_timezone() {
+        let new = crate::config::schema::DailyPauseConfig {
+            timezone: "America/New_York".to_string(),
+            ..daily_cfg()
+        };
+        assert!(daily_window_changed(&daily_cfg(), &new));
+    }
+
+    #[test]
+    fn daily_window_unchanged_on_text_or_enabled_edits() {
+        // Message / title edits and the kill-switch must NOT clear the
+        // per-day markers — only the window definition counts.
+        let new = crate::config::schema::DailyPauseConfig {
+            enabled: false,
+            popup_title: "Autre titre".to_string(),
+            ..daily_cfg()
+        };
+        assert!(!daily_window_changed(&daily_cfg(), &new));
     }
 }
 
@@ -853,6 +935,7 @@ mod win {
                 Ok(TickCommand::Reload) => {
                     tracing::info!("config reload triggered");
                     let state_path = PathBuf::from(STATE_DAT);
+                    let old_daily = config.daily_pause.clone();
                     *config = config::load_or_default(&state_path);
                     tracing::info!(
                         count_active_time = config.count_active_time,
@@ -894,6 +977,31 @@ mod win {
                             daily_pause_fired_at: *daily_pause_fired_at,
                             daily_pause_fired_paliers_bits: *daily_pause_fired_paliers_bits,
                             daily_pause_skipped_today: *daily_pause_skipped_today,
+                            popup_pid: *popup_pid,
+                        });
+                    }
+                    // A moved daily window invalidates the per-day
+                    // markers computed against the OLD window : the
+                    // skipped marker would block the new time all day
+                    // (and, pre-guard-fix, suppress intervals around
+                    // it), fired palier bits would swallow the new
+                    // pre-notifs. `fired_today` stays — see
+                    // daily_window_changed's doc.
+                    if super::daily_window_changed(&old_daily, &config.daily_pause) {
+                        *daily_pause_skipped_today = None;
+                        *daily_pause_fired_paliers_bits = 0;
+                        tracing::info!(
+                            "reload: daily-pause window changed - clearing skipped marker + palier bits (fired-today untouched)"
+                        );
+                        let _ = runtime_dat::write(&runtime_dat::RuntimeState {
+                            last_popup: *last_popup,
+                            paused_secs: *paused_secs,
+                            popup_pending: *popup_pending,
+                            last_heartbeat: *last_heartbeat,
+                            last_clean_shutdown_at: SystemTime::UNIX_EPOCH,
+                            daily_pause_fired_at: *daily_pause_fired_at,
+                            daily_pause_fired_paliers_bits: 0,
+                            daily_pause_skipped_today: None,
                             popup_pid: *popup_pid,
                         });
                     }

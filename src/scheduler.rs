@@ -537,8 +537,13 @@ pub fn next_event(
     // Daily-pause countdowns — iterate largest → smallest so we emit
     // the tightest-still-relevant palier when the earlier ones have
     // already been fired. Windows are closed once now_local passes
-    // fire_at_today (the fire branch above catches that case).
-    if daily_pause_state.enabled && !daily_pause_state.fired_today {
+    // fire_at_today (the fire branch above catches that case). A
+    // skipped day has no lunch to announce — same guard as the fire
+    // branch, or a moved-then-skipped window would still countdown.
+    if daily_pause_state.enabled
+        && !daily_pause_state.fired_today
+        && !daily_pause_state.skipped_today
+    {
         for palier in [15u32, 10, 5] {
             if daily_pause_state.fired_paliers.contains(&palier) {
                 continue;
@@ -563,8 +568,14 @@ pub fn next_event(
     // activity so no interval popup or pre-notif countdown lands on top
     // of the lunch pause. The daily fire / daily-countdown branches above
     // already emit the daily decisions at their exact moments ; this
-    // guard covers the gaps between them.
-    if daily_pause_state.enabled && !daily_pause_state.fired_today {
+    // guard covers the gaps between them. A skipped day has no lunch to
+    // protect (same guard as the fire branch) — without it, a stale
+    // skipped marker around a re-timed window would swallow interval
+    // deadlines for 45 min and release them late, paliers skipped.
+    if daily_pause_state.enabled
+        && !daily_pause_state.fired_today
+        && !daily_pause_state.skipped_today
+    {
         let window_start =
             daily_pause_state.fire_at_today - ChronoDuration::minutes(15);
         if now_local >= window_start && now_local <= daily_pause_state.grace_window_end {
@@ -1978,6 +1989,55 @@ mod tests {
         let last = epoch_plus(0);
         let fired = HashSet::new();
         let now_local = paris_at(2026, 3, 15, 12, 15);
+        let mut state = daily_state_at(chrono_tz::Europe::Paris, now_local, 12, 0, 30);
+        state.skipped_today = true;
+        let decision = next_event(now, &cfg, last, 0, &fired, false, &state, now_local);
+        assert_eq!(decision, SchedulerDecision::Nothing);
+    }
+
+    #[test]
+    fn daily_pause_suppression_lifted_when_skipped_today() {
+        // A skipped day has no lunch to protect : an interval due
+        // inside the (stale) suppression window must fire, not be
+        // swallowed until grace_window_end.
+        let cfg = config_with(2.0, vec![], false); // intervals ENABLED
+        let now = epoch_plus(3 * 3600); // 3h since last popup → due
+        let last = epoch_plus(0);
+        let fired = HashSet::new();
+        let now_local = paris_at(2026, 3, 15, 12, 15);
+        let mut state = daily_state_at(chrono_tz::Europe::Paris, now_local, 12, 0, 30);
+        state.skipped_today = true;
+        let decision = next_event(now, &cfg, last, 0, &fired, false, &state, now_local);
+        assert_eq!(decision, SchedulerDecision::FirePopup);
+    }
+
+    #[test]
+    fn daily_pause_suppression_active_when_not_skipped() {
+        // Regression pin : same setup minus the skipped marker — the
+        // suppression window still swallows the due interval. T-10
+        // with paliers 15+10 already emitted, so neither the countdown
+        // branch (palier 5 is at T-5) nor the fire branch is due : the
+        // suppression guard is the branch under test.
+        let cfg = config_with(2.0, vec![], false);
+        let now = epoch_plus(3 * 3600);
+        let last = epoch_plus(0);
+        let fired = HashSet::new();
+        let now_local = paris_at(2026, 3, 15, 11, 50);
+        let mut state = daily_state_at(chrono_tz::Europe::Paris, now_local, 12, 0, 30);
+        state.fired_paliers = HashSet::from([15, 10]);
+        let decision = next_event(now, &cfg, last, 0, &fired, false, &state, now_local);
+        assert_eq!(decision, SchedulerDecision::Nothing);
+    }
+
+    #[test]
+    fn daily_pause_countdown_not_emitted_when_skipped_today() {
+        // Paliers announce a lunch ; a skipped day has none. Intervals
+        // disabled so the assertion isolates the countdown branch.
+        let cfg = config_with(2.0, vec![], true);
+        let now = epoch_plus(10_000);
+        let last = epoch_plus(0);
+        let fired = HashSet::new();
+        let now_local = paris_at(2026, 3, 15, 11, 50); // T-10
         let mut state = daily_state_at(chrono_tz::Europe::Paris, now_local, 12, 0, 30);
         state.skipped_today = true;
         let decision = next_event(now, &cfg, last, 0, &fired, false, &state, now_local);
