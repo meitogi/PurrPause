@@ -10,6 +10,7 @@
 
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+mod bench;
 mod config;
 mod embedded;
 mod ipc;
@@ -243,6 +244,11 @@ enum Mode {
         /// so the dismiss countdown resumes at the right offset (or
         /// activates immediately if elapsed >= duration).
         elapsed_seconds: Option<u32>,
+        /// `Some(secs)` when spawned with `--bench [--bench-secs N]`
+        /// (config UI Animations tab, Benchmark checkbox). The popup
+        /// samples its process tree's CPU/GPU/memory every 500 ms into
+        /// `Data\Logs\bench.log` and self-exits after N seconds.
+        bench_secs: Option<u32>,
     },
     /// Small corner countdown widget for T-15 / T-10 / T-5 / T-1.
     /// `debug` skips force-minimize so the current window isn't lost.
@@ -303,6 +309,9 @@ fn classify_mode(args: &[String]) -> Mode {
             passcode_hash: parse_string_after(args, "--passcode-hash"),
             mode: parse_string_after(args, "--mode"),
             elapsed_seconds: parse_u32_after(args, "--elapsed-seconds"),
+            bench_secs: args.iter().any(|a| a == "--bench").then(|| {
+                parse_u32_after(args, "--bench-secs").unwrap_or(bench::DEFAULT_BENCH_SECS)
+            }),
         },
         Some("--countdown") => parse_countdown(args),
         Some("--config") => Mode::Config {
@@ -434,8 +443,8 @@ fn dispatch(mode: Mode) -> anyhow::Result<()> {
         Mode::Service => modes::service::run()?,
         Mode::Watchdog => modes::watchdog::run()?,
         Mode::InputProbe => modes::input_probe::run()?,
-        Mode::Popup { preview, debug, anim_override, config_override, test_countdown_secs, passcode_hash, mode: popup_mode, elapsed_seconds } => {
-            modes::popup::run(preview, debug, anim_override, config_override, test_countdown_secs, passcode_hash, popup_mode, elapsed_seconds)?
+        Mode::Popup { preview, debug, anim_override, config_override, test_countdown_secs, passcode_hash, mode: popup_mode, elapsed_seconds, bench_secs } => {
+            modes::popup::run(preview, debug, anim_override, config_override, test_countdown_secs, passcode_hash, popup_mode, elapsed_seconds, bench_secs)?
         }
         Mode::Countdown { seconds, palier, debug, config_override, mode: cd_mode } => {
             modes::countdown::run(seconds, palier, debug, config_override, cd_mode)?
@@ -457,7 +466,7 @@ fn dispatch(mode: Mode) -> anyhow::Result<()> {
         Mode::Uninstall => modes::uninstall::run()?,
         Mode::Unknown(argv) => {
             eprintln!("Unknown argv: {argv:?}");
-            eprintln!("Valid modes: --service | --popup [--preview] [--anim <file>] | --countdown <secs> --palier <15|10|5> | --config [--first-run] | --watchdog | --uninstall | --rollback-from-failed-install | --sandbox --try <preset>");
+            eprintln!("Valid modes: --service | --popup [--preview] [--anim <file>] [--bench [--bench-secs N]] | --countdown <secs> --palier <15|10|5> | --config [--first-run] | --watchdog | --uninstall | --rollback-from-failed-install | --sandbox --try <preset>");
             anyhow::bail!("unknown mode");
         }
     }
@@ -486,7 +495,7 @@ mod tests {
     fn popup_with_preview() {
         assert_eq!(
             classify_mode(&as_args(["--popup", "--preview"])),
-            Mode::Popup { preview: true, debug: false, anim_override: None, config_override: None, test_countdown_secs: None, passcode_hash: None, mode: None, elapsed_seconds: None }
+            Mode::Popup { preview: true, debug: false, anim_override: None, config_override: None, test_countdown_secs: None, passcode_hash: None, mode: None, elapsed_seconds: None, bench_secs: None }
         );
     }
 
@@ -494,7 +503,7 @@ mod tests {
     fn popup_without_preview() {
         assert_eq!(
             classify_mode(&as_args(["--popup"])),
-            Mode::Popup { preview: false, debug: false, anim_override: None, config_override: None, test_countdown_secs: None, passcode_hash: None, mode: None, elapsed_seconds: None }
+            Mode::Popup { preview: false, debug: false, anim_override: None, config_override: None, test_countdown_secs: None, passcode_hash: None, mode: None, elapsed_seconds: None, bench_secs: None }
         );
     }
 
@@ -502,7 +511,7 @@ mod tests {
     fn popup_default_has_no_debug() {
         assert_eq!(
             classify_mode(&as_args(["--popup"])),
-            Mode::Popup { preview: false, debug: false, anim_override: None, config_override: None, test_countdown_secs: None, passcode_hash: None, mode: None, elapsed_seconds: None }
+            Mode::Popup { preview: false, debug: false, anim_override: None, config_override: None, test_countdown_secs: None, passcode_hash: None, mode: None, elapsed_seconds: None, bench_secs: None }
         );
     }
 
@@ -510,7 +519,7 @@ mod tests {
     fn popup_debug_opts_in() {
         assert_eq!(
             classify_mode(&as_args(["--popup", "--debug"])),
-            Mode::Popup { preview: false, debug: true, anim_override: None, config_override: None, test_countdown_secs: None, passcode_hash: None, mode: None, elapsed_seconds: None }
+            Mode::Popup { preview: false, debug: true, anim_override: None, config_override: None, test_countdown_secs: None, passcode_hash: None, mode: None, elapsed_seconds: None, bench_secs: None }
         );
     }
 
@@ -518,7 +527,7 @@ mod tests {
     fn popup_legacy_no_debug_is_ignored() {
         assert_eq!(
             classify_mode(&as_args(["--popup", "--no-debug"])),
-            Mode::Popup { preview: false, debug: false, anim_override: None, config_override: None, test_countdown_secs: None, passcode_hash: None, mode: None, elapsed_seconds: None }
+            Mode::Popup { preview: false, debug: false, anim_override: None, config_override: None, test_countdown_secs: None, passcode_hash: None, mode: None, elapsed_seconds: None, bench_secs: None }
         );
     }
 
@@ -537,6 +546,7 @@ mod tests {
                 passcode_hash: None,
                 mode: None,
                 elapsed_seconds: None,
+                bench_secs: None,
             }
         );
     }
@@ -545,7 +555,7 @@ mod tests {
     fn popup_anim_traversal_rejected() {
         assert_eq!(
             classify_mode(&as_args(["--popup", "--anim", "../etc/passwd"])),
-            Mode::Popup { preview: false, debug: false, anim_override: None, config_override: None, test_countdown_secs: None, passcode_hash: None, mode: None, elapsed_seconds: None }
+            Mode::Popup { preview: false, debug: false, anim_override: None, config_override: None, test_countdown_secs: None, passcode_hash: None, mode: None, elapsed_seconds: None, bench_secs: None }
         );
     }
 
@@ -562,6 +572,7 @@ mod tests {
                 passcode_hash: None,
                 mode: None,
                 elapsed_seconds: None,
+                bench_secs: None,
             }
         );
     }
@@ -570,7 +581,7 @@ mod tests {
     fn popup_anim_absolute_path_rejected() {
         assert_eq!(
             classify_mode(&as_args(["--popup", "--anim", "/etc/hosts"])),
-            Mode::Popup { preview: false, debug: false, anim_override: None, config_override: None, test_countdown_secs: None, passcode_hash: None, mode: None, elapsed_seconds: None }
+            Mode::Popup { preview: false, debug: false, anim_override: None, config_override: None, test_countdown_secs: None, passcode_hash: None, mode: None, elapsed_seconds: None, bench_secs: None }
         );
     }
 
@@ -590,6 +601,7 @@ mod tests {
                 passcode_hash: Some(hash.to_string()),
                 mode: None,
                 elapsed_seconds: None,
+                bench_secs: None,
             }
         );
     }
@@ -598,7 +610,7 @@ mod tests {
     fn popup_passcode_hash_absent_is_none() {
         assert_eq!(
             classify_mode(&as_args(["--popup"])),
-            Mode::Popup { preview: false, debug: false, anim_override: None, config_override: None, test_countdown_secs: None, passcode_hash: None, mode: None, elapsed_seconds: None }
+            Mode::Popup { preview: false, debug: false, anim_override: None, config_override: None, test_countdown_secs: None, passcode_hash: None, mode: None, elapsed_seconds: None, bench_secs: None }
         );
     }
 
@@ -661,6 +673,7 @@ mod tests {
                 passcode_hash: None,
                 mode: Some("daily-pause".to_string()),
                 elapsed_seconds: None,
+                bench_secs: None,
             }
         );
     }
@@ -678,7 +691,32 @@ mod tests {
                 passcode_hash: None,
                 mode: Some("daily-pause".to_string()),
                 elapsed_seconds: Some(900),
+                bench_secs: None,
             }
+        );
+    }
+
+    #[test]
+    fn popup_bench_flag_with_secs() {
+        assert_eq!(
+            classify_mode(&as_args(["--popup", "--preview", "--bench", "--bench-secs", "30"])),
+            Mode::Popup { preview: true, debug: false, anim_override: None, config_override: None, test_countdown_secs: None, passcode_hash: None, mode: None, elapsed_seconds: None, bench_secs: Some(30) }
+        );
+    }
+
+    #[test]
+    fn popup_bench_flag_defaults_secs() {
+        assert_eq!(
+            classify_mode(&as_args(["--popup", "--bench"])),
+            Mode::Popup { preview: false, debug: false, anim_override: None, config_override: None, test_countdown_secs: None, passcode_hash: None, mode: None, elapsed_seconds: None, bench_secs: Some(bench::DEFAULT_BENCH_SECS) }
+        );
+    }
+
+    #[test]
+    fn popup_bench_secs_without_bench_is_none() {
+        assert_eq!(
+            classify_mode(&as_args(["--popup", "--bench-secs", "30"])),
+            Mode::Popup { preview: false, debug: false, anim_override: None, config_override: None, test_countdown_secs: None, passcode_hash: None, mode: None, elapsed_seconds: None, bench_secs: None }
         );
     }
 

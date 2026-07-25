@@ -9,6 +9,7 @@ pub mod itaskservice;
 pub mod keyboard_hook;
 pub mod power_notify;
 pub mod proc_kill;
+pub mod proc_sample;
 pub mod service_config;
 pub mod spawn_user;
 pub mod unbiased_time;

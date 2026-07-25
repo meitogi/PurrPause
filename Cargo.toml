@@ -1,6 +1,6 @@
 [package]
 name = "purrpause"
-version = "1.5.0"
+version = "1.6.0"
 edition = "2021"
 license = "MIT"
 description = "Break-reminder overlay for Windows — camouflaged Windows Session Health Service"
@@ -60,7 +60,10 @@ image = { version = "0.25.10", default-features = false, features = ["png"] }
 # on Linux doesn't pull GTK/WebKit through wry/eframe.
 [target.'cfg(windows)'.dependencies]
 tao = "0.35.3"
-wry = "0.55.1"
+# `devtools` feature is load-bearing : without it `.with_devtools(true)`
+# is a silent no-op in release builds (wry gates the whole devtools path
+# behind the cargo feature outside debug_assertions).
+wry = { version = "0.55.1", features = ["devtools"] }
 egui = "0.35.0"
 eframe = { version = "0.35.0", default-features = false, features = ["default_fonts", "wgpu"] }
 raw-window-handle = "0.6"                # Extract HWND from eframe::Frame (countdown widget styling)
@@ -78,8 +81,10 @@ windows = { version = "0.62.2", features = [
     "Win32_System_Diagnostics_ToolHelp", # CreateToolhelp32Snapshot + PROCESSENTRY32W (orphan WebView2 sweep)
     "Win32_System_Environment",          # CreateEnvironmentBlock / DestroyEnvironmentBlock
     "Win32_System_IO",                   # OVERLAPPED + GetOverlappedResult (pipe accept)
+    "Win32_System_Performance",          # PDH GPU Engine / GPU Process Memory counters (bench sampler)
     "Win32_System_Pipes",                # CreateNamedPipeW + PIPE_* constants
     "Win32_System_Power",                # RegisterSuspendResumeNotification + HPOWERNOTIFY (suspend/resume broadcasts)
+    "Win32_System_ProcessStatus",        # GetProcessMemoryInfo (bench sampler)
     "Win32_System_RemoteDesktop",        # WTSQueryUserToken
     "Win32_System_Services",             # SCM helpers not covered by windows-service
     "Win32_System_Registry",             # Runtime service ImagePath queries

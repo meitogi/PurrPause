@@ -54,6 +54,9 @@ pub struct TabsState {
     pub confirm_close: bool,
     pub save_error: Option<String>,
     pub new_palier_buffer: u32,
+    /// Ephemeral (never persisted) : when ticked, the Animations-tab
+    /// "Tester" button spawns the popup in bench mode (--bench).
+    pub bench_animations: bool,
 }
 
 impl TabsState {
@@ -65,6 +68,7 @@ impl TabsState {
             confirm_close: false,
             save_error: None,
             new_palier_buffer: 20,
+            bench_animations: false,
         }
     }
 }
@@ -221,7 +225,9 @@ pub fn ui(
                 .show(ui, |ui| match state.active {
                 Tab::General => ui_general(ui, cfg, &mut state.dirty),
                 Tab::DailyPause => ui_daily_pause(ui, cfg, &mut state.dirty),
-                Tab::Animations => ui_animations(ui, cfg, &mut state.dirty),
+                Tab::Animations => {
+                    ui_animations(ui, cfg, &mut state.dirty, &mut state.bench_animations)
+                }
                 Tab::Messages => ui_messages(ui, cfg, &mut state.dirty),
                 Tab::Notifications => {
                     ui_notifications(ui, cfg, &mut state.dirty, &mut state.new_palier_buffer)
@@ -749,10 +755,17 @@ fn ui_daily_pause(ui: &mut egui::Ui, cfg: &mut Config, dirty: &mut bool) {
     });
 }
 
-fn ui_animations(ui: &mut egui::Ui, cfg: &mut Config, dirty: &mut bool) {
+fn ui_animations(ui: &mut egui::Ui, cfg: &mut Config, dirty: &mut bool, bench: &mut bool) {
     ui.label("Coche pour activer. Glisser-déposer un .lottie pour l'ajouter.");
     ui.add_space(6.0);
     rotation_row(ui, cfg, dirty);
+    ui.add_space(8.0);
+    // Ephemeral toggle (not saved) : reframes the per-row "Tester"
+    // button as a benchmark run instead of adding a second button.
+    ui.checkbox(
+        bench,
+        "Benchmark : Tester échantillonne CPU/GPU/RAM pendant 10 s dans Data\\Logs\\bench.log",
+    );
     ui.add_space(8.0);
 
     // Accept files dropped anywhere on the window.
@@ -835,6 +848,11 @@ fn ui_animations(ui: &mut egui::Ui, cfg: &mut Config, dirty: &mut bool) {
             "--anim".into(),
             file.clone(),
         ];
+        if *bench {
+            args.push("--bench".into());
+            args.push("--bench-secs".into());
+            args.push(crate::bench::DEFAULT_BENCH_SECS.to_string());
+        }
         if let Some(p) = override_path.as_ref() {
             args.push("--config-override".into());
             args.push(p.to_string_lossy().to_string());

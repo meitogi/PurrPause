@@ -134,8 +134,9 @@ pub fn run(
     passcode_hash: Option<String>,
     mode: Option<String>,
     elapsed_seconds: Option<u32>,
+    bench_secs: Option<u32>,
 ) -> anyhow::Result<()> {
-    windows_impl::run(preview, debug, anim_override, config_override, test_countdown_secs, passcode_hash, mode, elapsed_seconds)
+    windows_impl::run(preview, debug, anim_override, config_override, test_countdown_secs, passcode_hash, mode, elapsed_seconds, bench_secs)
 }
 
 #[cfg(not(windows))]
@@ -148,6 +149,7 @@ pub fn run(
     _passcode_hash: Option<String>,
     _mode: Option<String>,
     _elapsed_seconds: Option<u32>,
+    _bench_secs: Option<u32>,
 ) -> anyhow::Result<()> {
     anyhow::bail!("popup mode is Windows-only")
 }
@@ -217,6 +219,9 @@ mod windows_impl {
         /// Restart only the visible countdown / unlock timer.
         /// `palier_minutes` is informational (logged).
         IpcRestartCountdown { palier_minutes: u32, seconds_until: u64 },
+        /// Bench sampling window elapsed (or the sampler failed) —
+        /// clean-exit the popup through the same path as Dismiss.
+        BenchDone,
     }
 
     /// Install the LL keyboard hook (pincode-capturing variant when a
@@ -275,6 +280,74 @@ mod windows_impl {
             .as_secs()
     }
 
+    /// Bench-mode sampling loop (background thread). Appends one TSV
+    /// row per live tree process per 500 ms tick, plus a `role=total`
+    /// aggregate row, to `<exe_dir>\Data\Logs\bench.log` — the same dir
+    /// as widget.log, proven writable by the user-session popup
+    /// (DiagnosticsCache is SYSTEM/admin-write only). Rows are flushed
+    /// every tick : tao's `event_loop.run` diverges and terminates via
+    /// process::exit, so nothing buffered would survive the exit.
+    ///
+    /// Tick 1 is a baseline (cpu columns 0 — no previous CPU totals) ;
+    /// analysis discards the first row group.
+    fn run_bench_sampler(secs: u32, anim_file: &str, anim_ext: &str) -> Result<()> {
+        use std::io::Write;
+
+        let exe = std::env::current_exe().context("current_exe")?;
+        let exe_dir = exe.parent().context("exe has no parent dir")?;
+        let log_dir = crate::modes::install::logs_dir(exe_dir);
+        std::fs::create_dir_all(&log_dir).context("create Data/Logs")?;
+        let log_path = log_dir.join("bench.log");
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&log_path)
+            .with_context(|| format!("open {}", log_path.display()))?;
+        if file.metadata().map(|m| m.len() == 0).unwrap_or(false) {
+            writeln!(file, "{}", crate::bench::TSV_HEADER)?;
+        }
+
+        let mut sampler = crate::platform::win32::proc_sample::ProcSampler::new(std::process::id())
+            .context("ProcSampler::new")?;
+        tracing::info!(secs, log = %log_path.display(), "bench: sampling started");
+
+        let ticks = (secs as u64).saturating_mul(1000) / crate::bench::BENCH_TICK_MS;
+        let mut last_tick = std::time::Instant::now();
+        for _ in 0..ticks {
+            std::thread::sleep(Duration::from_millis(crate::bench::BENCH_TICK_MS));
+            // Measured interval, not the nominal 500 ms — cpu_pct must
+            // survive scheduler jitter / a busy machine.
+            let interval = last_tick.elapsed();
+            last_tick = std::time::Instant::now();
+
+            let rows = sampler.sample(interval).context("sample tick")?;
+            let ts = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%.3f").to_string();
+            let mut total = crate::bench::BenchRow {
+                pid: std::process::id(),
+                role: "total".to_string(),
+                cpu_ms: 0,
+                cpu_pct: 0.0,
+                gpu_pct: 0.0,
+                gpu_mem_bytes: 0,
+                workingset_bytes: 0,
+                private_bytes: 0,
+            };
+            for row in &rows {
+                total.cpu_ms += row.cpu_ms;
+                total.cpu_pct += row.cpu_pct;
+                total.gpu_pct += row.gpu_pct;
+                total.gpu_mem_bytes += row.gpu_mem_bytes;
+                total.workingset_bytes += row.workingset_bytes;
+                total.private_bytes += row.private_bytes;
+                writeln!(file, "{}", crate::bench::tsv_row(&ts, anim_file, anim_ext, crate::bench::RENDERER_LABEL, row))?;
+            }
+            writeln!(file, "{}", crate::bench::tsv_row(&ts, anim_file, anim_ext, crate::bench::RENDERER_LABEL, &total))?;
+            file.flush()?;
+        }
+        tracing::info!("bench: sampling window complete");
+        Ok(())
+    }
+
     pub fn run(
         preview: bool,
         debug: bool,
@@ -284,6 +357,7 @@ mod windows_impl {
         passcode_hash: Option<String>,
         mode: Option<String>,
         elapsed_seconds: Option<u32>,
+        bench_secs: Option<u32>,
     ) -> Result<()> {
         // Preview / test spawns from the config UI pass a per-PID
         // temp state file so uncommitted edits show up without an
@@ -535,6 +609,7 @@ mod windows_impl {
             resources_dir: PathBuf,
             rendered: String,
             proxy: tao::event_loop::EventLoopProxy<UserEvent>,
+            devtools: bool,
         ) -> Result<(wry::WebView, wry::WebContext)> {
             if let Some(ref dir) = webview2_data {
                 let _ = std::fs::create_dir_all(dir);
@@ -544,6 +619,13 @@ mod windows_impl {
             let mut web_ctx = wry::WebContext::new(webview2_data);
             let webview = wry::WebViewBuilder::new_with_web_context(&mut web_ctx)
                 .with_transparent(true)
+                // Right-click > Inspect. Gated off in real scheduled
+                // popups (the kid must not get a devtools escape hatch) ;
+                // available in preview / debug / bench so the
+                // GPU-compositing diagnostic can read the WebGL renderer
+                // string + rendering stats. Never auto-opened : an open
+                // devtools window would pollute the bench numbers.
+                .with_devtools(devtools)
                 .with_custom_protocol(
                     "purrpause".to_string(),
                     move |_webview_id, request| {
@@ -597,12 +679,14 @@ mod windows_impl {
         }
 
         tracing::info!("popup: building wry webview");
+        let devtools = preview || debug || bench_secs.is_some();
         let first_attempt = build_webview(
             &window,
             webview2_data.clone(),
             resources_dir.clone(),
             rendered.clone(),
             event_loop.create_proxy(),
+            devtools,
         );
         // Force-shutdown mid-popup can leave <exe_dir>/Data/WebView2/
         // in a locked/partial state, surfacing on the next popup as
@@ -631,6 +715,7 @@ mod windows_impl {
                     resources_dir.clone(),
                     rendered.clone(),
                     event_loop.create_proxy(),
+                    devtools,
                 )
                 .context("build wry webview after WebView2 UserData wipe (retry-once)")?
             }
@@ -717,6 +802,27 @@ mod windows_impl {
                 }
             }
         });
+
+        // Benchmark sampler thread. Samples the whole process tree
+        // (host + msedgewebview2 children — the renderer child is where
+        // the rasterization cost lives) every 500 ms into
+        // Data\Logs\bench.log, then BenchDone auto-exits the popup.
+        // Spawned AFTER the webview build so the WebView2 children
+        // exist by the first tick. Self-sampling caveat : the thread's
+        // own cost lands in the host row — negligible at 500 ms cadence
+        // against a saturated renderer core.
+        if let Some(secs) = bench_secs {
+            let bench_proxy = event_loop.create_proxy();
+            let (anim_file, anim_ext) = crate::bench::split_anim_name(&anim_path);
+            std::thread::spawn(move || {
+                if let Err(e) = run_bench_sampler(secs, &anim_file, &anim_ext) {
+                    tracing::warn!(error = ?e, "bench sampler failed");
+                }
+                // Sent on the error path too — the popup must always
+                // auto-exit once the bench window is over.
+                let _ = bench_proxy.send_event(UserEvent::BenchDone);
+            });
+        }
 
         // Per-PID content pipe. Runs for EVERY popup (interval popups
         // are exactly the ones a daily-pause collision must mutate).
@@ -815,6 +921,10 @@ mod windows_impl {
             match event {
                 Event::UserEvent(UserEvent::Dismiss) => {
                     tracing::info!("popup dismissed by user");
+                    *control_flow = ControlFlow::Exit;
+                }
+                Event::UserEvent(UserEvent::BenchDone) => {
+                    tracing::info!("popup: bench window complete - exiting");
                     *control_flow = ControlFlow::Exit;
                 }
                 Event::UserEvent(UserEvent::ReassertForeground) => {
