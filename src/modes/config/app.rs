@@ -86,6 +86,7 @@ pub fn run() -> Result<()> {
 
     let options = eframe::NativeOptions {
         viewport,
+        wgpu_options: wgpu_options_with_surface_recovery(),
         ..Default::default()
     };
 
@@ -128,6 +129,44 @@ pub fn run() -> Result<()> {
             );
             Err(anyhow!("eframe: {e}"))
         }
+    }
+}
+
+/// `WgpuConfiguration` whose surface-status callback logs through
+/// `tracing` and escalates unknown statuses to a surface recreation.
+///
+/// eframe's default handler logs via the `log` crate at debug/trace
+/// (invisible in widget.log at the info filter) and SKIPS the frame on
+/// any status it doesn't recognise — after a Parallels quit/resume the
+/// virtualized D3D12 surface can come back in such a state, and
+/// skipping forever means the window stays black even though frames
+/// are requested (the heartbeat repaint alone couldn't recover it).
+/// Recreating the surface is the strongest recovery available from
+/// here ; if the whole device is removed even that fails, but the
+/// warn-level log now says so instead of failing silently.
+fn wgpu_options_with_surface_recovery() -> eframe::egui_wgpu::WgpuConfiguration {
+    use eframe::egui_wgpu::{SurfaceErrorAction, WgpuConfiguration};
+    use eframe::wgpu::CurrentSurfaceTexture;
+    WgpuConfiguration {
+        on_surface_status: std::sync::Arc::new(|status| match status {
+            CurrentSurfaceTexture::Outdated => {
+                tracing::info!("wgpu surface outdated - reconfiguring");
+                SurfaceErrorAction::Reconfigure
+            }
+            CurrentSurfaceTexture::Lost => {
+                tracing::warn!("wgpu surface lost - recreating surface");
+                SurfaceErrorAction::RecreateSurface
+            }
+            CurrentSurfaceTexture::Occluded => SurfaceErrorAction::SkipFrame,
+            other => {
+                tracing::warn!(
+                    status = ?other,
+                    "wgpu surface error - attempting surface recreation"
+                );
+                SurfaceErrorAction::RecreateSurface
+            }
+        }),
+        ..Default::default()
     }
 }
 
