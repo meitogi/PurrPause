@@ -273,7 +273,8 @@
       data-animation-path="{{ ANIMATION_PATH }}"
       data-countdown-template="{{ COUNTDOWN_TEMPLATE }}"
       data-mode="{{ POPUP_MODE }}"
-      data-debug="{{ DEBUG_MODE }}">
+      data-debug="{{ DEBUG_MODE }}"
+      data-devtools="{{ DEVTOOLS }}">
   <!-- <dotlottie-wc> is mounted by JS in the module script below, AFTER
        setWasmUrl() has pinned the vendored WASM URL. Putting the element
        in the initial HTML races the constructor's _initWasm() against
@@ -981,6 +982,53 @@
       default:
         console.warn('[mount] unknown animation extension', JSON.stringify(ext), '— falling back to Lottie');
         mountLottie();
+    }
+
+    // ── Diagnostics / hardening ──────────────────────────────────────
+    // When devtools is enabled (preview/debug/bench) the popup can't rely
+    // on a human opening DevTools to read the WebGL renderer string — the
+    // fullscreen topmost window sits over the DevTools window — so it
+    // self-reports over the existing window.ipc bridge instead. When
+    // devtools is OFF (a real scheduled popup) the WebView2 default
+    // context menu is suppressed so a right-click is inert.
+    if (document.body.dataset.devtools === '1') {
+      // Probe once, after the mounts settle, so the performance resource
+      // entries (the vendor/* fetches) are already recorded — that list
+      // is the conditional-import proof (a .lottie popup fetches zero
+      // vendor/rive/*, a .riv popup fetches zero vendor/dotlottie-wc/*).
+      setTimeout(() => {
+        try {
+          let webglRenderer;
+          try {
+            const c = document.createElement('canvas');
+            const gl = c.getContext('webgl2') || c.getContext('webgl');
+            const info = gl && gl.getExtension('WEBGL_debug_renderer_info');
+            webglRenderer = info
+              ? gl.getParameter(info.UNMASKED_RENDERER_WEBGL)
+              : (gl ? '(WEBGL_debug_renderer_info unavailable)' : '(no webgl context)');
+          } catch (e) { webglRenderer = '(probe error: ' + e + ')'; }
+
+          const animEl = document.getElementById('anim');
+          const vendorResources = performance.getEntriesByType('resource')
+            .map(r => r.name)
+            .filter(n => n.includes('/vendor/'))
+            .map(n => n.replace(location.origin, ''));
+
+          const payload = {
+            path, ext, webglRenderer,
+            mountedEl: animEl ? animEl.tagName.toLowerCase() : null,
+            riveLoaded: !!window.rive,
+            dotlottieLoaded: !!customElements.get('dotlottie-wc'),
+            vendorResources,
+          };
+          if (window.ipc && typeof window.ipc.postMessage === 'function') {
+            window.ipc.postMessage('diag:' + JSON.stringify(payload));
+          }
+          console.info('[diag]', payload);
+        } catch (e) { console.error('[diag] failed:', e); }
+      }, 1500);
+    } else {
+      document.addEventListener('contextmenu', e => e.preventDefault());
     }
   </script>
 </body>

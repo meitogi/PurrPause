@@ -83,11 +83,16 @@ pub fn render_html(
     countdown_seconds: u32,
     preview: bool,
     debug: bool,
+    devtools: bool,
     stage_scale: f32,
     stage_offset_y_vh: i8,
 ) -> String {
     let mode = if preview { "preview" } else { "live" };
     let debug_mode = if debug { "true" } else { "false" };
+    // "1" when the popup self-diagnoses (WebGL renderer + conditional-import
+    // proof over window.ipc) and keeps the context menu; "0" on a real
+    // scheduled popup, which suppresses right-click instead.
+    let devtools_flag = if devtools { "1" } else { "0" };
     // WebView2 propagates the HTML <title> to the parent HWND's OS
     // title, so if we only bumped the tao WindowBuilder title the
     // "(preview)" suffix would get overwritten seconds later. Apply
@@ -109,6 +114,7 @@ pub fn render_html(
         .replace("{{ COUNTDOWN_SECONDS }}", &countdown_seconds.to_string())
         .replace("{{ POPUP_MODE }}", mode)
         .replace("{{ DEBUG_MODE }}", debug_mode)
+        .replace("{{ DEVTOOLS }}", devtools_flag)
         .replace("{{ STAGE_SCALE }}", &format!("{stage_scale:.2}"))
         .replace("{{ STAGE_OFFSET_Y_VH }}", &stage_offset_y_vh.to_string())
 }
@@ -471,6 +477,11 @@ mod windows_impl {
         let template = String::from_utf8(template_bytes.into_owned())
             .context("popup.html is not valid utf-8")?;
         let resources_dir = resources_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        // Devtools reachable (right-click > Inspect) in preview / debug /
+        // bench. Also drives the popup's self-diagnostic: when on, the page
+        // reports the WebGL renderer + fetched vendor bytes over window.ipc;
+        // when off (real scheduled popup), it blocks the context menu.
+        let devtools = preview || debug || bench_secs.is_some();
         let rendered = render_html(
             &template,
             &cfg,
@@ -478,6 +489,7 @@ mod windows_impl {
             countdown,
             preview,
             debug,
+            devtools,
             scale,
             offset_y_vh,
         );
@@ -649,6 +661,35 @@ mod windows_impl {
                         let _ = proxy.send_event(UserEvent::Dismiss);
                         return;
                     }
+                    // Self-diagnostic from a preview / debug / bench popup :
+                    // the WebGL renderer string (GPU-compositing verdict) +
+                    // the fetched vendor bytes (conditional-import proof),
+                    // posted here so no DevTools window is needed (the
+                    // fullscreen topmost popup would sit over it). Audit trail
+                    // to widget.log, plus a one-line append to
+                    // <exe_dir>\Data\Logs\bench-diag.log (kept out of bench.log
+                    // so its strict 12-col TSV stays parseable).
+                    if let Some(rest) = body.strip_prefix("diag:") {
+                        tracing::info!(diag = rest, "bench.diag");
+                        if let Some(dir) = std::env::current_exe()
+                            .ok()
+                            .and_then(|e| e.parent().map(|p| crate::modes::install::logs_dir(p)))
+                        {
+                            let _ = std::fs::create_dir_all(&dir);
+                            let ts = chrono::Local::now()
+                                .format("%Y-%m-%dT%H:%M:%S%.3f")
+                                .to_string();
+                            if let Ok(mut f) = std::fs::OpenOptions::new()
+                                .append(true)
+                                .create(true)
+                                .open(dir.join("bench-diag.log"))
+                            {
+                                use std::io::Write;
+                                let _ = writeln!(f, "{ts}\t{rest}");
+                            }
+                        }
+                        return;
+                    }
                     // WebView2 JS-side pincode capture, primary surface :
                     // the LL keyboard hook + tao WindowEvent path both
                     // fail on some virtualised guests (Parallels on
@@ -685,7 +726,6 @@ mod windows_impl {
         }
 
         tracing::info!("popup: building wry webview");
-        let devtools = preview || debug || bench_secs.is_some();
         let first_attempt = build_webview(
             &window,
             webview2_data.clone(),
@@ -1417,6 +1457,7 @@ mod tests {
             300,
             false,
             false,
+            false,
             1.0,
             0,
         );
@@ -1437,6 +1478,7 @@ mod tests {
             300,
             false,
             false,
+            false,
             1.0,
             0,
         );
@@ -1452,6 +1494,7 @@ mod tests {
             "animations/foo.lottie",
             10,
             true,
+            false,
             false,
             1.0,
             0,
@@ -1469,6 +1512,7 @@ mod tests {
             &cfg,
             "animations/foo.lottie",
             60,
+            false,
             false,
             false,
             1.0,
@@ -1494,6 +1538,7 @@ mod tests {
             10,
             true,
             false,
+            false,
             1.0,
             0,
         );
@@ -1505,11 +1550,24 @@ mod tests {
     fn stage_scale_and_offset_substituted() {
         let cfg = Config::default();
         let tpl = r#"<style>:root { --stage-scale: {{ STAGE_SCALE }}; --stage-offset-y: {{ STAGE_OFFSET_Y_VH }}vh; }</style>"#;
-        let out = render_html(tpl, &cfg, "animations/foo.lottie", 60, false, false, 1.5, -12);
+        let out = render_html(tpl, &cfg, "animations/foo.lottie", 60, false, false, false, 1.5, -12);
         assert!(out.contains("--stage-scale: 1.50"));
         assert!(out.contains("--stage-offset-y: -12vh"));
         assert!(!out.contains("{{ STAGE_SCALE }}"));
         assert!(!out.contains("{{ STAGE_OFFSET_Y_VH }}"));
+    }
+
+    #[test]
+    fn devtools_flag_substituted() {
+        // "1" drives the popup's self-diagnostic (WebGL renderer +
+        // conditional-import proof over window.ipc) and keeps the context
+        // menu; "0" (real scheduled popup) suppresses right-click instead.
+        let cfg = Config::default();
+        let tpl = r#"<body data-devtools="{{ DEVTOOLS }}"></body>"#;
+        let on = render_html(tpl, &cfg, "animations/foo.lottie", 60, false, false, true, 1.0, 0);
+        assert!(on.contains(r#"data-devtools="1""#));
+        let off = render_html(tpl, &cfg, "animations/foo.lottie", 60, false, false, false, 1.0, 0);
+        assert!(off.contains(r#"data-devtools="0""#));
     }
 
     #[test]
