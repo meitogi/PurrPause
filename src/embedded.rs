@@ -58,6 +58,11 @@ pub const EMBEDDED_ASSETS: &[(&str, &[u8])] = &[
         "vendor/dotlottie-wc/dotlottie-player.wasm",
         include_bytes!("../resources/vendor/dotlottie-wc/dotlottie-player.wasm"),
     ),
+    ("vendor/rive/rive.js", include_bytes!("../resources/vendor/rive/rive.js")),
+    (
+        "vendor/rive/rive.wasm",
+        include_bytes!("../resources/vendor/rive/rive.wasm"),
+    ),
     ("cat-icon.png", include_bytes!("../resources/cat-icon.png")),
     (
         "cat-watermark.png",

@@ -187,7 +187,7 @@ pub fn spawn_local_with_env(args: &[&str], env: &[(&str, &str)]) -> Result<()> {
 /// File extensions the config UI accepts as animations. The popup detects
 /// the engine by extension too (see `resources/popup.html` mount script),
 /// so the import gate and the mount must agree on this set.
-pub const ANIM_EXTS: &[&str] = &["lottie", "svg", "gif", "webp", "png", "apng", "webm"];
+pub const ANIM_EXTS: &[&str] = &["lottie", "svg", "gif", "webp", "png", "apng", "webm", "riv"];
 
 /// True when `path`'s extension (case-insensitive) is an accepted animation
 /// format.

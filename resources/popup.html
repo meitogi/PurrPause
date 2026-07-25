@@ -50,6 +50,11 @@
       - vendor/dotlottie-wc/dotlottie-player.wasm — the renderer core
         (software renderer, ~1.8MB, from @lottiefiles/dotlottie-web).
         Pointed at via setWasmUrl() so no CDN fetch ever happens.
+      - vendor/rive/rive.js   — @rive-app/webgl2 UMD bundle (classic
+        <script>, exposes window.rive). GPU renderer via WebGL2.
+      - vendor/rive/rive.wasm — the Rive runtime core (~2.5MB).
+        Pointed at via rive.RuntimeLoader.setWasmUrl() so no CDN
+        fetch ever happens.
   -->
   <style>
     :root {
@@ -840,12 +845,14 @@
       .lottie                       → <dotlottie-wc> (ThorVG software WASM)
       .svg .gif .webp .png .apng    → <img>   (native raster/vector decode)
       .webm                         → <video> (VP9/VP8 alpha, WebView2-composited)
+      .riv                          → <canvas> (Rive, WebGL2 GPU renderer)
       unknown                       → Lottie fallback + console warning
 
-    The ~1.8 MB dotlottie-wc bundle is imported ONLY inside mountLottie(), so a
-    non-Lottie popup pulls zero dotlottie bytes. Every branch keeps the same
-    id='anim' / class='stage' contract (stage scale/offset CSS + z-index key off
-    .stage; the in-place IPC update keys off #anim).
+    The ~1.8 MB dotlottie-wc bundle is imported ONLY inside mountLottie(), and
+    the ~2.5 MB Rive runtime ONLY inside mountRive() — a popup for any other
+    format pulls zero bytes of either. Every branch keeps the same id='anim' /
+    class='stage' contract (stage scale/offset CSS + z-index key off .stage;
+    the in-place IPC update keys off #anim).
   -->
   <script type="module">
     const path = document.body.dataset.animationPath || '';
@@ -896,6 +903,64 @@
       document.body.prepend(el);
     }
 
+    // Rive (.riv) via <canvas>, GPU rendering through @rive-app/webgl2 (fully
+    // vendored — no CDN fetch). rive.js is a classic UMD bundle (not an ES
+    // module), so it's loaded via a lazily-injected <script> tag, only inside
+    // this function — a non-.riv popup never fetches it.
+    //
+    // A .riv file's own default artboard (index 0) is often a blank
+    // placeholder — the real content lives in a different, composed
+    // artboard defined after it. This mirrors the heuristic validated in the
+    // local Rive tester (resources/fixtures/preview.html): probe the file
+    // with a throwaway instance, then run the LAST artboard that carries a
+    // state machine (falls back to Rive's own default if none do).
+    async function mountRive() {
+      await new Promise((resolve, reject) => {
+        const s = document.createElement('script');
+        s.src = './vendor/rive/rive.js';
+        s.onload = resolve;
+        s.onerror = () => reject(new Error('vendor/rive/rive.js missing'));
+        document.head.appendChild(s);
+      });
+      const rive = window.rive;
+      rive.RuntimeLoader.setWasmUrl(new URL('./vendor/rive/rive.wasm', location.href).href);
+
+      const canvas = document.createElement('canvas');
+      canvas.id = 'anim';
+      canvas.className = 'stage';
+      document.body.prepend(canvas);
+
+      const buffer = await (await fetch(path)).arrayBuffer();
+
+      const probe = new rive.Rive({
+        buffer: buffer.slice(0),
+        canvas: document.createElement('canvas'),
+        autoplay: false,
+        onLoad: () => {
+          const artboards = (probe.contents && probe.contents.artboards) || [];
+          try { probe.cleanup(); } catch (e) { /* best-effort */ }
+          const chosen = [...artboards].reverse().find(a => (a.stateMachines || []).length);
+          const artboard = chosen ? chosen.name : undefined;
+          const stateMachines = chosen ? chosen.stateMachines[0].name : undefined;
+
+          const instance = new rive.Rive({
+            buffer,
+            canvas,
+            autoplay: true,
+            artboard,
+            stateMachines,
+            layout: new rive.Layout({ fit: rive.Fit.Contain, alignment: rive.Alignment.Center }),
+            onLoad: () => {
+              instance.resizeDrawingSurfaceToCanvas();
+              console.info('[rive] loaded:', path, 'artboard:', artboard || '(default)');
+            },
+            onLoadError: e => console.error('[rive] load error:', e),
+          });
+        },
+        onLoadError: e => console.error('[rive] probe error:', e),
+      });
+    }
+
     switch (ext) {
       case 'lottie':
         mountLottie();
@@ -909,6 +974,9 @@
         break;
       case 'webm':
         mountMedia('video');
+        break;
+      case 'riv':
+        mountRive();
         break;
       default:
         console.warn('[mount] unknown animation extension', JSON.stringify(ext), '— falling back to Lottie');

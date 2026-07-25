@@ -1278,6 +1278,7 @@ mod windows_impl {
             "webp" => "image/webp",
             "svg" => "image/svg+xml",
             "webm" => "video/webm",
+            "riv" => "application/octet-stream",
             _ => "application/octet-stream",
         }
     }

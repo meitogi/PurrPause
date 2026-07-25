@@ -17,14 +17,16 @@ pub const TSV_HEADER: &str = "timestamp\tfilename\textension\trenderer\tpid\trol
 ///   `.lottie`                       -> `thorvg-sw`  (software WASM)
 ///   `.svg/.gif/.webp/.png/.apng`    -> `img-native` (WebView `<img>` decode)
 ///   `.webm`                         -> `video-native`
+///   `.riv`                          -> `rive-gpu`   (WebGL2 GPU renderer)
 /// Unknown extensions map to `thorvg-sw` to match the popup mount's
-/// unknown->Lottie fallback. GPU vector engines (Rive/Skottie) add their
-/// own labels in later rollout sessions.
+/// unknown->Lottie fallback. Skottie adds its own label in a later
+/// rollout session.
 pub fn renderer_label_for_ext(ext: &str) -> &'static str {
     match ext {
         "lottie" => "thorvg-sw",
         "svg" | "gif" | "webp" | "png" | "apng" => "img-native",
         "webm" => "video-native",
+        "riv" => "rive-gpu",
         _ => "thorvg-sw",
     }
 }
@@ -236,6 +238,7 @@ mod tests {
             assert_eq!(renderer_label_for_ext(ext), "img-native", "ext {ext}");
         }
         assert_eq!(renderer_label_for_ext("webm"), "video-native");
+        assert_eq!(renderer_label_for_ext("riv"), "rive-gpu");
         // Unknown ext mirrors the mount's unknown->Lottie fallback.
         assert_eq!(renderer_label_for_ext("xyz"), "thorvg-sw");
         assert_eq!(renderer_label_for_ext(""), "thorvg-sw");
