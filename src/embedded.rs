@@ -117,6 +117,19 @@ pub fn get_asset_vec(name: &str) -> Option<Vec<u8>> {
     get_asset(name).map(|c| c.into_owned())
 }
 
+/// True if `name` resolves to bytes (disk override / user-imported file or
+/// the embedded table) — WITHOUT reading them. Lets the popup detect a
+/// configured animation whose file has gone missing and fall back to an
+/// embedded default instead of showing a blank stage.
+pub fn has_asset(name: &str) -> bool {
+    if let Some(path) = disk_path(name) {
+        if path.exists() {
+            return true;
+        }
+    }
+    EMBEDDED_ASSETS.iter().any(|(k, _)| *k == name)
+}
+
 /// Also look for user-added assets under `<exe_dir>/resources/<sub>/`
 /// that aren't in the embedded table — e.g. animations the user
 /// imported via drag-drop or the file picker. Used by the popup's
@@ -160,6 +173,17 @@ mod tests {
         let parent = PathBuf::from("Purr");
         let got = disk_path_under(&parent, "animations/foo.lottie").unwrap();
         assert_eq!(got, parent.join("Data").join("Animations").join("foo.lottie"));
+    }
+
+    #[test]
+    fn has_asset_true_for_embedded_false_for_unknown() {
+        // Embedded table entries resolve without touching disk.
+        assert!(has_asset("popup.html"));
+        assert!(has_asset("animations/dance-cat.lottie"));
+        // An unknown name with no disk file is absent (drives the popup's
+        // missing-file fallback).
+        assert!(!has_asset("animations/does-not-exist-xyz.lottie"));
+        assert!(!has_asset("vendor/skottie/nope.wasm"));
     }
 
     #[test]

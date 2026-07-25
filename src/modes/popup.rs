@@ -456,6 +456,19 @@ mod windows_impl {
             picked_path
         };
 
+        // Robustness : a configured animation file can go missing — the
+        // Data\Animations folder was wiped, or the exe was launched from a
+        // fresh install dir that never received the user's imports. Rather
+        // than a blank stage (fetch 404), fall back to the embedded default
+        // so a cat always shows. Applied BEFORE stage_params/resolve so the
+        // whole pipeline (mount dispatch, renderer, framing) stays consistent.
+        let anim_path = if crate::embedded::has_asset(&resolve_animation_url(&anim_path)) {
+            anim_path
+        } else {
+            tracing::warn!(selected = %anim_path, fallback = %FALLBACK_ANIM_PATH, "animation file not found, falling back to embedded default");
+            FALLBACK_ANIM_PATH.to_string()
+        };
+
         // Resolve per-anim scale + offset + renderer. Present in the
         // AnimationEntry list → use those. Absent (e.g. fallback anim or a
         // testing-only override that isn't in the config) → defaults
