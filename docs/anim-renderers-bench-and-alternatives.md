@@ -139,6 +139,64 @@ several are git-pinned or drifting):
 | **WebP (animated)** | crate **`webp`** (libwebp `AnimDecoder`) · `image-webp` | native | CPU | Full alpha | webp active; `image-webp` animated support to verify | Easy via libwebp bindings. |
 | **SVG animated (SMIL)** | **`resvg`/`usvg`**, `vello_svg` | native | CPU (resvg) / GPU (vello_svg) | Yes | active | ⚠️ **Gap** — these render SVG **static only**; **no native SMIL animator** exists. The browser is one of the few engines that animates `<animateTransform>`. This format specifically favours keeping the webview (or converting it to another format). |
 
+### Estimated memory saving if rendered natively (per format)
+
+Baseline = measured `private_bytes` in the webview → estimated native
+footprint as a **single** egui/wgpu process. ⚠️ **The native figures are
+estimates, not measured** (a POC is needed to confirm), but the orders of
+magnitude are sound. Animated SVG is excluded — it has no native path.
+
+| Format | Webview (measured) | Native (estimate) | Saving |
+|---|---|---|---|
+| **Rive** | 427 MB | ~100–160 MB | **~270–330 MB (~70 %)** |
+| APNG | 333 MB | ~90–150 MB | ~180–240 MB (~60 %) |
+| WebP | 332 MB | ~90–150 MB | ~180–240 MB (~60 %) |
+| Lottie | 332 MB | ~100–160 MB | ~170–230 MB (~60 %) |
+| GIF | 311 MB | ~90–150 MB | ~160–220 MB (~60 %) |
+| **WebM** | 237 MB | ~110–200 MB | ~40–130 MB (~20–45 %) |
+| ~~SVG animated~~ | ~~398 MB~~ | *no native path* | — |
+
+Key point: the egui/wgpu **host cost (~80–120 MB** — wgpu device + swapchain
++ a fullscreen RGBA texture) is **fixed and shared, not per-format**. So the
+popup becomes a **single ~100–160 MB process regardless of format**, versus
+237–427 MB today. Biggest absolute win is **Rive (~300 MB)** and the raster
+formats (~200 MB); **WebM saves the least** — it was already cheapest via
+hardware decode, and native it reverts to CPU decode. And the memory is
+**transient** (per-popup, freed on close), so the practical value is low
+unless the popup becomes persistent or targets very low-RAM machines.
+
+### Cross-platform (Windows / macOS / Linux)
+
+The rendering + UI bricks are **fully cross-platform** — in fact *more*
+uniform than the current webview:
+
+| Brick | Windows | macOS | Linux |
+|---|---|---|---|
+| egui / eframe (wgpu) | D3D12 | Metal | Vulkan/GL |
+| Rive (rive-rs → vello/wgpu) | ✅ | ✅ | ✅ |
+| Lottie (velato / ThorVG / dotlottie-rs) | ✅ | ✅ | ✅ |
+| WebM alpha (ffmpeg-next, CPU) | ✅ | ✅ | ✅ |
+| GIF (`image`) / WebP (`webp`) | ✅ | ✅ | ✅ |
+| Media Foundation VP9 | Windows-only | — | — |
+| SVG animated (SMIL) | ❌ | ❌ | ❌ |
+
+Two caveats worth stating:
+
+- **The current `wry`/webview stack is itself NOT uniform across OS** — wry
+  uses WebView2 on Windows, **WKWebView** on macOS, **WebKitGTK** on Linux.
+  Three different engines that render Lottie/Rive/WebGL/alpha *differently*
+  (WebKitGTK is notoriously buggy for transparency + WebGL on Linux; WKWebView
+  handles VP9-alpha differently). A native **egui + wgpu** stack would be
+  **more consistent** across platforms, not less.
+- **What is not portable — webview or native — is the OS-integration layer**:
+  the always-on-top kiosk window, the global keyboard hook + lock, per-pixel
+  transparent compositing, and foreground-steal. Today that is pure Win32
+  (`WS_EX_TOOLWINDOW`, `SetWindowsHookEx`, DirectComposition). macOS needs
+  `NSWindow` level/collectionBehavior + `CGEventTap`; Linux needs X11/Wayland
+  equivalents. **This must be rewritten per OS regardless** of the renderer
+  choice, and the Parallels JS keyboard fallback is a Windows-VM-specific
+  workaround with no native equivalent.
+
 ### Bottom line
 
 - The UI is not the blocker — **egui (already present) would host the pincode
