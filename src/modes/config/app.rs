@@ -195,6 +195,14 @@ impl eframe::App for ConfigApp {
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Focus);
             self.focus_requested = true;
         }
+        // Heartbeat repaint. eframe runs reactive : an idle window
+        // never presents a frame, so a D3D12 surface gone stale across
+        // sleep/resume (common on virtualized DXGI) is never
+        // reconfigured and the window stays black. Forcing a low-rate
+        // frame lets the wgpu painter recover the surface — same
+        // mechanism that keeps the countdown widget alive across
+        // resume (see countdown.rs).
+        ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
         // The Tabs screen has its own CentralPanel inside tabs::ui.
         // The Passcode + in-config Uninstall screens need one here so
         // panel_fill paints their viewport uniformly with the Tabs bg.
