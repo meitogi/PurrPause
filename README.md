@@ -18,9 +18,14 @@ ARM64). Aligned with a « friction, not fort-knox » design — see
 1. Download the release zip matching your CPU :
    - `SystemHealthAgent-<version>-x64.zip` for typical Windows PCs.
    - `SystemHealthAgent-<version>-aarch64.zip` for Snapdragon / ARM64.
-2. Extract anywhere (Documents, Downloads, dedicated folder — the exe
-   stays put ; only `C:\ProgramData\DiagnosticsCache\` is used at
-   runtime).
+2. Extract into a **user-writable** folder — the exe stays put there.
+   - **Do NOT** extract into `C:\Program Files`, `C:\Program Files (x86)`,
+     or any admin-protected folder : the WebView2 UserDataFolder must be
+     user-writable, and it cannot be there, so the popup will crash.
+   - **Recommended** : `%LOCALAPPDATA%\Microsoft\SystemHealthAgent\`
+     (i.e. `C:\Users\<you>\AppData\Local\Microsoft\SystemHealthAgent\`) —
+     always writable without elevation, hidden by default, blends in.
+     Documents, Downloads, or a dedicated user folder are fine too.
 3. Double-click `SystemHealthAgent.exe`.
 4. Accept the UAC elevation prompt.
 5. First-run wizard prompts for a passcode (4-12 digits, argon2id

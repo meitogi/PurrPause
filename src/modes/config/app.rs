@@ -48,7 +48,7 @@ pub fn run() -> Result<()> {
         // happened.
         show_error_dialog(
             "Configuration verrouillée",
-            "Aucun code parental n'est configuré (state.dat vide).\n\nLance à nouveau le premier démarrage : supprime C:\\ProgramData\\DiagnosticsCache\\state.dat puis relance SystemHealthAgent.exe.",
+            "Aucun code parental n'est configuré : la configuration initiale n'a pas été terminée.\n\nRelancez SystemHealthAgent puis terminez l'assistant de premier démarrage.",
         );
         anyhow::bail!("no passcode configured");
     }

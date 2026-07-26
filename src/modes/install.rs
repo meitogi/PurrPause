@@ -117,6 +117,38 @@ pub(crate) fn paths_equal_ci(a: &Path, b: &Path) -> bool {
     a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()
 }
 
+/// Normalize a path for case-insensitive, separator-agnostic prefix matching :
+/// lowercase, unify `/`→`\`, and strip trailing separators. Kept string-based
+/// (like [`paths_equal_ci`]) so the guard's pure core is unit-testable on Linux
+/// against Windows-style `\` paths — `Path::starts_with` splits on `/` only and
+/// would mis-handle them off-Windows.
+fn normalize_for_prefix(p: &Path) -> String {
+    p.to_string_lossy()
+        .to_lowercase()
+        .replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_string()
+}
+
+/// True iff `exe_parent` is *at* or *nested under* any of `protected_roots`
+/// (e.g. Program Files / Program Files (x86) / Windows). Case-insensitive and
+/// trailing-separator tolerant. The trailing separator on the prefix probe
+/// enforces a path-component boundary, so `…\Program FilesX` is NOT treated as
+/// under `…\Program Files`. An empty `protected_roots` yields `false` — a failed
+/// known-folder resolution must never falsely block an install.
+///
+/// Membership (not a write-probe) is the correct signal : the elevated
+/// installer CAN write to Program Files, but the *unelevated WebView2 worker*
+/// cannot create its UserDataFolder there — the failure is specific to the
+/// protected root, so a probe would return "writable" and miss it.
+pub fn is_protected_location(exe_parent: &Path, protected_roots: &[PathBuf]) -> bool {
+    let exe = normalize_for_prefix(exe_parent);
+    protected_roots.iter().any(|root| {
+        let root = normalize_for_prefix(root);
+        !root.is_empty() && (exe == root || exe.starts_with(&format!("{root}\\")))
+    })
+}
+
 /// Extract the executable path from a Windows service `BINARY_PATH_NAME`
 /// (a.k.a. command line). SCM stores the exe path and launch arguments
 /// as one string ; `query_config().executable_path` returns the whole
@@ -198,6 +230,28 @@ pub(crate) fn scm_image_path() -> Option<PathBuf> {
 fn fresh_install(current_exe: &Path) -> Result<()> {
     use crate::platform::win32::{acl, hidden_attrs, itaskservice};
 
+    let exe_parent = current_exe
+        .parent()
+        .context("current_exe has no parent")?;
+
+    // Guard : never install into a Windows-protected root. WebView2's
+    // unelevated popup worker can't create its UserDataFolder under Program
+    // Files / Windows even though this elevated installer CAN write there, so
+    // the first break popup would crash (HRESULT 0x80080005). Stop here —
+    // before ANY side effect (no HKLM marker, no Data/ scaffolding, no service)
+    // — while a human is watching the install. `std::process::exit` rather than
+    // `bail!` so we don't also trigger main.rs's generic fatal dialog on top of
+    // our own path-clean warning.
+    #[cfg(windows)]
+    if is_protected_location(exe_parent, &crate::platform::win32::location::protected_roots()) {
+        tracing::error!(
+            parent = %exe_parent.display(),
+            "install refused: protected location (WebView2 UserDataFolder unwritable)"
+        );
+        protected_location_dialog();
+        std::process::exit(1);
+    }
+
     // Step 0 — clear the "Uninstalled" HKLM marker unconditionally. A
     // fresh install rewrites the user's intent from "uninstalled" (if
     // the marker was set by a prior --uninstall) to "installed and
@@ -211,9 +265,6 @@ fn fresh_install(current_exe: &Path) -> Result<()> {
     // previous 0.6.x install may still be on disk even though the SCM
     // entry is gone (e.g. previous path_update failed halfway). Move
     // legacy artefacts into Data/ so step 4's scaffolding is a no-op.
-    let exe_parent = current_exe
-        .parent()
-        .context("current_exe has no parent")?;
     let exe_file_name = current_exe
         .file_name()
         .and_then(|n| n.to_str())
@@ -428,6 +479,46 @@ fn firewall_rule_failed_dialog() {
         .into();
     unsafe {
         MessageBoxW(None, &body, &title, MB_OK | MB_ICONWARNING);
+    }
+}
+
+/// Warning shown when a fresh install is attempted from a Windows-protected
+/// root. Path-clean : it names only the *recommended* destination (a generic
+/// `%LOCALAPPDATA%` sub-path, identical on every machine — reveals nothing about
+/// where the exe currently sits), never the current protected folder. `[OK]`
+/// opens that recommended folder in Explorer to help the user move the exe ;
+/// either button aborts the install (the caller `exit(1)`s afterwards).
+#[cfg(windows)]
+fn protected_location_dialog() {
+    use windows::core::{HSTRING, PCWSTR};
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        MessageBoxW, IDOK, MB_ICONWARNING, MB_OKCANCEL, SW_SHOWNORMAL,
+    };
+
+    let title: HSTRING = "SystemHealthAgent".into();
+    let body: HSTRING = "Emplacement non supporté. Cette application ne peut pas fonctionner \
+         depuis un dossier protégé par Windows.\n\n\
+         Déplacez SystemHealthAgent.exe dans votre dossier personnel, par exemple :\n\n\
+         %LOCALAPPDATA%\\Microsoft\\SystemHealthAgent\\\n\n\
+         puis relancez-la.\n\n\
+         [OK] ouvre ce dossier.  [Annuler] quitte."
+        .into();
+
+    let choice = unsafe { MessageBoxW(None, &body, &title, MB_OKCANCEL | MB_ICONWARNING) };
+
+    if choice == IDOK {
+        // Best-effort : create the recommended folder then open it in Explorer
+        // so the window isn't empty. The install aborts regardless — this is a
+        // courtesy to make the move a one-click affair.
+        if let Some(dir) = crate::platform::win32::location::recommended_target_dir() {
+            let _ = std::fs::create_dir_all(&dir);
+            let path: HSTRING = dir.to_string_lossy().as_ref().into();
+            let verb: HSTRING = "open".into();
+            unsafe {
+                ShellExecuteW(None, &verb, &path, PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL);
+            }
+        }
     }
 }
 
@@ -1054,5 +1145,105 @@ mod tests {
         // File stayed put because guard tripped.
         assert!(legacy.join("cat.lottie").exists());
         assert!(!animations_dir(parent).join("cat.lottie").exists());
+    }
+
+    // -------- is_protected_location (install-location guard) --------
+
+    fn roots() -> Vec<PathBuf> {
+        vec![
+            PathBuf::from(r"C:\Program Files"),
+            PathBuf::from(r"C:\Program Files (x86)"),
+            PathBuf::from(r"C:\Windows"),
+        ]
+    }
+
+    #[test]
+    fn protected_direct_program_files() {
+        assert!(is_protected_location(
+            Path::new(r"C:\Program Files"),
+            &roots()
+        ));
+    }
+
+    #[test]
+    fn protected_nested_under_program_files_x86() {
+        assert!(is_protected_location(
+            Path::new(r"C:\Program Files (x86)\SystemHealthAgent-1.18.0"),
+            &roots()
+        ));
+    }
+
+    #[test]
+    fn protected_deeply_nested() {
+        assert!(is_protected_location(
+            Path::new(r"C:\Windows\System32\foo\bar"),
+            &roots()
+        ));
+    }
+
+    #[test]
+    fn protected_case_insensitive() {
+        assert!(is_protected_location(
+            Path::new(r"c:\PROGRAM files\App"),
+            &roots()
+        ));
+    }
+
+    #[test]
+    fn protected_trailing_separator_tolerant() {
+        // Trailing sep on the candidate, and on the root.
+        assert!(is_protected_location(
+            Path::new(r"C:\Program Files\App\"),
+            &roots()
+        ));
+        let roots_with_sep = vec![PathBuf::from(r"C:\Program Files\")];
+        assert!(is_protected_location(
+            Path::new(r"C:\Program Files\App"),
+            &roots_with_sep
+        ));
+    }
+
+    #[test]
+    fn not_protected_shared_prefix_sibling() {
+        // "Program FilesX" must NOT count as under "Program Files".
+        assert!(!is_protected_location(
+            Path::new(r"C:\Program FilesX\App"),
+            &roots()
+        ));
+    }
+
+    #[test]
+    fn not_protected_local_appdata() {
+        assert!(!is_protected_location(
+            Path::new(r"C:\Users\alice\AppData\Local\Microsoft\SystemHealthAgent"),
+            &roots()
+        ));
+    }
+
+    #[test]
+    fn not_protected_documents() {
+        assert!(!is_protected_location(
+            Path::new(r"C:\Users\alice\Documents\SystemHealthAgent"),
+            &roots()
+        ));
+    }
+
+    #[test]
+    fn not_protected_empty_roots() {
+        // A failed known-folder resolution must never falsely block.
+        assert!(!is_protected_location(
+            Path::new(r"C:\Program Files\App"),
+            &[]
+        ));
+    }
+
+    #[test]
+    fn not_protected_empty_root_entry_ignored() {
+        let roots = vec![PathBuf::new(), PathBuf::from(r"C:\Windows")];
+        // An empty root string must not match everything.
+        assert!(!is_protected_location(
+            Path::new(r"C:\Users\alice\Desktop"),
+            &roots
+        ));
     }
 }

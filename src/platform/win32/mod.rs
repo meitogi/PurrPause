@@ -8,6 +8,7 @@ pub mod hidden_attrs;
 pub mod idle;
 pub mod itaskservice;
 pub mod keyboard_hook;
+pub mod location;
 pub mod power_notify;
 pub mod proc_kill;
 pub mod proc_sample;

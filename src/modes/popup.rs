@@ -395,6 +395,28 @@ mod windows_impl {
         elapsed_seconds: Option<u32>,
         bench_secs: Option<u32>,
     ) -> Result<()> {
+        // Defensive guard : a popup must never run from a Windows-protected
+        // root — WebView2 can't create its UserDataFolder there and would crash
+        // (HRESULT 0x80080005). The interactive install already blocks this, so
+        // this only fires on a manually-relocated install. Log ONE line and
+        // exit cleanly — no WebView2 build, and no modal (popups fire on a
+        // schedule; a dialog per popup would be spam, and `Ok` avoids main.rs's
+        // fatal dialog that an `Err` would trigger).
+        if let Some(parent) =
+            std::env::current_exe().ok().and_then(|e| e.parent().map(Path::to_path_buf))
+        {
+            if crate::modes::install::is_protected_location(
+                &parent,
+                &crate::platform::win32::location::protected_roots(),
+            ) {
+                tracing::error!(
+                    parent = %parent.display(),
+                    "popup skipped: protected location (WebView2 UserDataFolder unwritable)"
+                );
+                return Ok(());
+            }
+        }
+
         // Preview / test spawns from the config UI pass a per-PID
         // temp state file so uncommitted edits show up without an
         // autosave. Regular service-spawned popups leave

@@ -59,7 +59,10 @@ fn main() -> ExitCode {
     match dispatch(mode.clone()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            tracing::error!(error = %err, "mode handler failed");
+            // Full anyhow chain (`{:#}`, incl. any `with_context` paths) goes to
+            // the log file — the on-screen dialog below is deliberately scrubbed
+            // of paths, so this is the only place the detail survives.
+            tracing::error!(error = %format!("{err:#}"), "mode handler failed");
             // Under windows_subsystem="windows" nothing is visible on
             // failure — pop a MessageBox so the user sees WHAT went
             // wrong, especially for the install-flow modes that route
@@ -71,22 +74,26 @@ fn main() -> ExitCode {
             // the user's desktop. They've already logged via tracing above.
             #[cfg(windows)]
             if !matches!(mode, Mode::Service | Mode::Watchdog | Mode::InputProbe) {
-                fatal_error_dialog(&mode, &err);
+                fatal_error_dialog();
             }
             ExitCode::FAILURE
         }
     }
 }
 
+/// Generic on-screen failure notice. Deliberately **path-free and mode-free** :
+/// the app camouflages as a neutral health service, so the dialog must not leak
+/// its install location, folder name, or internal mode (the old `{mode:?}` body
+/// could even Debug-dump a passcode hash). All diagnostic detail — the full
+/// error chain with any embedded paths — is written to the log file just above.
 #[cfg(windows)]
-fn fatal_error_dialog(mode: &Mode, err: &anyhow::Error) {
+fn fatal_error_dialog() {
     use std::iter::once;
     use windows::core::PCWSTR;
     use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
-    let title = format!("SystemHealthAgent — {mode:?}");
-    let body = format!(
-        "Une erreur fatale est survenue :\n\n{err:#}\n\nLog complet : install.log ou widget.log à côté de l'exe."
-    );
+    let title = "SystemHealthAgent";
+    let body = "Une erreur inattendue s'est produite et l'application doit se fermer.\n\n\
+                Si le problème persiste, consultez les journaux de l'application.";
     let title_w: Vec<u16> = title.encode_utf16().chain(once(0)).collect();
     let body_w: Vec<u16> = body.encode_utf16().chain(once(0)).collect();
     unsafe {
