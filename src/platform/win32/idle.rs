@@ -61,6 +61,10 @@ pub struct InputStampState {
     /// SMTC "any transport session reports Playing" flag — catches a
     /// video muted in the player/tab whose audio stream is stopped.
     pub playing_smtc: bool,
+    /// Workstation-lock flag sampled by the probe via the active input
+    /// desktop (session/desktop-scoped — see `lock_detector.rs`). A hard
+    /// "inactive" override: a locked session means the human is away.
+    pub locked: bool,
 }
 
 /// Seconds since the last keyboard or mouse input on the interactive
@@ -107,4 +111,19 @@ pub fn media_playing(
         staleness_ms,
         MAX_PROBE_STALENESS_MS,
     )
+}
+
+/// True if the user-session probe last reported the workstation locked
+/// AND the stamp is fresh. Missing / stale state → false: never
+/// force-pause on a crashed probe (err toward "assume active", matching
+/// `idle_seconds`→0 and `media_playing`→false on the same stale state).
+/// Reuses `media_playing_decision` — the shared "a probe-reported bool
+/// decays to false when stale" gate, one decay convention.
+pub fn screen_locked(state: Option<&InputStampState>) -> bool {
+    let Some(s) = state else {
+        return false;
+    };
+    let current_tick = unsafe { GetTickCount64() };
+    let staleness_ms = current_tick.saturating_sub(s.received_at_tick_ms);
+    crate::signals::media_playing_decision(s.locked, staleness_ms, MAX_PROBE_STALENESS_MS)
 }

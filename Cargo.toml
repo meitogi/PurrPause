@@ -1,6 +1,6 @@
 [package]
 name = "purrpause"
-version = "1.18.0"
+version = "1.19.0"
 edition = "2021"
 license = "MIT"
 description = "Break-reminder overlay for Windows — camouflaged Windows Session Health Service"
@@ -94,6 +94,7 @@ windows = { version = "0.62.2", features = [
     "Win32_System_RemoteDesktop",        # WTSQueryUserToken
     "Win32_System_Services",             # SCM helpers not covered by windows-service
     "Win32_System_Registry",             # Runtime service ImagePath queries
+    "Win32_System_StationsAndDesktops",  # OpenInputDesktop + GetUserObjectInformationW (lock detection: secure desktop = locked)
     "Win32_System_SystemInformation",    # GetTickCount64 (idle counter base)
     "Win32_System_Time",                 # FileTimeToSystemTime + SystemTimeToTzSpecificLocalTime (Config UI anchor label)
     "Win32_System_TaskScheduler",        # ITaskService COM watchdog registration

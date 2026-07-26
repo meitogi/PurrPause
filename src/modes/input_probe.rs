@@ -27,8 +27,10 @@
 //      playing) — audio sessions are session-scoped exactly like
 //      window stations, so this too must run here and not in the
 //      Session 0 service (see `busy_detector.rs`),
-//   3. calls `ipc::send(Message::InputStamp { tick_ms, playing_audio })`
-//      to push both to the service (see `ipc.rs` for the wire format).
+//   3. checks whether the workstation is locked via the active input
+//      desktop — also session/desktop-scoped (see `lock_detector.rs`),
+//   4. calls `ipc::send(Message::InputStamp { … })` to push all of it
+//      to the service (see `ipc.rs` for the wire format).
 //
 // The service's pipe thread bridges `InputStamp` onto a dedicated
 // stamp mpsc, and the tick loop drains that at each 5 s tick.
@@ -83,7 +85,7 @@ pub fn run() -> Result<()> {
     // First sample always logs (None != Some) — one line at probe
     // start gives the WASAPI endpoint/session counts for diagnosis,
     // then only transitions log to keep the file quiet.
-    let mut last_playing: Option<(bool, bool)> = None;
+    let mut last_playing: Option<(bool, bool, bool)> = None;
     loop {
         match send_stamp(&mut last_playing) {
             Ok(()) => consecutive_failures = 0,
@@ -108,24 +110,27 @@ pub fn run() -> Result<()> {
 }
 
 #[cfg(windows)]
-fn send_stamp(last_playing: &mut Option<(bool, bool)>) -> Result<()> {
+fn send_stamp(last_playing: &mut Option<(bool, bool, bool)>) -> Result<()> {
     let current_tick = unsafe { GetTickCount64() };
     let last_input_tick = read_last_input_tick_abs(current_tick);
     let det = crate::platform::win32::busy_detector::detect();
-    if *last_playing != Some((det.audio, det.smtc)) {
+    let locked = crate::platform::win32::lock_detector::screen_locked();
+    if *last_playing != Some((det.audio, det.smtc, locked)) {
         tracing::info!(
             audio = det.audio,
             smtc = det.smtc,
+            locked,
             endpoints = det.endpoints,
             sessions = det.sessions,
             "media detection state changed"
         );
-        *last_playing = Some((det.audio, det.smtc));
+        *last_playing = Some((det.audio, det.smtc, locked));
     }
     ipc::send(Message::InputStamp {
         tick_ms: last_input_tick,
         playing_audio: det.audio,
         playing_smtc: det.smtc,
+        locked,
     })
 }
 

@@ -54,7 +54,12 @@ pub fn classify_wm_powerbroadcast(wparam: usize) -> Option<PowerEventKind> {
 /// True when the current tick should accrue `paused_secs` : the user
 /// has been idle at least `threshold_secs`, no gamepad packet has
 /// bumped since the previous call, and no WASAPI audio/video session
-/// is currently active.
+/// is currently active — OR the workstation is locked.
+///
+/// `locked` is a HARD override : a locked session is proof the human is
+/// away, so it forces pause regardless of media / gamepad / recent
+/// input. Every other condition is weighed by the config's per-signal
+/// toggles ; a lock is not.
 ///
 /// Ordering matters : short-circuit on gamepad and playing before
 /// touching `idle_secs` in the caller is not required (the args are
@@ -64,8 +69,9 @@ pub fn idle_tick_should_pause(
     threshold_secs: u64,
     gamepad_active: bool,
     playing_video_or_audio: bool,
+    locked: bool,
 ) -> bool {
-    idle_secs >= threshold_secs && !gamepad_active && !playing_video_or_audio
+    locked || (idle_secs >= threshold_secs && !gamepad_active && !playing_video_or_audio)
 }
 
 /// True when the probe-reported media flag should count as "playing" :
@@ -237,27 +243,58 @@ mod tests {
 
     #[test]
     fn idle_pause_at_threshold_boundary_is_true() {
-        assert!(idle_tick_should_pause(60, 60, false, false));
+        assert!(idle_tick_should_pause(60, 60, false, false, false));
     }
 
     #[test]
     fn idle_pause_below_threshold_is_false() {
-        assert!(!idle_tick_should_pause(59, 60, false, false));
+        assert!(!idle_tick_should_pause(59, 60, false, false, false));
     }
 
     #[test]
     fn idle_pause_gamepad_active_short_circuits() {
-        assert!(!idle_tick_should_pause(600, 60, true, false));
+        assert!(!idle_tick_should_pause(600, 60, true, false, false));
     }
 
     #[test]
     fn idle_pause_busy_short_circuits() {
-        assert!(!idle_tick_should_pause(600, 60, false, true));
+        assert!(!idle_tick_should_pause(600, 60, false, true, false));
     }
 
     #[test]
     fn idle_pause_all_conditions_ok_is_true() {
-        assert!(idle_tick_should_pause(3600, 60, false, false));
+        assert!(idle_tick_should_pause(3600, 60, false, false, false));
+    }
+
+    // locked is a hard override: it forces pause regardless of active
+    // media, an active gamepad, or sub-threshold idle.
+    #[test]
+    fn locked_forces_pause_despite_media() {
+        assert!(idle_tick_should_pause(0, 60, false, true, true));
+    }
+
+    #[test]
+    fn locked_forces_pause_despite_gamepad() {
+        assert!(idle_tick_should_pause(0, 60, true, false, true));
+    }
+
+    #[test]
+    fn locked_forces_pause_despite_recent_input() {
+        // idle_secs below threshold (user "just typed") + locked ⇒ pause.
+        assert!(idle_tick_should_pause(0, 60, false, false, true));
+    }
+
+    #[test]
+    fn locked_forces_pause_despite_all_active_signals() {
+        assert!(idle_tick_should_pause(0, 60, true, true, true));
+    }
+
+    #[test]
+    fn unlocked_preserves_idle_logic() {
+        // locked=false leaves the original media/gamepad/idle logic intact.
+        assert!(!idle_tick_should_pause(600, 60, false, true, false));
+        assert!(!idle_tick_should_pause(600, 60, true, false, false));
+        assert!(idle_tick_should_pause(600, 60, false, false, false));
     }
 
     // -- media_playing_decision ---------------------------------------
@@ -280,6 +317,19 @@ mod tests {
     #[test]
     fn media_not_playing_fresh_stamp_is_false() {
         assert!(!media_playing_decision(false, 0, 30_000));
+    }
+
+    // `idle::screen_locked` reuses this same gate, so a stale locked
+    // flag decays to false (never force-pause on a dead probe) while a
+    // fresh one passes through — mirrors the media staleness contract.
+    #[test]
+    fn locked_flag_stale_decays_to_false() {
+        assert!(!media_playing_decision(true, 30_001, 30_000));
+    }
+
+    #[test]
+    fn locked_flag_fresh_passes_through() {
+        assert!(media_playing_decision(true, 5_000, 30_000));
     }
 
     // -- PincodeBuffer -----------------------------------------------

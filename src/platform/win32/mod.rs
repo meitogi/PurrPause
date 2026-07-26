@@ -9,6 +9,7 @@ pub mod idle;
 pub mod itaskservice;
 pub mod keyboard_hook;
 pub mod location;
+pub mod lock_detector;
 pub mod power_notify;
 pub mod proc_kill;
 pub mod proc_sample;

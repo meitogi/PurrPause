@@ -1886,6 +1886,10 @@ mod win {
                         config.count_media,
                     );
                     let idle_secs = idle::idle_seconds(input_stamp.as_ref());
+                    // Hard override : a locked workstation forces inactive
+                    // regardless of media/gamepad/idle. Stale/dead probe
+                    // reads false (never force-pause on a crashed probe).
+                    let locked_now = idle::screen_locked(input_stamp.as_ref());
                     // Kbd/mouse toggle off → input no longer refutes
                     // idleness ; clamp the reading to the threshold so
                     // the pause decision sees it as idle. `idle_secs`
@@ -1908,6 +1912,7 @@ mod win {
                             IDLE_THRESHOLD_SECS,
                             gamepad_seen,
                             playing_video_or_audio_now,
+                            locked_now,
                         )
                     } else {
                         false
@@ -1951,6 +1956,7 @@ mod win {
                             idle_secs,
                             gamepad_seen,
                             playing_video_or_audio = playing_video_or_audio_now,
+                            locked = locked_now,
                             paused_secs = *paused_secs,
                             "idle state changed"
                         );
@@ -1967,6 +1973,8 @@ mod win {
                         // wins (kbd/mouse > gamepad > media).
                         let active_reason = if !config.count_active_time || !any_signal {
                             "wall_clock_mode"
+                        } else if locked_now {
+                            "locked"
                         } else if is_idle_now {
                             "idle"
                         } else if kbd_idle_secs < IDLE_THRESHOLD_SECS {
@@ -1984,6 +1992,7 @@ mod win {
                             idle_secs,
                             gamepad_seen,
                             playing_video_or_audio = playing_video_or_audio_now,
+                            locked = locked_now,
                             paused_secs = *paused_secs,
                             remaining_secs,
                             count_active_time = config.count_active_time,
@@ -2951,13 +2960,14 @@ mod win {
                     let _ = pipe_tx.send(TickCommand::Shutdown);
                     break;
                 }
-                Message::InputStamp { tick_ms, playing_audio, playing_smtc } => {
+                Message::InputStamp { tick_ms, playing_audio, playing_smtc, locked } => {
                     let received_at = unsafe { GetTickCount64() };
                     let _ = stamp_tx.send(idle::InputStampState {
                         last_input_tick_ms: tick_ms,
                         received_at_tick_ms: received_at,
                         playing_audio,
                         playing_smtc,
+                        locked,
                     });
                 }
             }
