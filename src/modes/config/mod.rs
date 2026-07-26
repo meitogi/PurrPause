@@ -6,6 +6,9 @@
 // rfd file picker, IPC client) are Windows-only.
 
 pub mod lockout;
+// Read-only access diagnostics for the Sécurité tab. Pure profile-mapping core
+// compiles everywhere (tested under Linux); the live probes are Windows-only.
+pub mod access_health;
 
 #[cfg(windows)]
 pub(crate) mod decoration;

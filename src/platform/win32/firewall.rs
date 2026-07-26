@@ -82,6 +82,21 @@ pub fn rule_exists() -> Result<bool> {
     })
 }
 
+/// Active network-profile bitmask (`NET_FW_PROFILE2_*`, OR-combined) for the
+/// current connections. Display-only — it reports which profile is active so
+/// the Sécurité tab can tell whether the console's Private+Domain rule applies;
+/// it never mutates the firewall or switches the profile.
+pub fn current_profile_types() -> Result<u32> {
+    with_com(|| unsafe {
+        let policy: INetFwPolicy2 = CoCreateInstance(&NetFwPolicy2, None, CLSCTX_INPROC_SERVER)
+            .context("CoCreateInstance(NetFwPolicy2)")?;
+        let types = policy
+            .CurrentProfileTypes()
+            .context("INetFwPolicy2::CurrentProfileTypes")?;
+        Ok(types as u32)
+    })
+}
+
 /// Remove the console's firewall rule. A missing rule is not an error.
 pub fn remove_rule() -> Result<()> {
     with_com(|| unsafe {

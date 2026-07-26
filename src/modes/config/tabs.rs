@@ -6,11 +6,13 @@
 
 use std::path::Path;
 use std::str::FromStr;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use chrono_tz::Tz;
 use eframe::egui;
 
+use super::access_health::{summarize_profile, AccessHealth, Probe, ProfileVerdict};
 use super::decoration::{
     ingest_animation, is_supported_anim, paint_watermark, spawn_local, spawn_local_with_env,
 };
@@ -60,6 +62,12 @@ pub struct TabsState {
     /// tab compares the live toggle against it to warn that a service restart
     /// is required (the accept loop is read once at service start, never live).
     pub baseline_remote_logs_enabled: bool,
+    /// Shared access-diagnostics state, written by a worker thread and read as a
+    /// snapshot each frame by the Sécurité tab (see `access_health`).
+    pub health: Arc<Mutex<AccessHealth>>,
+    /// Whether the Sécurité tab has been shown yet — gates the one-shot auto
+    /// health check on first open (re-runs go through the « Revérifier » button).
+    pub security_seen: bool,
 }
 
 impl TabsState {
@@ -72,6 +80,8 @@ impl TabsState {
             save_error: None,
             new_palier_buffer: 20,
             baseline_remote_logs_enabled,
+            health: Arc::new(Mutex::new(AccessHealth::default())),
+            security_seen: false,
         }
     }
 }
@@ -234,6 +244,13 @@ pub fn ui(
                     ui_notifications(ui, cfg, &mut state.dirty, &mut state.new_palier_buffer)
                 }
                 Tab::Security => {
+                    // Auto-run the access check once, the first time the tab is
+                    // shown (re-runs go through the « Revérifier » button). Kept
+                    // at the dispatch level so `ui_security` stays display-only.
+                    if !state.security_seen {
+                        state.security_seen = true;
+                        spawn_access_check(Arc::clone(&state.health), ui.ctx().clone());
+                    }
                     ui_security(
                         ui,
                         cfg,
@@ -241,6 +258,7 @@ pub fn ui(
                         &mut state.change_pwd,
                         &mut trigger_uninstall,
                         state.baseline_remote_logs_enabled,
+                        &state.health,
                     );
                 }
             });
@@ -1260,6 +1278,7 @@ fn ui_security(
     change_pwd: &mut Option<ChangePwdDialog>,
     trigger_uninstall: &mut bool,
     baseline_remote_logs_enabled: bool,
+    health: &Arc<Mutex<AccessHealth>>,
 ) {
 
     if ui
@@ -1303,6 +1322,13 @@ fn ui_security(
             ui.ctx().copy_text(url.clone());
         }
     });
+
+    // Access diagnostics — display-only reachability signals so the parent can
+    // tell whether the console is actually reachable without leaving the Config
+    // UI. The check is kicked off (once on first open, then on « Revérifier »)
+    // off the immediate-mode UI thread; this only paints the latest snapshot.
+    ui.add_space(4.0);
+    ui_access_diagnostics(ui, health);
 
     ui.separator();
 
@@ -1399,6 +1425,151 @@ fn ui_security(
             });
         if close_dialog {
             *change_pwd = None;
+        }
+    }
+}
+
+/// Run the three access probes off the UI thread and publish the results.
+/// egui is immediate-mode, so the blocking loopback GET must not run inline;
+/// a worker fills the shared `AccessHealth` and requests a repaint on
+/// completion. `running` debounces overlapping checks (spam-clicking the
+/// button, or a first-open racing a manual re-check).
+fn spawn_access_check(health: Arc<Mutex<AccessHealth>>, ctx: egui::Context) {
+    {
+        let mut h = health.lock().unwrap();
+        if h.running {
+            return;
+        }
+        h.running = true;
+    }
+    std::thread::spawn(move || {
+        let liveness = probe_liveness();
+        let profile = probe_profile();
+        let rule = probe_rule();
+        {
+            let mut h = health.lock().unwrap();
+            h.liveness = liveness;
+            h.profile = profile;
+            h.rule = rule;
+            h.running = false;
+        }
+        ctx.request_repaint();
+    });
+}
+
+/// Loopback liveness probe: `GET http://127.0.0.1:<port>/api/session` (200 + JSON,
+/// no auth). Loopback bypasses the firewall, so this tests server liveness only
+/// — service running + toggle on + restarted — complementary to the profile /
+/// rule checks that gauge LAN reachability.
+fn probe_liveness() -> Probe<()> {
+    use ureq::Agent;
+    let url = format!(
+        "http://127.0.0.1:{}/api/session",
+        crate::remote::REMOTE_LOG_PORT
+    );
+    let agent: Agent = Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(2)))
+        .build()
+        .into();
+    match agent.get(&url).call() {
+        Ok(_) => Probe::Ok(()),
+        Err(_) => Probe::Failed,
+    }
+}
+
+/// Active-network-profile probe via `INetFwPolicy2::CurrentProfileTypes()`.
+fn probe_profile() -> Probe<ProfileVerdict> {
+    match crate::platform::win32::firewall::current_profile_types() {
+        Ok(bits) => Probe::Ok(summarize_profile(bits)),
+        Err(_) => Probe::Failed,
+    }
+}
+
+/// Inbound-rule presence probe (reuses session-6b's `rule_exists`). `Ok(false)`
+/// — a rule genuinely absent — is a valid read, not a `Failed` query.
+fn probe_rule() -> Probe<bool> {
+    match crate::platform::win32::firewall::rule_exists() {
+        Ok(present) => Probe::Ok(present),
+        Err(_) => Probe::Failed,
+    }
+}
+
+/// Render the three display-only diagnostics from a lock-free snapshot.
+fn ui_access_diagnostics(ui: &mut egui::Ui, health: &Arc<Mutex<AccessHealth>>) {
+    // AccessHealth is Copy — snapshot out and release the lock before painting.
+    let snap = *health.lock().unwrap();
+
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("Diagnostic d'accès").strong());
+        if snap.running {
+            ui.spinner();
+            ui.label("Vérification…");
+        } else if ui.button("Revérifier").clicked() {
+            spawn_access_check(Arc::clone(health), ui.ctx().clone());
+        }
+    });
+
+    let ok = egui::Color32::from_rgb(90, 180, 90);
+    let warn = egui::Color32::from_rgb(220, 120, 60);
+    let dim = egui::Color32::GRAY;
+
+    // 7.1 — server liveness (loopback; bypasses the firewall).
+    match snap.liveness {
+        Probe::Pending => {
+            ui.colored_label(dim, "Service : vérification en attente…");
+        }
+        Probe::Ok(()) => {
+            ui.colored_label(ok, "✓  Service joignable (127.0.0.1 répond)");
+        }
+        Probe::Failed => {
+            ui.colored_label(
+                warn,
+                "⚠  Service injoignable — service arrêté, ou option activée sans \
+                 redémarrage du service.",
+            );
+        }
+    }
+
+    // 7.2 — active network profile.
+    match snap.profile {
+        Probe::Pending => {
+            ui.colored_label(dim, "Réseau : vérification en attente…");
+        }
+        Probe::Ok(ProfileVerdict::Reachable) => {
+            ui.colored_label(ok, "✓  Réseau : Privé/Domaine — joignable");
+        }
+        Probe::Ok(ProfileVerdict::PublicOnly) => {
+            ui.colored_label(
+                warn,
+                "⚠  Réseau actuel : Public — console injoignable depuis le LAN \
+                 (le port n'est ouvert qu'en Privé/Domaine).",
+            );
+        }
+        Probe::Ok(ProfileVerdict::Unknown) => {
+            ui.colored_label(dim, "Réseau : profil inconnu");
+        }
+        Probe::Failed => {
+            ui.colored_label(dim, "Réseau : lecture du profil impossible");
+        }
+    }
+
+    // 7.3 — inbound firewall rule presence.
+    match snap.rule {
+        Probe::Pending => {
+            ui.colored_label(dim, "Règle pare-feu : vérification en attente…");
+        }
+        Probe::Ok(true) => {
+            ui.colored_label(ok, "✓  Règle pare-feu : présente");
+        }
+        Probe::Ok(false) => {
+            ui.colored_label(
+                warn,
+                "⚠  Règle pare-feu absente — console injoignable sur le LAN \
+                 (voir « Recréer la règle du pare-feu » ci-dessous).",
+            );
+        }
+        Probe::Failed => {
+            ui.colored_label(dim, "Règle pare-feu : vérification impossible");
         }
     }
 }
