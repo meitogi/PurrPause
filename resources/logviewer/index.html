@@ -17,10 +17,13 @@
       - On load, GET /api/session -> { authed, hostname, logs:[...] }.
       - Not authed -> pincode form -> POST /api/auth { pin }. On success the
         server sets an HttpOnly session cookie; we re-query /api/session.
-      - Authed -> 3 tabs (service / widget / bench), each showing today's
-        history (GET /api/logs?file=X&tail=N) + a live tail via
-        EventSource('/api/stream?file=X'). "Tout télécharger" -> GET
-        /api/download (zip). "Déclencher une pause" -> POST /api/pause.
+      - Authed -> 4 tabs (service / widget / install / watchdog). Service /
+        widget / watchdog show a 2-day window (today + yesterday) via GET
+        /api/logs?file=X&tail=N plus a live tail via
+        EventSource('/api/stream?file=X'); install shows its latest dated file.
+        "Télécharger tous les logs" -> GET /api/download?scope=all (zip);
+        "Télécharger les 2 derniers jours" -> GET /api/download?scope=window.
+        "Déclencher une pause" -> POST /api/pause.
     ============================================================================
   -->
   <style>
@@ -194,7 +197,8 @@
       <span class="host" id="host"></span>
       <span class="spacer"></span>
       <div class="actions">
-        <button id="downloadBtn" class="ghost">Tout télécharger</button>
+        <button id="downloadAllBtn" class="ghost">Télécharger tous les logs</button>
+        <button id="downloadWindowBtn" class="ghost">Télécharger les 2 derniers jours</button>
         <button id="pauseBtn" class="ghost">Déclencher une pause</button>
       </div>
     </header>
@@ -208,8 +212,8 @@
     "use strict";
 
     // Display labels for each log param returned by /api/session.
-    const LABELS = { service: "Service", widget: "Widget", bench: "Bench" };
-    const HISTORY_TAIL = 500; // lines of today's history to load per tab
+    const LABELS = { service: "Service", widget: "Widget", install: "Install", watchdog: "Watchdog" };
+    const HISTORY_TAIL = 500; // lines of the displayed window to load per tab
 
     const el = (id) => document.getElementById(id);
     let currentFile = null;
@@ -273,7 +277,7 @@
       if (!lines.length) {
         const e = document.createElement("div");
         e.className = "empty";
-        e.textContent = "(aucune entrée aujourd'hui)";
+        e.textContent = "(aucune entrée)";
         pane.appendChild(e);
       } else {
         for (const l of lines) appendLine(l, false);
@@ -339,8 +343,11 @@
     });
 
     // --- Header actions ---
-    el("downloadBtn").addEventListener("click", () => {
-      window.location.href = "/api/download";
+    el("downloadAllBtn").addEventListener("click", () => {
+      window.location.href = "/api/download?scope=all";
+    });
+    el("downloadWindowBtn").addEventListener("click", () => {
+      window.location.href = "/api/download?scope=window";
     });
     el("pauseBtn").addEventListener("click", async () => {
       try {

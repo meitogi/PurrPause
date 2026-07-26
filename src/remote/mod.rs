@@ -40,7 +40,7 @@ use crate::modes::config::lockout::LockoutState;
 
 use assets::INDEX_HTML;
 use http::{parse_request, sse_data, write_sse_headers, Request, Response, SSE_PING};
-use logs::{history_files, tail_snapshot, today_path, LogDirs, LogFile, Tailer};
+use logs::{history_files, resolve_paths, snapshot, LogDirs, LogFile, Tailer};
 use session::{IpThrottle, Sessions};
 
 /// Fixed LAN port for the console. Not configurable in v1.
@@ -182,7 +182,7 @@ pub fn route(
                 return Resp(Response::not_found());
             };
             let tail = req.query.get("tail").and_then(|s| s.parse::<usize>().ok());
-            let lines = tail_snapshot(&today_path(&ctx.dirs, file, today), tail);
+            let lines = snapshot(&ctx.dirs, file, today, tail);
             Resp(Response::ok_json(
                 serde_json::json!({ "lines": lines }).to_string(),
             ))
@@ -202,7 +202,8 @@ pub fn route(
             if !authed {
                 return Resp(Response::unauthorized());
             }
-            match build_zip(&ctx.dirs) {
+            let scope = DownloadScope::from_param(req.query.get("scope").map(String::as_str));
+            match build_zip(&ctx.dirs, today, scope) {
                 Ok(bytes) => Resp(Response::zip(bytes)),
                 Err(_) => Resp(Response::json(
                     500,
@@ -255,16 +256,43 @@ fn handle_auth(req: &Request, ctx: &Ctx, client_ip: IpAddr, now: Instant) -> Res
     }
 }
 
-/// Build the download-all zip: one entry per log (`service.log` / `widget.log`
-/// / `bench.log`), each the concatenation of that log's full on-disk history.
-fn build_zip(dirs: &LogDirs) -> io::Result<Vec<u8>> {
+/// Which slice of history a download zip carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DownloadScope {
+    /// Every dated file for every log (full on-disk history).
+    All,
+    /// Just the displayed 2-day window (today + yesterday; the latest file for
+    /// Install) — matches the console's « 2 derniers jours » button.
+    Window,
+}
+
+impl DownloadScope {
+    /// Parse `?scope=`; defaults to `All` for back-compat (older bookmarks and
+    /// the plain `/api/download` link with no query).
+    fn from_param(s: Option<&str>) -> DownloadScope {
+        match s {
+            Some("window") => DownloadScope::Window,
+            _ => DownloadScope::All,
+        }
+    }
+}
+
+/// Build a download zip: one entry per log (`service.log` / `widget.log` /
+/// `install.log` / `watchdog.log`), each the concatenation of the paths the
+/// `scope` selects — `All` walks the full on-disk history, `Window` takes just
+/// the displayed 2-day window (today + yesterday; the latest file for Install).
+fn build_zip(dirs: &LogDirs, today: NaiveDate, scope: DownloadScope) -> io::Result<Vec<u8>> {
     let mut cursor = Cursor::new(Vec::new());
     {
         let mut zw = ZipWriter::new(&mut cursor);
         let opts = SimpleFileOptions::default();
         for file in LogFile::ALL {
+            let paths = match scope {
+                DownloadScope::All => history_files(dirs, file),
+                DownloadScope::Window => resolve_paths(dirs, file, today),
+            };
             zw.start_file(file.base(), opts)?;
-            for path in history_files(dirs, file) {
+            for path in paths {
                 if let Ok(bytes) = std::fs::read(&path) {
                     zw.write_all(&bytes)?;
                 }
@@ -324,14 +352,12 @@ fn handle_connection(stream: TcpStream, ctx: &Ctx) -> io::Result<()> {
     Ok(())
 }
 
-/// SSE handler: replay today's snapshot, then tail forever. Any write error
-/// (client disconnect) ends the loop and the connection thread.
+/// SSE handler: tail the log forever. The displayed history is served
+/// separately by `/api/logs`, so the stream carries only lines written after
+/// it opened — no snapshot replay. Any write error (client disconnect) ends
+/// the loop and the connection thread.
 fn stream_logs(ctx: &Ctx, file: LogFile, today: NaiveDate, w: &mut TcpStream) -> io::Result<()> {
     write_sse_headers(w)?;
-
-    for line in tail_snapshot(&today_path(&ctx.dirs, file, today), None) {
-        w.write_all(sse_data(&line).as_bytes())?;
-    }
     w.flush()?;
 
     let mut tailer = Tailer::new(&ctx.dirs, file, today);
@@ -359,6 +385,7 @@ fn stream_logs(ctx: &Ctx, file: LogFile, today: NaiveDate, w: &mut TcpStream) ->
 
 #[cfg(test)]
 mod tests {
+    use super::logs::today_path;
     use super::*;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -432,7 +459,10 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
         assert_eq!(v["authed"], false);
         assert_eq!(v["hostname"], "child.local:8787");
-        assert_eq!(v["logs"], serde_json::json!(["service", "widget", "bench"]));
+        assert_eq!(
+            v["logs"],
+            serde_json::json!(["service", "widget", "install", "watchdog"])
+        );
     }
 
     #[test]
@@ -475,7 +505,7 @@ mod tests {
         let now = Instant::now();
         let tok = ctx.sessions.issue(now);
         let r = resp(route(
-            &request("GET", "/api/logs", &[("file", "install")], Some(&tok), b""),
+            &request("GET", "/api/logs", &[("file", "bench")], Some(&tok), b""),
             &ctx,
             ip(),
             now,
@@ -562,19 +592,58 @@ mod tests {
     }
 
     #[test]
-    fn download_yields_zip_with_three_entries() {
+    fn download_all_yields_zip_with_four_entries() {
         let (_t, d) = dirs();
         std::fs::write(today_path(&d, LogFile::Service, today()), "svc\n").unwrap();
-        std::fs::write(today_path(&d, LogFile::Bench, today()), "bench\n").unwrap();
+        std::fs::write(today_path(&d, LogFile::Widget, today()), "wid\n").unwrap();
         let ctx = test_ctx(PathBuf::from("x"), d, Arc::new(AtomicUsize::new(0)));
         let now = Instant::now();
         let tok = ctx.sessions.issue(now);
 
+        // No scope param -> defaults to All (back-compat). One entry per log,
+        // present even for logs with no file yet.
         let r = resp(route(&request("GET", "/api/download", &[], Some(&tok), b""), &ctx, ip(), now, today()));
         assert_eq!(r.status, 200);
 
         let archive = zip::ZipArchive::new(Cursor::new(r.body)).unwrap();
-        assert_eq!(archive.len(), 3);
+        assert_eq!(archive.len(), 4);
+    }
+
+    #[test]
+    fn download_window_scopes_to_two_days_all_keeps_full_history() {
+        use std::io::Read;
+        let (_t, d) = dirs();
+        let t = today();
+        let yesterday = t.pred_opt().unwrap();
+        let older = NaiveDate::from_ymd_opt(2026, 7, 20).unwrap();
+        std::fs::write(today_path(&d, LogFile::Service, older), "old\n").unwrap();
+        std::fs::write(today_path(&d, LogFile::Service, yesterday), "yday\n").unwrap();
+        std::fs::write(today_path(&d, LogFile::Service, t), "tday\n").unwrap();
+        let ctx = test_ctx(PathBuf::from("x"), d, Arc::new(AtomicUsize::new(0)));
+        let now = Instant::now();
+        let tok = ctx.sessions.issue(now);
+
+        let read_service = |scope: &str| -> String {
+            let r = resp(route(
+                &request("GET", "/api/download", &[("scope", scope)], Some(&tok), b""),
+                &ctx,
+                ip(),
+                now,
+                t,
+            ));
+            let mut archive = zip::ZipArchive::new(Cursor::new(r.body)).unwrap();
+            let mut f = archive.by_name("service.log").unwrap();
+            let mut s = String::new();
+            f.read_to_string(&mut s).unwrap();
+            s
+        };
+
+        // All history includes the old file; the 2-day window excludes it.
+        let all = read_service("all");
+        assert!(all.contains("old") && all.contains("yday") && all.contains("tday"));
+        let window = read_service("window");
+        assert!(!window.contains("old"));
+        assert!(window.contains("yday") && window.contains("tday"));
     }
 
     #[test]
