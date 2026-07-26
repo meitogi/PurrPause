@@ -46,6 +46,13 @@ pub mod d {
     pub fn duration_minutes() -> u32 {
         5
     }
+    /// Continuous-inactivity reset threshold, in minutes. `0` is the
+    /// sentinel for "auto = 2 × duration_minutes" (resolved by
+    /// `scheduler::inactivity_reset_secs`), so the effective default is
+    /// Y×2 without hard-coding it against a possibly-edited duration.
+    pub fn inactivity_reset_minutes() -> u32 {
+        0
+    }
     pub fn pre_notification_minutes() -> Vec<u32> {
         vec![15, 10, 5, 1]
     }

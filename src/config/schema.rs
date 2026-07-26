@@ -72,6 +72,16 @@ pub struct Config {
     #[serde(default = "d::duration_minutes")]
     pub duration_minutes: u32,
 
+    /// Continuous-inactivity threshold (minutes) that resets the general
+    /// cycle : one uninterrupted sleep / lock / idle stretch ≥ this value
+    /// is treated as "the break was taken", so the timer reboots to a
+    /// fresh interval. `0` = auto = `2 × duration_minutes`. Cumulative
+    /// (non-continuous) inactivity never resets — it only pushes the
+    /// deadline back, capped at one interval. Distinct from the cold-boot
+    /// `reset_threshold_hours`.
+    #[serde(default = "d::inactivity_reset_minutes")]
+    pub inactivity_reset_minutes: u32,
+
     #[serde(default = "d::pre_notification_minutes")]
     pub pre_notification_minutes: Vec<u32>,
 

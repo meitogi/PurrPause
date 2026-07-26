@@ -9,9 +9,7 @@ pub mod registry;
 #[cfg(windows)]
 pub mod win32;
 
-use std::collections::HashMap;
 use std::ffi::OsStr;
-use std::hash::Hash;
 use std::path::Path;
 
 use anyhow::Result;
@@ -128,23 +126,6 @@ pub(crate) fn update_or_spawn_replacing_with_env<S: Spawner, M>(
     }
 }
 
-/// Same, keyed. Only the same-key predecessor is terminated ; other keys
-/// remain untouched (widget palier isolation).
-pub(crate) fn spawn_replacing_keyed<S: Spawner, K: Hash + Eq + Copy>(
-    spawner: &S,
-    exe: &Path,
-    args: &[&OsStr],
-    key: K,
-    map: &mut HashMap<K, S::Child>,
-) -> Result<()> {
-    let new_child = spawner.spawn(exe, args)?;
-    if let Some(prev) = map.remove(&key) {
-        prev.terminate();
-        drop(prev);
-    }
-    map.insert(key, new_child);
-    Ok(())
-}
 
 #[cfg(test)]
 mod tests {
@@ -385,43 +366,4 @@ mod tests {
         assert_eq!(&*seen.borrow(), &(4242, "the message".to_string()));
     }
 
-    // -------- spawn_replacing_keyed (widget palier state machine) --------
-
-    #[test]
-    fn keyed_spawn_isolates_different_keys() {
-        let spawner = FakeSpawner::new();
-        let mut map: HashMap<u32, FakeChild> = HashMap::new();
-        spawn_replacing_keyed(&spawner, dummy_exe(), &[], 10u32, &mut map).unwrap();
-        spawn_replacing_keyed(&spawner, dummy_exe(), &[], 15u32, &mut map).unwrap();
-        // Firing palier 15 must not disturb palier 10.
-        assert!(map.contains_key(&10));
-        assert!(map.contains_key(&15));
-        assert!(spawner.terminated().is_empty());
-    }
-
-    #[test]
-    fn keyed_spawn_same_key_terminates_and_replaces() {
-        let spawner = FakeSpawner::new();
-        let mut map: HashMap<u32, FakeChild> = HashMap::new();
-        spawn_replacing_keyed(&spawner, dummy_exe(), &[], 10u32, &mut map).unwrap();
-        spawn_replacing_keyed(&spawner, dummy_exe(), &[], 10u32, &mut map).unwrap();
-        assert_eq!(spawner.terminated(), vec![1000]);
-        assert_eq!(map.get(&10).unwrap().pid(), 1001);
-    }
-
-    #[test]
-    fn keyed_spawn_failure_preserves_all_map_entries() {
-        let spawner = FakeSpawner::new();
-        let mut map: HashMap<u32, FakeChild> = HashMap::new();
-        spawn_replacing_keyed(&spawner, dummy_exe(), &[], 10u32, &mut map).unwrap();
-        spawn_replacing_keyed(&spawner, dummy_exe(), &[], 15u32, &mut map).unwrap();
-
-        spawner.fail_next_spawn();
-        let result = spawn_replacing_keyed(&spawner, dummy_exe(), &[], 10u32, &mut map);
-        assert!(result.is_err());
-        // Both entries survive intact.
-        assert_eq!(map.get(&10).unwrap().pid(), 1000);
-        assert_eq!(map.get(&15).unwrap().pid(), 1001);
-        assert!(spawner.terminated().is_empty());
-    }
 }

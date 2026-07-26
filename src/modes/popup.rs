@@ -723,6 +723,21 @@ mod windows_impl {
                     },
                 )
                 .with_url("purrpause://localhost/popup.html")
+                // Page-load lifecycle trace : the window builds fullscreen
+                // TRANSPARENT, so a WebView that never navigates / never
+                // finishes loading shows nothing and the desktop (a
+                // background video) stays visible "through" it. Without
+                // this, widget.log confirms the window + webview were
+                // built but says nothing about whether the content
+                // actually rendered.
+                .with_on_page_load_handler(|event, url| match event {
+                    wry::PageLoadEvent::Started => {
+                        tracing::info!(url = %url, "popup: webview page load started");
+                    }
+                    wry::PageLoadEvent::Finished => {
+                        tracing::info!(url = %url, "popup: webview page load finished");
+                    }
+                })
                 .with_ipc_handler(move |request| {
                     let body = request.body().as_str();
                     if body == "dismiss" {
@@ -1371,6 +1386,10 @@ mod windows_impl {
         // Trim leading slash — uri().path() returns "/popup.html".
         let path = uri.path().trim_start_matches('/');
         if path == "popup.html" || path.is_empty() {
+            // Confirms the WebView actually requested the main document
+            // (and how big it is) — the first thing to check when the
+            // fullscreen transparent window renders blank.
+            tracing::info!(bytes = rendered_popup_html.len(), "popup: serving popup.html");
             return wry::http::Response::builder()
                 .status(200)
                 .header("Content-Type", "text/html; charset=utf-8")

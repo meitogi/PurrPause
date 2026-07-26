@@ -304,13 +304,13 @@ pub fn resolve_cold_start(
 /// Should a positive clock-shift gap (suspend, hibernate, VM freeze)
 /// reset the interval cycle instead of shifting `last_popup` forward ?
 ///
-/// Same rule as [`resolve_cold_start`]'s absence-covered-break branch :
-/// an absence at least as long as the break the popup would force IS
-/// the break — start a fresh cycle at wake instead of banking the gap.
-/// Sub-duration gaps keep the shift behavior (the user just closed the
-/// lid for a moment ; their active time is preserved).
-pub fn suspend_gap_resets_cycle(gap_secs: u64, popup_duration_secs: u64) -> bool {
-    gap_secs >= popup_duration_secs
+/// A single continuous absence at least as long as `threshold_secs` (the
+/// inactivity-reset threshold Z) IS the break — start a fresh cycle at
+/// wake instead of banking the gap. Sub-threshold gaps keep the shift
+/// behavior (the user just closed the lid for a moment ; their active
+/// time is preserved).
+pub fn suspend_gap_resets_cycle(gap_secs: u64, threshold_secs: u64) -> bool {
+    gap_secs >= threshold_secs
 }
 
 /// Cap `paused_secs` at the wall-clock elapsed since `last_popup`.
@@ -322,6 +322,28 @@ pub fn suspend_gap_resets_cycle(gap_secs: u64, popup_duration_secs: u64) -> bool
 /// suspend-compensation) ; clamping self-heals a bad runtime.dat.
 pub fn clamp_paused_to_elapsed(paused_secs: u64, elapsed_secs: u64) -> u64 {
     paused_secs.min(elapsed_secs)
+}
+
+/// Accumulate the length of the *current continuous* inactivity run.
+///
+/// Reset semantics (rules 2/3) key off ONE uninterrupted idle/lock/sleep
+/// stretch, not the cumulative banked inactivity : returns `prev + tick`
+/// while idle, and zeroes the instant activity returns. The result is
+/// compared against Z by [`idle_run_triggers_reset`] ; the cumulative
+/// `paused_secs` is a separate counter that only pushes the deadline back.
+pub fn accrue_idle_run(prev_run_secs: u64, is_idle_now: bool, tick_delta_secs: u64) -> u64 {
+    if is_idle_now {
+        prev_run_secs.saturating_add(tick_delta_secs)
+    } else {
+        0
+    }
+}
+
+/// True when a continuous inactivity run has reached the reset threshold Z
+/// (the break is considered taken — the caller reboots the cycle to `now`).
+/// Inclusive at Z so a run of exactly Z resets.
+pub fn idle_run_triggers_reset(idle_run_secs: u64, z_secs: u64) -> bool {
+    idle_run_secs >= z_secs
 }
 
 /// Compare wall-clock and unbiased-interrupt-time deltas across a tick
@@ -463,15 +485,26 @@ pub struct DailyPauseState {
     /// caller so the scheduler doesn't own the TZ/date arithmetic.
     pub fire_at_today: DateTime<Tz>,
     /// End of the grace window : `fire_at_today + duration_minutes`.
-    /// Past this the pause is skipped for the day (Cas C — see
-    /// ROLLOUT).
+    /// On-time fires happen inside `[fire_at, grace_window_end]` ; past
+    /// it a LATE fire is still allowed until `end_of_local_day`, gated on
+    /// activity (rule 4 : the pause always fires once per day).
     pub grace_window_end: DateTime<Tz>,
+    /// Next local midnight. Upper bound for a late daily fire : the pause
+    /// must still land the same local day (rule 4). After midnight the
+    /// day-rollover reset owns re-arming tomorrow's window.
+    pub end_of_local_day: DateTime<Tz>,
+    /// Whether the user is currently active (the tick's `!is_idle_now`,
+    /// which folds keyboard/mouse/gamepad/media AND locked). A late fire
+    /// (past grace) only happens when active, so the pause never lands on
+    /// a locked/asleep screen (rules 9/10/11).
+    pub active_now: bool,
     /// Paliers already fired for today. The caller may pre-populate
     /// with paliers whose windows are already past at boot to prevent
     /// retroactive fires (Cas B in the ROLLOUT).
     pub fired_paliers: HashSet<u32>,
-    /// Anti-forkbomb marker (Cas C) : true when today's fire attempt
-    /// hit past-grace-window ; scheduler must not retry until tomorrow.
+    /// Anti-forkbomb marker : true when the day is explicitly given up on.
+    /// (No longer set merely because the grace window passed — rule 4
+    /// guarantees a late fire on return to activity.)
     pub skipped_today: bool,
 }
 
@@ -490,6 +523,8 @@ impl Default for DailyPauseState {
             fired_today: false,
             fire_at_today: epoch,
             grace_window_end: epoch,
+            end_of_local_day: epoch,
+            active_now: false,
             fired_paliers: HashSet::new(),
             skipped_today: false,
         }
@@ -547,23 +582,63 @@ pub fn next_event(
         return SchedulerDecision::Nothing;
     }
 
-    // Daily-pause fire has the highest priority : it's time-anchored
-    // and the interval popup can reschedule freely.
+    // 2. Daily PAUSE fire — highest priority (rules 4/5/6). On-time (in
+    //    [fire_at, grace_end]) fires unconditionally. A LATE fire (past
+    //    grace, up to end of local day) is gated on activity so the pause
+    //    never lands on a locked/asleep screen (rules 9/10/11) — until the
+    //    user returns, it stays pending (Nothing), never skipped (rule 4:
+    //    the daily always fires once per local day).
     if daily_pause_state.enabled
         && !daily_pause_state.fired_today
         && !daily_pause_state.skipped_today
         && now_local >= daily_pause_state.fire_at_today
-        && now_local <= daily_pause_state.grace_window_end
+        && now_local < daily_pause_state.end_of_local_day
     {
-        return SchedulerDecision::FireDailyPause;
+        if now_local <= daily_pause_state.grace_window_end || daily_pause_state.active_now {
+            return SchedulerDecision::FireDailyPause;
+        }
+        // Armed and waiting for the user to return to activity : suppress
+        // everything else meanwhile (the pause is next, not an interval).
+        return SchedulerDecision::Nothing;
     }
 
-    // Daily-pause countdowns — iterate largest → smallest so we emit
-    // the tightest-still-relevant palier when the earlier ones have
-    // already been fired. Windows are closed once now_local passes
-    // fire_at_today (the fire branch above catches that case). A
-    // skipped day has no lunch to announce — same guard as the fire
-    // branch, or a moved-then-skipped window would still countdown.
+    // 3. Interval popup (general flow). `Config::disabled` gates ONLY the
+    //    interval branch (kill-switch separation). Rule 6 (no interval
+    //    inside the noon pause) is enforced by the lunch-end anchor set on
+    //    the daily fire, which pushes `last_popup` past the pause — so no
+    //    explicit pre-fire suppression window is needed here.
+    if !config.disabled {
+        let next = next_popup_at(last_popup, config, paused_secs);
+        if now >= next {
+            return SchedulerDecision::FirePopup;
+        }
+        // 4. Interval countdowns (general pre-notifs), largest boundary
+        //    first — the first crossed, not-yet-fired palier.
+        for palier in sanitize_paliers(config) {
+            if fired_paliers.contains(&palier) {
+                continue;
+            }
+            let palier_dur = Duration::from_secs(u64::from(palier) * 60);
+            let boundary = match next.checked_sub(palier_dur) {
+                Some(b) => b,
+                None => continue,
+            };
+            if now >= boundary {
+                let remaining = next.duration_since(now).unwrap_or(Duration::ZERO);
+                return SchedulerDecision::FireCountdown {
+                    palier_minutes: palier,
+                    seconds_until_popup: remaining.as_secs(),
+                };
+            }
+        }
+    }
+
+    // 5. Daily-pause countdown — LOWEST priority (rule 8 / "the general
+    //    flow runs before any pause-midi notification"). Only reached when
+    //    no general popup or countdown is due above, so the daily
+    //    notification always yields to the general flow ; the pause itself
+    //    still lands on time (step 2) by overwriting the popup or firing
+    //    after. Iterate largest → smallest for the tightest palier.
     if daily_pause_state.enabled
         && !daily_pause_state.fired_today
         && !daily_pause_state.skipped_today
@@ -583,61 +658,6 @@ pub fn next_event(
                     seconds_until,
                 };
             }
-        }
-    }
-
-    // Pause midi has absolute priority : once we're inside its window
-    // (from the earliest pre-notif at T-15 through the end of the grace
-    // window) and it hasn't fired yet today, suppress ALL interval
-    // activity so no interval popup or pre-notif countdown lands on top
-    // of the lunch pause. The daily fire / daily-countdown branches above
-    // already emit the daily decisions at their exact moments ; this
-    // guard covers the gaps between them. A skipped day has no lunch to
-    // protect (same guard as the fire branch) — without it, a stale
-    // skipped marker around a re-timed window would swallow interval
-    // deadlines for 45 min and release them late, paliers skipped.
-    if daily_pause_state.enabled
-        && !daily_pause_state.fired_today
-        && !daily_pause_state.skipped_today
-    {
-        let window_start =
-            daily_pause_state.fire_at_today - ChronoDuration::minutes(15);
-        if now_local >= window_start && now_local <= daily_pause_state.grace_window_end {
-            return SchedulerDecision::Nothing;
-        }
-    }
-
-    // Interval branch — scoped kill-switch (Config::disabled only
-    // disables intervals per the ROLLOUT "kill-switch separation"
-    // decision).
-    if config.disabled {
-        return SchedulerDecision::Nothing;
-    }
-
-    let next = next_popup_at(last_popup, config, paused_secs);
-
-    if now >= next {
-        return SchedulerDecision::FirePopup;
-    }
-
-    // Paliers are sorted descending (largest = earliest). We fire the
-    // first one that has crossed its boundary and hasn't been marked
-    // fired yet.
-    for palier in sanitize_paliers(config) {
-        if fired_paliers.contains(&palier) {
-            continue;
-        }
-        let palier_dur = Duration::from_secs(u64::from(palier) * 60);
-        let boundary = match next.checked_sub(palier_dur) {
-            Some(b) => b,
-            None => continue,
-        };
-        if now >= boundary {
-            let remaining = next.duration_since(now).unwrap_or(Duration::ZERO);
-            return SchedulerDecision::FireCountdown {
-                palier_minutes: palier,
-                seconds_until_popup: remaining.as_secs(),
-            };
         }
     }
 
@@ -696,6 +716,25 @@ pub fn interval(config: &Config) -> Duration {
         DEFAULT_INTERVAL_HOURS
     };
     Duration::from_secs((f64::from(hours) * 3600.0) as u64)
+}
+
+/// The continuous-inactivity reset threshold Z, in seconds.
+///
+/// `config.inactivity_reset_minutes == 0` is the sentinel for "auto =
+/// 2 × `duration_minutes`" (the owner-specified default, Y×2). A set
+/// value is used verbatim but floored to one break duration so a
+/// hand-edited tiny Z can't thrash-reset the cycle every idle blip.
+/// This is the single source of Z for the live-resume and idle-run
+/// reset paths. Distinct from the cold-boot `reset_threshold_hours`.
+pub fn inactivity_reset_secs(config: &Config) -> u64 {
+    let y_secs = u64::from(config.duration_minutes).saturating_mul(60);
+    if config.inactivity_reset_minutes == 0 {
+        y_secs.saturating_mul(2)
+    } else {
+        u64::from(config.inactivity_reset_minutes)
+            .saturating_mul(60)
+            .max(y_secs)
+    }
 }
 
 /// Sanitize `pre_notification_minutes` — sort descending, dedupe, drop
@@ -771,11 +810,18 @@ mod tests {
             .with_ymd_and_hms(now_local.year(), now_local.month(), now_local.day(), h, m, 0)
             .single()
             .expect("test time is unambiguous");
+        let end_of_local_day = now_local
+            .date_naive()
+            .succ_opt()
+            .and_then(|d| tz.with_ymd_and_hms(d.year(), d.month(), d.day(), 0, 0, 0).single())
+            .expect("next local midnight is unambiguous");
         DailyPauseState {
             enabled: true,
             fired_today: false,
             fire_at_today: fire,
             grace_window_end: fire + ChronoDuration::minutes(duration_minutes),
+            end_of_local_day,
+            active_now: true,
             fired_paliers: HashSet::new(),
             skipped_today: false,
         }
@@ -1803,6 +1849,64 @@ mod tests {
         assert_eq!(clamp_paused_to_elapsed(4876, 420), 420);
     }
 
+    // -------- inactivity_reset_secs (Z) --------
+
+    #[test]
+    fn inactivity_reset_secs_auto_is_twice_duration() {
+        // Sentinel 0 ⇒ auto = 2×Y. duration_minutes default 5 → 600s.
+        let cfg = config_with(2.0, vec![], false); // duration_minutes = 5 (default)
+        assert_eq!(inactivity_reset_secs(&cfg), 10 * 60);
+    }
+
+    #[test]
+    fn inactivity_reset_secs_explicit_value_used() {
+        let mut cfg = config_with(2.0, vec![], false);
+        cfg.inactivity_reset_minutes = 7;
+        assert_eq!(inactivity_reset_secs(&cfg), 7 * 60);
+    }
+
+    #[test]
+    fn inactivity_reset_secs_floored_to_one_duration() {
+        // A hand-edited Z below one break duration is floored to Y.
+        let mut cfg = config_with(2.0, vec![], false); // Y = 5 min
+        cfg.inactivity_reset_minutes = 2;
+        assert_eq!(inactivity_reset_secs(&cfg), 5 * 60);
+    }
+
+    // -------- accrue_idle_run + idle_run_triggers_reset --------
+
+    #[test]
+    fn accrue_idle_run_accumulates_while_idle() {
+        let r = accrue_idle_run(0, true, 5);
+        let r = accrue_idle_run(r, true, 5);
+        assert_eq!(r, 10);
+    }
+
+    #[test]
+    fn accrue_idle_run_zeroes_on_activity() {
+        assert_eq!(accrue_idle_run(600, false, 5), 0);
+    }
+
+    #[test]
+    fn idle_run_reset_boundary_inclusive_at_z() {
+        assert!(!idle_run_triggers_reset(599, 600));
+        assert!(idle_run_triggers_reset(600, 600));
+        assert!(idle_run_triggers_reset(601, 600));
+    }
+
+    #[test]
+    fn cumulative_paused_caps_at_interval_across_sub_z_bits() {
+        // Many sub-Z idle bits accumulate but the cumulative pushback is
+        // capped at X (the interval). Mirrors the tick-loop cap
+        // `(paused + tick).min(X)`. X = 1h here (3600s), bits of 300s.
+        let x_secs = interval(&config_with(1.0, vec![], false)).as_secs();
+        let mut paused = 0u64;
+        for _ in 0..20 {
+            paused = (paused + 300).min(x_secs);
+        }
+        assert_eq!(paused, x_secs); // never exceeds one interval
+    }
+
     // -------- compute_clock_shift + shift_systemtime --------
 
     const JUMP_THRESHOLD: u64 = 60;
@@ -1937,7 +2041,10 @@ mod tests {
     fn daily_pause_countdown_skips_fired_palier() {
         let cfg = config_with(2.0, vec![], false); // interval paliers irrelevant
         let now = epoch_plus(10_000);
-        let last = epoch_plus(0);
+        // last = now so no interval popup is due : the daily countdown is
+        // lowest priority (rule 8) and only fires when the general flow is
+        // idle, so we must isolate it here.
+        let last = epoch_plus(10_000);
         let fired = HashSet::new();
         let now_local = paris_at(2026, 3, 15, 11, 55); // T-5min from 12:00
         let mut state = daily_state_at(chrono_tz::Europe::Paris, now_local, 12, 0, 30);
@@ -2014,17 +2121,85 @@ mod tests {
     }
 
     #[test]
-    fn daily_pause_grace_window_at_31_min_does_not_fire() {
-        // Past the grace window (12:00 + 30min = 12:30) → no fire.
-        // The caller (session 2) sets skipped_today after seeing
-        // Nothing here, so the next tick doesn't re-attempt.
+    fn daily_pause_grace_window_at_31_min_does_not_fire_while_inactive() {
+        // Past the grace window (12:00 + 30min = 12:30) AND the user is
+        // inactive → the pause is armed and WAITS (rule 4 : it will fire
+        // late on return to activity, never skipped). Nothing fires now.
         // Intervals disabled so the assertion isolates the daily branch.
         let cfg = config_with(2.0, vec![], true);
         let now = epoch_plus(10_000);
         let last = epoch_plus(0);
         let fired = HashSet::new();
         let now_local = paris_at(2026, 3, 15, 12, 31);
+        let mut state = daily_state_at(chrono_tz::Europe::Paris, now_local, 12, 0, 30);
+        state.active_now = false; // inactive → armed, waiting
+        let decision = next_event(now, &cfg, last, 0, &fired, false, &state, now_local);
+        assert_eq!(decision, SchedulerDecision::Nothing);
+    }
+
+    #[test]
+    fn daily_pause_fires_late_when_active_past_grace() {
+        // Rule 4 : past the grace window but the user is active → fire the
+        // pause LATE (same local day) rather than skip it.
+        let cfg = config_with(2.0, vec![], true);
+        let now = epoch_plus(10_000);
+        let last = epoch_plus(0);
+        let fired = HashSet::new();
+        let now_local = paris_at(2026, 3, 15, 15, 0); // hours past grace
         let state = daily_state_at(chrono_tz::Europe::Paris, now_local, 12, 0, 30);
+        // helper sets active_now = true
+        let decision = next_event(now, &cfg, last, 0, &fired, false, &state, now_local);
+        assert_eq!(decision, SchedulerDecision::FireDailyPause);
+    }
+
+    #[test]
+    fn daily_pending_late_and_inactive_suppresses_interval() {
+        // Intentional (rule 4/5) : when the daily is past grace, unfired,
+        // and the user is INACTIVE, it is armed and waiting — return
+        // Nothing rather than fire an interval popup at an absent user.
+        // The daily fires the instant the user is active again (which then
+        // has priority over the interval, rule 5). Intervals ENABLED and
+        // due here to prove the daily-pending guard wins.
+        let cfg = config_with(2.0, vec![], false); // intervals enabled
+        let now = epoch_plus(3 * 3600); // 3h > 2h interval → interval due
+        let last = epoch_plus(0);
+        let fired = HashSet::new();
+        let now_local = paris_at(2026, 3, 15, 15, 0); // hours past grace
+        let mut state = daily_state_at(chrono_tz::Europe::Paris, now_local, 12, 0, 30);
+        state.active_now = false; // absent
+        let decision = next_event(now, &cfg, last, 0, &fired, false, &state, now_local);
+        assert_eq!(decision, SchedulerDecision::Nothing);
+    }
+
+    #[test]
+    fn daily_pending_late_and_active_fires_daily_over_due_interval() {
+        // Same setup but the user is ACTIVE : the overdue daily fires and
+        // takes priority over the also-due interval (rule 5).
+        let cfg = config_with(2.0, vec![], false);
+        let now = epoch_plus(3 * 3600);
+        let last = epoch_plus(0);
+        let fired = HashSet::new();
+        let now_local = paris_at(2026, 3, 15, 15, 0);
+        let state = daily_state_at(chrono_tz::Europe::Paris, now_local, 12, 0, 30);
+        // helper: active_now = true
+        let decision = next_event(now, &cfg, last, 0, &fired, false, &state, now_local);
+        assert_eq!(decision, SchedulerDecision::FireDailyPause);
+    }
+
+    #[test]
+    fn daily_pause_does_not_fire_next_day_before_window() {
+        // A late fire must stay same-day : at 00:30 the next day with the
+        // (stale) prior-day fire_at, the day-rollover owns re-arming, so
+        // next_event does NOT fire yesterday's pause.
+        let cfg = config_with(2.0, vec![], true);
+        let now = epoch_plus(10_000);
+        let last = epoch_plus(0);
+        let fired = HashSet::new();
+        // now_local is next day 00:30, but the state's fire_at/end_of_day
+        // are yesterday's (built for 2026-03-15).
+        let yesterday_local = paris_at(2026, 3, 15, 12, 0);
+        let state = daily_state_at(chrono_tz::Europe::Paris, yesterday_local, 12, 0, 30);
+        let now_local = paris_at(2026, 3, 16, 0, 30);
         let decision = next_event(now, &cfg, last, 0, &fired, false, &state, now_local);
         assert_eq!(decision, SchedulerDecision::Nothing);
     }
@@ -2075,12 +2250,13 @@ mod tests {
     }
 
     #[test]
-    fn daily_pause_suppression_active_when_not_skipped() {
-        // Regression pin : same setup minus the skipped marker — the
-        // suppression window still swallows the due interval. T-10
-        // with paliers 15+10 already emitted, so neither the countdown
-        // branch (palier 5 is at T-5) nor the fire branch is due : the
-        // suppression guard is the branch under test.
+    fn general_flow_shows_in_pre_noon_window() {
+        // Rule 8 / "general flow first" : a due interval popup in the
+        // T-15..noon pre-window is NO LONGER suppressed — it shows, and
+        // the daily countdown yields (it's lowest priority). The daily
+        // pause itself will overwrite this popup or fire after (rule 5).
+        // T-10 with paliers 15+10 already emitted ; interval due (3h since
+        // last popup, interval 2h) → FirePopup, not Nothing.
         let cfg = config_with(2.0, vec![], false);
         let now = epoch_plus(3 * 3600);
         let last = epoch_plus(0);
@@ -2089,7 +2265,22 @@ mod tests {
         let mut state = daily_state_at(chrono_tz::Europe::Paris, now_local, 12, 0, 30);
         state.fired_paliers = HashSet::from([15, 10]);
         let decision = next_event(now, &cfg, last, 0, &fired, false, &state, now_local);
-        assert_eq!(decision, SchedulerDecision::Nothing);
+        assert_eq!(decision, SchedulerDecision::FirePopup);
+    }
+
+    #[test]
+    fn daily_countdown_yields_to_interval_popup() {
+        // Rule 8 : interval popup due AND a daily countdown palier due on
+        // the same tick → the interval popup wins (daily notification is
+        // lowest priority).
+        let cfg = config_with(2.0, vec![], false);
+        let now = epoch_plus(3 * 3600); // interval (2h) due
+        let last = epoch_plus(0);
+        let fired = HashSet::new();
+        let now_local = paris_at(2026, 3, 15, 11, 45); // daily T-15 palier due
+        let state = daily_state_at(chrono_tz::Europe::Paris, now_local, 12, 0, 30);
+        let decision = next_event(now, &cfg, last, 0, &fired, false, &state, now_local);
+        assert_eq!(decision, SchedulerDecision::FirePopup);
     }
 
     #[test]
@@ -2150,7 +2341,9 @@ mod tests {
     fn daily_pause_countdown_palier_15_fires_at_boundary() {
         let cfg = config_with(2.0, vec![], false);
         let now = epoch_plus(10_000);
-        let last = epoch_plus(0);
+        // last = now so no interval popup is due (daily countdown is lowest
+        // priority, rule 8 — isolate it).
+        let last = epoch_plus(10_000);
         let fired = HashSet::new();
         let now_local = paris_at(2026, 3, 15, 11, 45); // exactly T-15
         let state = daily_state_at(chrono_tz::Europe::Paris, now_local, 12, 0, 30);

@@ -526,7 +526,6 @@ mod tick_helper_tests {
 
 #[cfg(windows)]
 mod win {
-    use std::collections::HashMap;
     use std::env;
     use std::ffi::{OsStr, OsString};
     use std::path::{Path, PathBuf};
@@ -558,8 +557,8 @@ mod win {
     use crate::platform::win32::spawn_user::{RealSpawner, SpawnedChild};
     use crate::platform::win32::{gamepad, idle, power_notify};
     use crate::platform::{
-        spawn_replacing, spawn_replacing_keyed, spawn_replacing_with_env,
-        update_or_spawn_replacing_with_env, UpdateOrSpawn,
+        spawn_replacing, spawn_replacing_with_env, update_or_spawn_replacing_with_env,
+        UpdateOrSpawn,
     };
     use crate::runtime_dat;
     use crate::scheduler::{self, SchedulerDecision};
@@ -913,7 +912,11 @@ mod win {
         // next schedule tick. Handle-based (not PID-based) so a recycled
         // PID cannot cause us to terminate an unrelated process.
         let mut last_popup_child: Option<SpawnedChild> = None;
-        let mut last_widget_children: HashMap<u32, SpawnedChild> = HashMap::new();
+        // Single-slot heads-up widget : at most ONE countdown window on
+        // screen at a time. Each new countdown (interval or daily, any
+        // palier) replaces the previous via `spawn_replacing`, so widgets
+        // can never stack (rules 7/8).
+        let mut last_widget_child: Option<SpawnedChild> = None;
 
         // User-session input probe. Spawned once here so the pipe
         // client is ready before the first idle::idle_seconds() call
@@ -1033,7 +1036,7 @@ mod win {
                 &mut last_heartbeat,
                 &mut fired,
                 &mut last_popup_child,
-                &mut last_widget_children,
+                &mut last_widget_child,
                 &config.passcode_hash,
                 daily_pause_fired_at,
                 daily_pause_fired_paliers_bits,
@@ -1065,7 +1068,7 @@ mod win {
             &mut last_heartbeat,
             &mut fired,
             &mut last_popup_child,
-            &mut last_widget_children,
+            &mut last_widget_child,
             &mut input_probe_child,
             &mut daily_pause_fired_at,
             &mut daily_pause_fired_paliers_bits,
@@ -1156,7 +1159,7 @@ mod win {
         last_heartbeat: &mut SystemTime,
         fired: &mut std::collections::HashSet<u32>,
         last_popup_child: &mut Option<SpawnedChild>,
-        last_widget_children: &mut HashMap<u32, SpawnedChild>,
+        last_widget_child: &mut Option<SpawnedChild>,
         input_probe_child: &mut Option<SpawnedChild>,
         daily_pause_fired_at: &mut Option<SystemTime>,
         daily_pause_fired_paliers_bits: &mut u8,
@@ -1208,6 +1211,19 @@ mod win {
         // component signals so bug reports show why the counter did or
         // didn't advance.
         let mut was_idle: Option<bool> = None;
+        // Length of the CURRENT continuous inactivity run (idle/lock),
+        // zeroed the instant activity returns. Distinct from the
+        // cumulative `paused_secs` : a single run >= Z resets the cycle
+        // (break taken, rules 2/3), whereas cumulative inactivity only
+        // pushes the deadline back (capped at one interval). `idle_reset_done`
+        // latches so one continuous idle episode resets at most once.
+        let mut idle_run_secs: u64 = 0;
+        let mut idle_reset_done = false;
+        // Last logged whole-minute of accumulated ACTIVE time toward the
+        // interval X. Emits a "+1 min" progress line each time it advances,
+        // so the log narrates the counter climbing to X (owner's traceability
+        // ask). Reset to 0 whenever the cycle reboots (fire / reset).
+        let mut last_active_min: u64 = 0;
         // Latest input stamp materialized from the pipe transport. Held
         // between ticks so a probe that stops pushing decays into
         // staleness (`idle::idle_seconds` returns 0 after 30 s of no
@@ -1219,7 +1235,7 @@ mod win {
         // branch leaves a diagnosable trail (window opened, suppressed
         // by fired_today, collision wanted, …) without a 5 s-cadence
         // spam. `None` = nothing observed yet, first tick seeds it.
-        let mut last_daily_trace: Option<(bool, bool, bool, bool, bool, bool)> = None;
+        let mut last_daily_trace: Option<(bool, bool, bool, bool, bool, bool, bool, bool)> = None;
         // In-flight daily UpdateContent : Some(...) between the pipe
         // write and the popup's DailyAck (or its deadline). The stamp
         // happens on the ack, never on the bare write.
@@ -1241,7 +1257,7 @@ mod win {
                         last_heartbeat,
                         fired,
                         last_popup_child,
-                        last_widget_children,
+                        last_widget_child,
                         &config.passcode_hash,
                         *daily_pause_fired_at,
                         *daily_pause_fired_paliers_bits,
@@ -1297,7 +1313,7 @@ mod win {
                         }
                     }
                     // 3. Dismiss any heads-up (countdown) widget.
-                    drain_heads_up_widgets(last_widget_children);
+                    drain_heads_up_widgets(last_widget_child);
                     // 4. Persist. Preserve the daily-pause fields : a Reset that
                     // closes an in-progress *daily* popup does NOT mark it done,
                     // so the daily branch may re-fire (matches "just reset").
@@ -1351,7 +1367,7 @@ mod win {
                                 );
                                 // Daily content is confirmed on screen :
                                 // drain any lingering heads-up widget.
-                                drain_heads_up_widgets(last_widget_children);
+                                drain_heads_up_widgets(last_widget_child);
                             } else {
                                 // Applied, then the popup died before the
                                 // ack was processed. Don't stamp against a
@@ -1468,7 +1484,7 @@ mod win {
                         let now_local_new =
                             time_authority::in_configured_tz(config, now_auth);
                         let new_fire_at =
-                            build_daily_pause_state(config, now_local_new, false, 0, None)
+                            build_daily_pause_state(config, now_local_new, false, 0, None, false)
                                 .fire_at_today;
                         if super::daily_rearm_on_window_change(
                             *daily_pause_fired_at,
@@ -1564,30 +1580,34 @@ mod win {
                             } else {
                                 "clock_advanced"
                             };
-                            let popup_duration_secs =
-                                u64::from(config.duration_minutes).saturating_mul(60);
+                            // Z = the continuous-inactivity reset threshold
+                            // (default 2×duration). A single sleep/freeze gap
+                            // >= Z is the break taken (rules 2/11) ; a shorter
+                            // gap only shifts last_popup forward (rule 3).
+                            let z_secs = scheduler::inactivity_reset_secs(config);
                             if divergence > 0
                                 && scheduler::suspend_gap_resets_cycle(
                                     divergence as u64,
-                                    popup_duration_secs,
+                                    z_secs,
                                 )
                             {
-                                // Absence covered the break — same rule as the
-                                // cold-start path : fresh cycle from wake, the
-                                // gap is the pause. (A positive divergence from
-                                // a mere clock-advance also lands here : the
-                                // anti-cheat concern is rewinds, and a forward
-                                // jump ≥ the popup duration is indistinguishable
-                                // from a suspend on VMs anyway.)
+                                // Absence >= Z covered the break : fresh cycle
+                                // from wake, the gap IS the pause. (A positive
+                                // divergence from a mere clock-advance also
+                                // lands here : the anti-cheat concern is
+                                // rewinds, and a forward jump >= Z is
+                                // indistinguishable from a suspend on VMs.)
                                 *last_popup = now_wall;
                                 *paused_secs = 0;
                                 fired.clear();
                                 tracing::warn!(
                                     divergence_secs = divergence,
+                                    z_secs,
                                     wall_delta_secs,
                                     unbiased_delta_secs,
                                     cause_hint,
-                                    "clock jump >= popup duration - break taken, cycle reset at wake"
+                                    reason = "clock_jump_ge_Z",
+                                    "cycle RESET: sleep/freeze gap >= Z - break taken, cycle reset at wake"
                                 );
                                 let _ = runtime_dat::write(&runtime_dat::RuntimeState {
                                     last_popup: *last_popup,
@@ -1730,7 +1750,7 @@ mod win {
                                 last_heartbeat,
                                 fired,
                                 last_popup_child,
-                                last_widget_children,
+                                last_widget_child,
                                 &config.passcode_hash,
                                 *daily_pause_fired_at,
                                 *daily_pause_fired_paliers_bits,
@@ -1841,7 +1861,7 @@ mod win {
                             last_heartbeat,
                             fired,
                             last_popup_child,
-                            last_widget_children,
+                            last_widget_child,
                             &config.passcode_hash,
                             *daily_pause_fired_at,
                             *daily_pause_fired_paliers_bits,
@@ -1917,8 +1937,55 @@ mod win {
                     } else {
                         false
                     };
+                    // Continuous-inactivity run drives the Z reset ; the
+                    // cumulative `paused_secs` only pushes the deadline back,
+                    // capped at one interval X (rules 2/3).
+                    idle_run_secs =
+                        scheduler::accrue_idle_run(idle_run_secs, is_idle_now, tick_delta_secs);
                     if is_idle_now {
-                        *paused_secs += tick_delta_secs;
+                        let z_secs = scheduler::inactivity_reset_secs(config);
+                        if !idle_reset_done
+                            && scheduler::idle_run_triggers_reset(idle_run_secs, z_secs)
+                        {
+                            // One uninterrupted idle/lock stretch >= Z : the
+                            // break is considered taken. Reboot the cycle to
+                            // now (fresh X) exactly once per idle episode.
+                            let was_active_secs = now
+                                .duration_since(*last_popup)
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0)
+                                .saturating_sub(*paused_secs);
+                            *last_popup = now;
+                            *paused_secs = 0;
+                            fired.clear();
+                            idle_reset_done = true;
+                            tracing::warn!(
+                                idle_run_secs,
+                                z_secs,
+                                was_active_secs,
+                                reason = "idle_ge_Z",
+                                "cycle RESET: continuous inactivity >= Z - break taken"
+                            );
+                            let _ = runtime_dat::write(&runtime_dat::RuntimeState {
+                                last_popup: *last_popup,
+                                paused_secs: 0,
+                                popup_pending: *popup_pending,
+                                last_heartbeat: *last_heartbeat,
+                                last_clean_shutdown_at: SystemTime::UNIX_EPOCH,
+                                daily_pause_fired_at: *daily_pause_fired_at,
+                                daily_pause_fired_paliers_bits: *daily_pause_fired_paliers_bits,
+                                daily_pause_skipped_today: *daily_pause_skipped_today,
+                                popup_pid: *popup_pid,
+                            });
+                        } else {
+                            // Below Z : bank the inactivity but cap the
+                            // cumulative pushback at one interval X.
+                            let x_secs = scheduler::interval(config).as_secs();
+                            *paused_secs = paused_secs.saturating_add(tick_delta_secs).min(x_secs);
+                        }
+                    } else {
+                        // Activity returned : arm the next idle episode.
+                        idle_reset_done = false;
                     }
                     // Invariant guard : paused time accrues at most 1 s
                     // per elapsed second, so paused_secs can never
@@ -1949,6 +2016,29 @@ mod win {
                             );
                         }
                         *paused_secs = clamped_paused;
+                    }
+                    // Active-time progress trace : narrate the counter
+                    // climbing toward X in whole-minute steps. active =
+                    // wall elapsed minus banked inactivity ; only when
+                    // last_popup is in the past (a future anchor = ongoing
+                    // daily pause, nothing to narrate yet).
+                    if now >= *last_popup {
+                        let active_secs = elapsed_since_last.saturating_sub(*paused_secs);
+                        let active_min = active_secs / 60;
+                        let x_min = scheduler::interval(config).as_secs() / 60;
+                        if active_min > last_active_min {
+                            last_active_min = active_min;
+                            tracing::info!(
+                                active_min,
+                                x_min,
+                                wall_min = elapsed_since_last / 60,
+                                paused_min = *paused_secs / 60,
+                                "active +1 min"
+                            );
+                        } else if active_min < last_active_min {
+                            // Cycle rebooted (fire / reset) — re-arm the counter.
+                            last_active_min = active_min;
+                        }
                     }
                     if was_idle != Some(is_idle_now) {
                         tracing::info!(
@@ -2069,6 +2159,7 @@ mod win {
                         fired_today,
                         *daily_pause_fired_paliers_bits,
                         *daily_pause_skipped_today,
+                        !is_idle_now,
                     );
 
                     // 4b. Daily↔interval collision (session 4). While an
@@ -2124,7 +2215,7 @@ mod win {
                                     last_heartbeat,
                                     fired,
                                     last_popup_child,
-                                    last_widget_children,
+                                    last_widget_child,
                                     &config.passcode_hash,
                                     daily_pause_fired_at,
                                     daily_pause_fired_paliers_bits,
@@ -2157,11 +2248,17 @@ mod win {
                     } else {
                         alive_pid
                     };
+                    // Rule 4 : the daily fires on-time in [fire_at, grace_end]
+                    // OR late (past grace, until end of local day) while the
+                    // user is active — same condition as `next_event`'s fire
+                    // branch, so a late fire still reaches the collision path
+                    // and overwrites an on-screen general popup (rule 5).
                     let daily_due = daily_state.enabled
                         && !fired_today
                         && !daily_state.skipped_today
                         && now_local >= daily_state.fire_at_today
-                        && now_local <= daily_state.grace_window_end;
+                        && now_local < daily_state.end_of_local_day
+                        && (now_local <= daily_state.grace_window_end || daily_state.active_now);
                     let collision_wants =
                         super::daily_collision_wants_update(&super::DailyCollisionInputs {
                             daily_due,
@@ -2180,11 +2277,14 @@ mod win {
                     // today" and a falsely-latched stamp.
                     let in_window = daily_state.enabled
                         && now_local >= daily_state.fire_at_today
-                        && now_local <= daily_state.grace_window_end;
+                        && now_local < daily_state.end_of_local_day;
+                    let late_fire = in_window && now_local > daily_state.grace_window_end;
                     let daily_trace = (
                         daily_state.enabled,
                         in_window,
                         daily_due,
+                        late_fire,
+                        daily_state.active_now,
                         fired_today,
                         daily_state.skipped_today,
                         collision_wants,
@@ -2195,6 +2295,8 @@ mod win {
                             enabled = daily_state.enabled,
                             in_window,
                             daily_due,
+                            late_fire,
+                            active_now = daily_state.active_now,
                             fired_today,
                             fired_at = ?*daily_pause_fired_at,
                             skipped_today = daily_state.skipped_today,
@@ -2292,7 +2394,7 @@ mod win {
                                 );
                                 // New daily popup is up : drain any lingering
                                 // heads-up widget.
-                                drain_heads_up_widgets(last_widget_children);
+                                drain_heads_up_widgets(last_widget_child);
                             }
                             Err(e) => {
                                 // Both the pipe AND the fallback spawn
@@ -2319,24 +2421,17 @@ mod win {
                         now_local,
                     ) {
                         SchedulerDecision::Nothing => {
-                            // Cas C anti-forkbomb : past the grace window,
-                            // no fire happened, no skip recorded → mark
-                            // today as skipped so subsequent ticks don't
-                            // re-enter FireDailyPause once fired_today
-                            // still reads false. Only touches state when
-                            // the daily branch was live (enabled).
-                            if daily_state.enabled
-                                && now_local > daily_state.grace_window_end
-                                && !fired_today
-                                && !daily_state.skipped_today
-                            {
-                                let today = now_local.date_naive();
-                                *daily_pause_skipped_today = Some(today);
-                                tracing::info!(
-                                    date = %today,
-                                    "Cas C: past grace window without fire, marking day skipped"
-                                );
-                            }
+                            // Rule 4 : a missed grace window is NO LONGER a
+                            // skip. The daily stays pending and fires late on
+                            // the user's return to activity (gated in
+                            // next_event / daily_due), latching `fired_today`
+                            // exactly once — so there is no forkbomb to guard
+                            // against here. Nothing to do on this arm now.
+                            // (`daily_pause_skipped_today` is consequently no
+                            // longer set anywhere; the field + its `!skipped`
+                            // guards are retained for runtime.dat back-compat
+                            // and self-heal a stale `Some` from an older
+                            // binary on the next day-rollover.)
                         }
                         SchedulerDecision::FirePopup => {
                             let elapsed_wall_secs = now
@@ -2353,7 +2448,8 @@ mod win {
                                 elapsed_active_secs,
                                 interval_secs,
                                 playing_video_or_audio = playing_video_or_audio_now,
-                                "scheduler said FirePopup - firing"
+                                reason = "reached_X_active",
+                                "interval popup FIRING: reached the active-time interval"
                             );
                             if let Err(e) = fire_popup(
                                 exe,
@@ -2363,7 +2459,7 @@ mod win {
                                 last_heartbeat,
                                 fired,
                                 last_popup_child,
-                                last_widget_children,
+                                last_widget_child,
                                 &config.passcode_hash,
                                 *daily_pause_fired_at,
                                 *daily_pause_fired_paliers_bits,
@@ -2382,7 +2478,7 @@ mod win {
                                 palier_minutes,
                                 seconds_until_popup,
                                 fired,
-                                last_widget_children,
+                                last_widget_child,
                             ) {
                                 tracing::warn!(error = ?e, "tick fire_countdown failed");
                             }
@@ -2390,7 +2486,11 @@ mod win {
                         SchedulerDecision::FireDailyPause => {
                             tracing::info!(
                                 fire_at = %daily_state.fire_at_today,
-                                "scheduler said FireDailyPause - firing daily-pause popup"
+                                now_local = %now_local,
+                                late_fire,
+                                active_now = daily_state.active_now,
+                                reason = if late_fire { "daily_late_on_return" } else { "daily_on_time" },
+                                "FireDailyPause - firing daily-pause popup"
                             );
                             match fire_popup_daily(
                                 exe,
@@ -2400,7 +2500,7 @@ mod win {
                                 last_heartbeat,
                                 fired,
                                 last_popup_child,
-                                last_widget_children,
+                                last_widget_child,
                                 &config.passcode_hash,
                                 daily_pause_fired_at,
                                 daily_pause_fired_paliers_bits,
@@ -2424,7 +2524,7 @@ mod win {
                                 exe,
                                 palier_minutes,
                                 seconds_until,
-                                last_widget_children,
+                                last_widget_child,
                                 daily_pause_fired_paliers_bits,
                                 &config.daily_pause.timezone,
                             ) {
@@ -2467,13 +2567,14 @@ mod win {
     }
 
     #[allow(clippy::too_many_arguments)]
-    /// Terminate every lingering heads-up (countdown) widget child. Called
-    /// whenever a pause popup appears (the countdown counts down *to* that
-    /// popup, so once it shows the heads-up is obsolete) and by the Reset
-    /// action. `spawn_replacing_keyed` only ever replaces the same-palier
-    /// predecessor, so nothing else drains the whole map.
-    fn drain_heads_up_widgets(children: &mut HashMap<u32, SpawnedChild>) {
-        for (_, w) in children.drain() {
+    /// Terminate the lingering heads-up (countdown) widget child, if any.
+    /// Called whenever a pause popup appears (the countdown counts down *to*
+    /// that popup, so once it shows the heads-up is obsolete) and by the
+    /// Reset action. There is at most ONE widget at a time (single-slot :
+    /// each new countdown replaces the previous, any palier), so this drains
+    /// the single slot — never a stack of windows.
+    fn drain_heads_up_widgets(child: &mut Option<SpawnedChild>) {
+        if let Some(w) = child.take() {
             w.terminate();
         }
     }
@@ -2486,7 +2587,7 @@ mod win {
         last_heartbeat: &mut SystemTime,
         fired: &mut std::collections::HashSet<u32>,
         last_popup_child: &mut Option<SpawnedChild>,
-        last_widget_children: &mut HashMap<u32, SpawnedChild>,
+        last_widget_child: &mut Option<SpawnedChild>,
         passcode_hash: &str,
         daily_pause_fired_at: Option<SystemTime>,
         daily_pause_fired_paliers_bits: u8,
@@ -2534,7 +2635,7 @@ mod win {
                 fired.clear();
                 // The popup is now up : any "pause dans X min" heads-up widget
                 // is obsolete and must not linger behind it.
-                drain_heads_up_widgets(last_widget_children);
+                drain_heads_up_widgets(last_widget_child);
                 if let Err(e) = runtime_dat::write(&runtime_dat::RuntimeState {
                     last_popup: now,
                     paused_secs: 0,
@@ -2584,7 +2685,7 @@ mod win {
         palier: u32,
         seconds_until_popup: u64,
         fired: &mut std::collections::HashSet<u32>,
-        last_widget_children: &mut HashMap<u32, SpawnedChild>,
+        last_widget_child: &mut Option<SpawnedChild>,
     ) -> Result<()> {
         let seconds_str = seconds_until_popup.to_string();
         let palier_str = palier.to_string();
@@ -2600,9 +2701,13 @@ mod win {
         ];
         // Spawn-first, kill-on-success — same invariant as fire_popup.
         // Different-palier widgets remain untouched.
-        match spawn_replacing_keyed(&RealSpawner, exe, &args, palier, last_widget_children) {
-            Ok(()) => {
-                tracing::info!(palier, "countdown child spawned");
+        // Single-slot : replace whatever widget is on screen (any palier,
+        // interval or daily) so only one heads-up ever shows (rules 7/8).
+        let replaced = last_widget_child.is_some();
+        match spawn_replacing(&RealSpawner, exe, &args, last_widget_child) {
+            Ok(child) => {
+                *last_widget_child = Some(child);
+                tracing::info!(palier, replaced, "countdown child spawned (single-slot)");
                 fired.insert(palier);
                 Ok(())
             }
@@ -2621,6 +2726,7 @@ mod win {
         fired_today: bool,
         fired_paliers_bits: u8,
         skipped_today_marker: Option<chrono::NaiveDate>,
+        active_now: bool,
     ) -> scheduler::DailyPauseState {
         use chrono::{Datelike, Duration as ChronoDuration, TimeZone};
         let tz = now_local.timezone();
@@ -2656,6 +2762,16 @@ mod win {
                 .expect("noon is always valid")
             });
         let grace_end = fire_at_today + ChronoDuration::minutes(config.daily_pause.duration_minutes as i64);
+        // Next local midnight = the upper bound for a LATE daily fire
+        // (rule 4 : the pause must still land the same local day).
+        // DATE arithmetic (not `+ Duration::days(1)`, which adds an absolute
+        // 24h and lands ±1h off on DST-transition nights) : advance the
+        // calendar date then re-resolve local midnight in the TZ.
+        let end_of_local_day = now_local
+            .date_naive()
+            .succ_opt()
+            .and_then(|d| tz.with_ymd_and_hms(d.year(), d.month(), d.day(), 0, 0, 0).single())
+            .unwrap_or_else(|| fire_at_today + ChronoDuration::days(1));
         let skipped_today = skipped_today_marker
             .map(|d| d == now_local.date_naive())
             .unwrap_or(false);
@@ -2664,6 +2780,8 @@ mod win {
             fired_today,
             fire_at_today,
             grace_window_end: grace_end,
+            end_of_local_day,
+            active_now,
             fired_paliers: runtime_dat::bits_to_paliers(fired_paliers_bits),
             skipped_today,
         }
@@ -2685,7 +2803,7 @@ mod win {
         last_heartbeat: &mut SystemTime,
         fired: &mut std::collections::HashSet<u32>,
         last_popup_child: &mut Option<SpawnedChild>,
-        last_widget_children: &mut HashMap<u32, SpawnedChild>,
+        last_widget_child: &mut Option<SpawnedChild>,
         passcode_hash: &str,
         daily_pause_fired_at: &mut Option<SystemTime>,
         daily_pause_fired_paliers_bits: &mut u8,
@@ -2720,7 +2838,7 @@ mod win {
             Ok(child) => {
                 tracing::info!(pid = child.pid, "daily-pause popup child spawned");
                 // The daily popup is up : drain any lingering heads-up widget.
-                drain_heads_up_widgets(last_widget_children);
+                drain_heads_up_widgets(last_widget_child);
                 stamp_daily_fire_success(
                     last_popup,
                     paused_secs,
@@ -2810,7 +2928,7 @@ mod win {
         exe: &Path,
         palier: u32,
         seconds_until: u64,
-        last_widget_children: &mut HashMap<u32, SpawnedChild>,
+        last_widget_child: &mut Option<SpawnedChild>,
         daily_pause_fired_paliers_bits: &mut u8,
         tz_name: &str,
     ) -> Result<()> {
@@ -2830,16 +2948,18 @@ mod win {
         // anyway to keep both children symmetric ; the config UI in
         // session 3 will surface a TZ label that reads it.
         let _tz_env = tz_name; // reserved for future use
-        // Reuse spawn_replacing_keyed — no env override needed for
-        // countdowns until session 3.
-        match spawn_replacing_keyed(&RealSpawner, exe, &args, palier, last_widget_children) {
-            Ok(()) => {
+        // Single-slot : the daily countdown replaces any widget on screen
+        // (interval or a prior daily palier) so only one heads-up shows.
+        let replaced = last_widget_child.is_some();
+        match spawn_replacing(&RealSpawner, exe, &args, last_widget_child) {
+            Ok(child) => {
+                *last_widget_child = Some(child);
                 let existing: std::collections::HashSet<u32> =
                     runtime_dat::bits_to_paliers(*daily_pause_fired_paliers_bits);
                 let mut merged = existing;
                 merged.insert(palier);
                 *daily_pause_fired_paliers_bits = runtime_dat::paliers_to_bits(&merged);
-                tracing::info!(palier, "daily-pause countdown child spawned");
+                tracing::info!(palier, replaced, "daily-pause countdown child spawned (single-slot)");
                 Ok(())
             }
             Err(e) => {
