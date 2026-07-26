@@ -1315,6 +1315,25 @@ fn ui_security(
         }
     });
 
+    // Ask the SYSTEM service to (re)create the LAN console's firewall rule.
+    // The rule needs admin (INetFwPolicy2 COM); this UI is unelevated, so it
+    // delegates over the signal pipe. Fire-and-forget — the pipe is inbound
+    // only; whether the rule now exists is surfaced by the Sécurité tab's
+    // presence check.
+    if ui
+        .button("Recréer la règle du pare-feu")
+        .on_hover_text(
+            "À utiliser si la console est joignable depuis cet ordinateur \
+             (127.0.0.1) mais pas depuis le réseau local.",
+        )
+        .clicked()
+    {
+        #[cfg(windows)]
+        if let Err(e) = crate::ipc::send(crate::ipc::Message::AddFirewallRule) {
+            tracing::warn!(error = %e, "IPC AddFirewallRule failed");
+        }
+    }
+
     if let Some(dialog) = change_pwd.as_mut() {
         let mut close_dialog = false;
         egui::Window::new("Changer le mot de passe")

@@ -2930,6 +2930,23 @@ mod win {
                 Message::DailyPauseApplied { pid } => {
                     let _ = pipe_tx.send(TickCommand::DailyAck { pid });
                 }
+                Message::AddFirewallRule => {
+                    // Handled inline (not via TickCommand): (re)creating the
+                    // firewall rule is unrelated to scheduler state, and this
+                    // service process runs as SYSTEM — it has the elevation the
+                    // INetFwPolicy2 COM API needs, which the unelevated config
+                    // UI that sent this lacks.
+                    match env::current_exe() {
+                        Ok(exe) => {
+                            if let Err(e) = crate::platform::win32::firewall::add_rule(&exe) {
+                                tracing::error!(error = %e, "AddFirewallRule: add_rule failed");
+                            } else {
+                                tracing::info!("AddFirewallRule: firewall rule (re)created");
+                            }
+                        }
+                        Err(e) => tracing::error!(error = %e, "AddFirewallRule: current_exe() failed"),
+                    }
+                }
                 Message::Shutdown => {
                     let _ = pipe_tx.send(TickCommand::Shutdown);
                     break;

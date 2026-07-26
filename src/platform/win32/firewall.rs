@@ -64,6 +64,24 @@ pub fn add_rule(exe: &Path) -> Result<()> {
     })
 }
 
+/// Whether the console's inbound rule currently exists, by name.
+///
+/// `Ok(true)` / `Ok(false)` answer the question; an `Err` means the query
+/// itself could not run (e.g. the Windows Firewall service is stopped), which
+/// is deliberately NOT collapsed into `Ok(false)` — "no rule" and "can't tell"
+/// are different states for the caller (install verification, session-7 signal).
+pub fn rule_exists() -> Result<bool> {
+    with_com(|| unsafe {
+        let policy: INetFwPolicy2 = CoCreateInstance(&NetFwPolicy2, None, CLSCTX_INPROC_SERVER)
+            .context("CoCreateInstance(NetFwPolicy2)")?;
+        let rules = policy.Rules().context("INetFwPolicy2::Rules")?;
+        // Item() returns the rule by name, or an error HRESULT when absent.
+        // A lookup miss is `Ok(false)`; failure to obtain policy/rules above
+        // has already propagated as `Err`.
+        Ok(rules.Item(&BSTR::from(RULE_NAME)).is_ok())
+    })
+}
+
 /// Remove the console's firewall rule. A missing rule is not an error.
 pub fn remove_rule() -> Result<()> {
     with_com(|| unsafe {

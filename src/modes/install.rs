@@ -268,12 +268,10 @@ fn fresh_install(current_exe: &Path) -> Result<()> {
 
     // Step 7.5 : inbound firewall rule for the LAN log console (TCP 8787,
     // Private+Domain, exe-scoped). Non-fatal — the console is opt-in (config
-    // default off), so a missing rule only means it's unreachable until added
-    // manually; it must not abort an otherwise-good install.
-    match crate::platform::win32::firewall::add_rule(current_exe) {
-        Ok(()) => tracing::info!("step 7.5: firewall rule added"),
-        Err(e) => tracing::warn!(error = %e, "step 7.5: firewall rule not added"),
-    }
+    // default off), so a missing rule only means it's unreachable until
+    // repaired; it must not abort an otherwise-good install. Verified + loud
+    // on failure (see `ensure_firewall_rule`).
+    ensure_firewall_rule(current_exe);
 
     // Step 8 : block on first-run wizard — SKIP if state.dat already
     // has a passcode. This handles the "PathUpdate failed → FreshInstall
@@ -384,6 +382,47 @@ fn start_service() -> Result<()> {
     }
 }
 
+/// Create (or refresh) the LAN log-console inbound firewall rule and verify it
+/// landed. Non-fatal: the console is opt-in, so a failure must not abort an
+/// otherwise-good install — but it is **loud and recoverable**, never silent.
+/// A failed create OR a post-create `rule_exists() == false` logs `error!` and
+/// shows a one-time dialog pointing at the Sécurité-tab repair button.
+///
+/// Called from BOTH `fresh_install` (step 7.5) and `path_update`: the rule is
+/// exe-scoped, so an upgrade that moves the binary to a new folder must re-lay
+/// it at the new path — `add_rule` is idempotent (it drops any stale same-name
+/// rule first), which also repairs a rule left pointing at the old location.
+#[cfg(windows)]
+fn ensure_firewall_rule(current_exe: &Path) {
+    use crate::platform::win32::firewall;
+    let ok = matches!(firewall::add_rule(current_exe), Ok(()))
+        && firewall::rule_exists().unwrap_or(false);
+    if ok {
+        tracing::info!("firewall rule present - LAN log console reachable");
+    } else {
+        tracing::error!("firewall rule NOT created - LAN log console unreachable until repaired");
+        firewall_rule_failed_dialog();
+    }
+}
+
+/// One-time modal shown when the console firewall rule could not be created.
+/// Neutral wording, **no filesystem path** (the app presents as a generic
+/// health service — an on-screen path would leak its install location).
+#[cfg(windows)]
+fn firewall_rule_failed_dialog() {
+    use windows::core::HSTRING;
+    use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONWARNING, MB_OK};
+
+    let title: HSTRING = "Console de journaux".into();
+    let body: HSTRING = "La console de journaux sur le réseau local n'a pas pu être autorisée dans le pare-feu.\n\n\
+         Elle reste accessible uniquement depuis cet ordinateur.\n\n\
+         Pour réessayer : ouvrez la configuration → onglet Sécurité → « Recréer la règle du pare-feu »."
+        .into();
+    unsafe {
+        MessageBoxW(None, &body, &title, MB_OK | MB_ICONWARNING);
+    }
+}
+
 #[cfg(windows)]
 fn launch_config_ui(current_exe: &Path) -> Result<()> {
     use windows::Win32::UI::WindowsAndMessaging::{AllowSetForegroundWindow, ASFW_ANY};
@@ -482,6 +521,13 @@ pub(crate) fn path_update(current_exe: &Path, old_path: &Path) -> Result<()> {
     // Same treatment for the scheduled task.
     crate::platform::win32::itaskservice::update_watchdog_action(current_exe)
         .context("update watchdog action")?;
+
+    // Re-lay the LAN console firewall rule at the new path. The rule is
+    // exe-scoped, so a move leaves any prior rule pointing at the old binary
+    // (and a pre-firewall version upgraded via this path never had one at
+    // all — the original host-smoke failure). `add_rule` is idempotent, so
+    // this both creates a missing rule and re-points a stale one.
+    ensure_firewall_rule(current_exe);
 
     // Copy animations/ from the old dir if the new one doesn't have any.
     migrate_animations_folder(old_path, current_exe).ok();

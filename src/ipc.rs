@@ -12,6 +12,7 @@
 //   0x05                             RearmDailyPause
 //   0x06                             ResetPause
 //   0x07 + 4 LE bytes (u32 pid)      DailyPauseApplied
+//   0x08                             AddFirewallRule
 //
 // Pipe name blends into native Windows-service pipe conventions
 // (`SystemEventsBroker-*`, `TrustedInstaller-Rpc`, ...). Explicit SDDL
@@ -74,6 +75,11 @@ pub enum Message {
     /// The daily fire is stamped ONLY on this ack — a bare content-pipe
     /// write is not proof the popup rendered the daily pause.
     DailyPauseApplied { pid: u32 },
+    /// (Re)create the LAN log-console inbound firewall rule. Sent by the
+    /// unelevated config UI's Sécurité tab: creating the rule needs the
+    /// `INetFwPolicy2` COM API, which requires admin, so the UI delegates to
+    /// the SYSTEM service (which owns this pipe and already has the rights).
+    AddFirewallRule,
 }
 
 impl Message {
@@ -97,6 +103,7 @@ impl Message {
             [0x07, b0, b1, b2, b3] => Some(Message::DailyPauseApplied {
                 pid: u32::from_le_bytes([*b0, *b1, *b2, *b3]),
             }),
+            [0x08] => Some(Message::AddFirewallRule),
             _ => None,
         }
     }
@@ -123,6 +130,7 @@ impl Message {
                 v.extend_from_slice(&pid.to_le_bytes());
                 v
             }
+            Message::AddFirewallRule => vec![0x08],
         }
     }
 }
@@ -555,6 +563,17 @@ mod tests {
     }
 
     #[test]
+    fn parse_add_firewall_rule_byte() {
+        assert_eq!(Message::parse(&[0x08]), Some(Message::AddFirewallRule));
+    }
+
+    #[test]
+    fn parse_add_firewall_rule_extra_bytes_returns_none() {
+        // Unit variant is 1-byte only ; trailing bytes must be rejected.
+        assert_eq!(Message::parse(&[0x08, 0x00]), None);
+    }
+
+    #[test]
     fn parse_daily_pause_applied() {
         // 0x07 tag + LE u32 pid.
         assert_eq!(
@@ -661,6 +680,7 @@ mod tests {
             Message::Shutdown,
             Message::RearmDailyPause,
             Message::ResetPause,
+            Message::AddFirewallRule,
         ] {
             let bytes = m.to_bytes();
             assert_eq!(bytes.len(), 1, "{m:?} must encode to 1 byte");
@@ -701,6 +721,11 @@ mod tests {
     #[test]
     fn client_wire_shape_reset_is_0x06() {
         assert_eq!(Message::ResetPause.to_bytes(), vec![0x06]);
+    }
+
+    #[test]
+    fn client_wire_shape_add_firewall_rule_is_0x08() {
+        assert_eq!(Message::AddFirewallRule.to_bytes(), vec![0x08]);
     }
 
     #[test]
