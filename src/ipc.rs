@@ -11,6 +11,7 @@
 //          bit1 smtc — 0x00..=0x03)  InputStamp
 //   0x05                             RearmDailyPause
 //   0x06                             ResetPause
+//   0x07 + 4 LE bytes (u32 pid)      DailyPauseApplied
 //
 // Pipe name blends into native Windows-service pipe conventions
 // (`SystemEventsBroker-*`, `TrustedInstaller-Rpc`, ...). Explicit SDDL
@@ -66,6 +67,13 @@ pub enum Message {
     /// marking the daily (noon) pause done. Sent from the remote console's
     /// "Réinitialiser" button.
     ResetPause,
+    /// Popup-side confirmation that an `UpdateContent{DailyPause}` was
+    /// applied in its event loop (WebView script queued, countdown
+    /// re-armed, re-lock done). `pid` is the popup's own process id so
+    /// the service can match the ack against the popup it targeted.
+    /// The daily fire is stamped ONLY on this ack — a bare content-pipe
+    /// write is not proof the popup rendered the daily pause.
+    DailyPauseApplied { pid: u32 },
 }
 
 impl Message {
@@ -86,6 +94,9 @@ impl Message {
             }
             [0x05] => Some(Message::RearmDailyPause),
             [0x06] => Some(Message::ResetPause),
+            [0x07, b0, b1, b2, b3] => Some(Message::DailyPauseApplied {
+                pid: u32::from_le_bytes([*b0, *b1, *b2, *b3]),
+            }),
             _ => None,
         }
     }
@@ -106,6 +117,12 @@ impl Message {
             }
             Message::RearmDailyPause => vec![0x05],
             Message::ResetPause => vec![0x06],
+            Message::DailyPauseApplied { pid } => {
+                let mut v = Vec::with_capacity(5);
+                v.push(0x07);
+                v.extend_from_slice(&pid.to_le_bytes());
+                v
+            }
         }
     }
 }
@@ -538,6 +555,27 @@ mod tests {
     }
 
     #[test]
+    fn parse_daily_pause_applied() {
+        // 0x07 tag + LE u32 pid.
+        assert_eq!(
+            Message::parse(&[0x07, 0x39, 0x30, 0x00, 0x00]),
+            Some(Message::DailyPauseApplied { pid: 12345 })
+        );
+    }
+
+    #[test]
+    fn parse_daily_pause_applied_short_returns_none() {
+        // Truncated pid payload must be rejected, not zero-padded.
+        assert_eq!(Message::parse(&[0x07, 0x01, 0x02]), None);
+    }
+
+    #[test]
+    fn parse_daily_pause_applied_long_returns_none() {
+        // One trailing byte too many — same strictness as InputStamp.
+        assert_eq!(Message::parse(&[0x07, 0, 0, 0, 0, 0xFF]), None);
+    }
+
+    #[test]
     fn parse_empty_returns_none() {
         assert_eq!(Message::parse(&[]), None);
     }
@@ -663,6 +701,17 @@ mod tests {
     #[test]
     fn client_wire_shape_reset_is_0x06() {
         assert_eq!(Message::ResetPause.to_bytes(), vec![0x06]);
+    }
+
+    #[test]
+    fn to_bytes_daily_pause_applied_roundtrip() {
+        for pid in [0u32, 1, 8724, u32::MAX] {
+            let msg = Message::DailyPauseApplied { pid };
+            let bytes = msg.to_bytes();
+            assert_eq!(bytes.len(), 5, "DailyPauseApplied must encode to 5 bytes");
+            assert_eq!(bytes[0], 0x07);
+            assert_eq!(Message::parse(&bytes), Some(msg));
+        }
     }
 
     #[test]

@@ -1147,6 +1147,30 @@ mod windows_impl {
                         }
                         window.set_focus();
                     }
+                    if content_mode == crate::ipc_popup::PopupContentMode::DailyPause {
+                        // Ack the daily update back to the service over
+                        // the signal pipe : the service stamps the daily
+                        // fire ONLY on this confirmation (a bare content-
+                        // pipe write is not proof the popup applied it).
+                        // Detached thread — a busy pipe must never stall
+                        // the UI event loop.
+                        let pid = std::process::id();
+                        std::thread::spawn(move || {
+                            match crate::ipc::send(
+                                crate::ipc::Message::DailyPauseApplied { pid },
+                            ) {
+                                Ok(()) => tracing::info!(
+                                    pid,
+                                    "popup: daily-pause apply ack sent to service"
+                                ),
+                                Err(e) => tracing::warn!(
+                                    error = ?e,
+                                    pid,
+                                    "popup: daily-pause apply ack send failed"
+                                ),
+                            }
+                        });
+                    }
                 }
                 Event::UserEvent(UserEvent::IpcRestartCountdown {
                     palier_minutes,

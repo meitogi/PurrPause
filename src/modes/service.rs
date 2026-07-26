@@ -84,9 +84,10 @@ pub(super) fn clamp_cas_d_elapsed(elapsed_secs: u64, duration_secs: u64) -> u32 
 /// fields defining WHEN the pause happens count — text / message edits
 /// must not invalidate per-day state. A changed window clears the
 /// skipped-today marker and the palier bits (they refer to the old
-/// window), but never `fired_today` : the pause already happened today
-/// and auto-refiring would risk a double lunch — the Rearm button owns
-/// the explicit re-fire.
+/// window) ; `fired_today` is cleared only when the NEW window is still
+/// in the future (see `daily_rearm_on_window_change` — amended
+/// 2026-07-26), else it survives and the Rearm button owns the explicit
+/// re-fire.
 #[cfg_attr(not(windows), allow(dead_code))]
 pub(super) fn daily_window_changed(
     old: &crate::config::schema::DailyPauseConfig,
@@ -111,17 +112,96 @@ pub(super) struct DailyCollisionInputs {
     /// The live child IS already the daily popup (`popup_pid` match) —
     /// nothing to convert.
     pub current_popup_is_daily: bool,
+    /// An `UpdateContent{DailyPause}` was already sent and its ack is
+    /// still awaited — don't re-send every tick while it's in flight.
+    pub ack_pending: bool,
 }
 
 /// Should the service mutate the RUNNING popup over its content pipe ?
 /// The scheduler's `popup_pending` guard defers `FireDailyPause` for as
 /// long as a popup is up, so without this path a noon collision would
 /// wait for the interval popup to be dismissed. When true, the tick
-/// loop sends `UpdateContent` over the popup's per-PID pipe (fallback :
-/// kill+respawn) instead of waiting.
+/// loop sends `UpdateContent` over the popup's per-PID pipe ; the daily
+/// fire is stamped only once the popup ACKS the update (else the
+/// deadline path kills/respawns deterministically).
 #[cfg_attr(not(windows), allow(dead_code))]
 pub(super) fn daily_collision_wants_update(i: &DailyCollisionInputs) -> bool {
-    i.daily_due && i.popup_pending && i.popup_child_alive && !i.current_popup_is_daily
+    i.daily_due
+        && i.popup_pending
+        && i.popup_child_alive
+        && !i.current_popup_is_daily
+        && !i.ack_pending
+}
+
+/// After a same-day daily-window change, should today's fired latch be
+/// re-armed ? Yes iff the daily already fired today AND the NEW window
+/// starts strictly in the future — the parent re-timing the pause to a
+/// later moment is an implicit ask for it to fire there (amended
+/// decision, 2026-07-26 ; previously fired-today always survived a
+/// window move). A move to a past/current time keeps the latch so the
+/// pause can't instantly re-fire ; Rearm stays the explicit escape.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(super) fn daily_rearm_on_window_change(
+    fired_at: Option<std::time::SystemTime>,
+    new_fire_at_today: chrono::DateTime<chrono_tz::Tz>,
+    now_local: chrono::DateTime<chrono_tz::Tz>,
+) -> bool {
+    fired_at.is_some() && now_local < new_fire_at_today
+}
+
+/// Interval anchor after a daily fire : the END of the lunch pause, so
+/// the next interval popup is `daily_hour + daily_duration + interval +
+/// inactive_time` — never inside or right after the noon pause. Every
+/// daily-fire path stamps through this ; the clean daily-close path
+/// later overwrites with the ACTUAL close time (actual end wins).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(super) fn daily_lunch_end_anchor(
+    fire_at: std::time::SystemTime,
+    daily_duration_secs: u64,
+) -> std::time::SystemTime {
+    fire_at + std::time::Duration::from_secs(daily_duration_secs)
+}
+
+/// In-flight daily `UpdateContent` awaiting its popup-side ack.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(super) struct PendingDailyAck {
+    /// Pid the `UpdateContent{DailyPause}` was written to — the ack must
+    /// come from this exact process.
+    pub pid: u32,
+    /// Past this instant with no ack, the update counts as NOT applied.
+    pub deadline: std::time::SystemTime,
+}
+
+/// Per-tick outcome for an in-flight daily ack.
+#[cfg_attr(not(windows), allow(dead_code))]
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum PendingAckTick {
+    /// Deadline not reached, target still alive — keep waiting.
+    Wait,
+    /// No ack within the deadline and the popup is still up : the update
+    /// is NOT confirmed — deterministic kill/respawn of a real daily
+    /// popup (stamp only on spawn success).
+    RespawnDeadline,
+    /// The targeted popup is gone (dismissed / Reset / crashed) — drop
+    /// the pending ack ; the normal no-popup daily path takes over.
+    AbandonChildGone,
+}
+
+/// Resolve an in-flight daily ack against the current tick. Pure — the
+/// tick loop owns the side effects (respawn, stamp, clear).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(super) fn resolve_pending_daily_ack(
+    pending: &PendingDailyAck,
+    now: std::time::SystemTime,
+    child_alive_pid: Option<u32>,
+) -> PendingAckTick {
+    if child_alive_pid != Some(pending.pid) {
+        PendingAckTick::AbandonChildGone
+    } else if now >= pending.deadline {
+        PendingAckTick::RespawnDeadline
+    } else {
+        PendingAckTick::Wait
+    }
 }
 
 #[cfg(test)]
@@ -201,6 +281,7 @@ mod tick_helper_tests {
             popup_pending: true,
             popup_child_alive: true,
             current_popup_is_daily: false,
+            ack_pending: false,
         }
     }
 
@@ -249,14 +330,142 @@ mod tick_helper_tests {
         assert!(!daily_collision_wants_update(&i));
     }
 
+    #[test]
+    fn collision_none_while_ack_pending() {
+        // An UpdateContent is in flight : no re-send storm while the
+        // popup's ack (or the deadline) is awaited.
+        let i = DailyCollisionInputs {
+            ack_pending: true,
+            ..collision_inputs()
+        };
+        assert!(!daily_collision_wants_update(&i));
+    }
+
+    // -- resolve_pending_daily_ack ------------------------------------
+
+    fn pending(pid: u32, deadline_secs: u64) -> PendingDailyAck {
+        PendingDailyAck {
+            pid,
+            deadline: std::time::UNIX_EPOCH + std::time::Duration::from_secs(deadline_secs),
+        }
+    }
+
+    fn at(secs: u64) -> std::time::SystemTime {
+        std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs)
+    }
+
+    #[test]
+    fn pending_ack_waits_before_deadline_while_child_alive() {
+        assert_eq!(
+            resolve_pending_daily_ack(&pending(8724, 100), at(99), Some(8724)),
+            PendingAckTick::Wait
+        );
+    }
+
+    #[test]
+    fn pending_ack_respawns_at_deadline_while_child_alive() {
+        // Deadline inclusive : `now == deadline` already counts as
+        // not-confirmed (the tick cadence makes the real check ~5 s
+        // after send anyway).
+        assert_eq!(
+            resolve_pending_daily_ack(&pending(8724, 100), at(100), Some(8724)),
+            PendingAckTick::RespawnDeadline
+        );
+        assert_eq!(
+            resolve_pending_daily_ack(&pending(8724, 100), at(500), Some(8724)),
+            PendingAckTick::RespawnDeadline
+        );
+    }
+
+    #[test]
+    fn pending_ack_abandons_when_child_gone() {
+        // Dismissed / Reset / crashed popup : the no-popup daily path
+        // owns the fire now — even past the deadline.
+        assert_eq!(
+            resolve_pending_daily_ack(&pending(8724, 100), at(500), None),
+            PendingAckTick::AbandonChildGone
+        );
+    }
+
+    #[test]
+    fn pending_ack_abandons_when_child_pid_differs() {
+        // The tracked child was already replaced by another popup : the
+        // pending ack refers to a dead target, drop it.
+        assert_eq!(
+            resolve_pending_daily_ack(&pending(8724, 100), at(99), Some(999)),
+            PendingAckTick::AbandonChildGone
+        );
+    }
+
+    // -- daily_rearm_on_window_change ---------------------------------
+
+    fn paris_at(h: u32, m: u32) -> chrono::DateTime<chrono_tz::Tz> {
+        Paris.with_ymd_and_hms(2026, 7, 26, h, m, 0).unwrap()
+    }
+
+    #[test]
+    fn rearm_when_fired_and_new_window_is_future() {
+        // The host repro : daily fired earlier, parent re-times it to a
+        // later moment the same day — the new window must fire.
+        assert!(daily_rearm_on_window_change(
+            Some(std::time::UNIX_EPOCH),
+            paris_at(8, 0),
+            paris_at(7, 45),
+        ));
+    }
+
+    #[test]
+    fn no_rearm_when_new_window_is_past_or_current() {
+        // Moving the window to a past/current moment must not clear the
+        // latch — the pause would instantly re-fire.
+        assert!(!daily_rearm_on_window_change(
+            Some(std::time::UNIX_EPOCH),
+            paris_at(7, 30),
+            paris_at(7, 45),
+        ));
+        assert!(!daily_rearm_on_window_change(
+            Some(std::time::UNIX_EPOCH),
+            paris_at(7, 45),
+            paris_at(7, 45),
+        ));
+    }
+
+    #[test]
+    fn no_rearm_when_not_fired_today() {
+        // Nothing fired : nothing to re-arm, the future window fires on
+        // its own (must NOT be suppressed either — pinned by daily_due).
+        assert!(!daily_rearm_on_window_change(None, paris_at(8, 0), paris_at(7, 45)));
+    }
+
+    // -- daily_lunch_end_anchor ---------------------------------------
+
+    #[test]
+    fn next_interval_after_daily_is_lunch_end_plus_interval_plus_inactive() {
+        // The converged formula : next interval popup =
+        // daily_fire + daily_duration + interval + inactive_time.
+        let cfg = crate::config::Config {
+            interval_hours: 2.0,
+            ..crate::config::Config::default()
+        };
+        let fire = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        let duration_secs = 45 * 60;
+        let inactive_secs = 600;
+        let anchor = daily_lunch_end_anchor(fire, duration_secs);
+        assert_eq!(
+            crate::scheduler::next_popup_at(anchor, &cfg, inactive_secs),
+            fire + std::time::Duration::from_secs(duration_secs + 2 * 3600 + inactive_secs)
+        );
+    }
+
     // -- daily_window_changed -----------------------------------------
     //
     // Reload-reconciliation behavior pinned by these tests + the
     // scheduler suite : window changed → skipped marker + palier bits
     // cleared (fresh chance at the new time, full pre-notifs) ;
-    // `fired_today` never cleared (no double lunch — Rearm button owns
-    // re-fire) ; a new window already in the past is re-stamped
-    // skipped by the Cas C block on the next tick.
+    // `fired_today` cleared only for a still-future new window
+    // (daily_rearm_on_window_change, amended 2026-07-26 — else Rearm
+    // owns the re-fire) ; a new window already in the past is
+    // re-stamped skipped by the Cas C block on the next tick.
 
     fn daily_cfg() -> crate::config::schema::DailyPauseConfig {
         crate::config::schema::DailyPauseConfig {
@@ -391,6 +600,10 @@ mod win {
         Shutdown,
         RearmDaily,
         ResetPause,
+        /// Popup confirmed it applied `UpdateContent{DailyPause}` in its
+        /// event loop. Carries the popup's own pid so a stale ack (from
+        /// an already-replaced popup) can't stamp the daily fire.
+        DailyAck { pid: u32 },
     }
 
     define_windows_service!(ffi_service_main, service_main);
@@ -971,6 +1184,11 @@ mod win {
         // curve minute-by-minute. Bounded — one line per minute is ~1440
         // lines/day, cheap compared to the 5-tick heartbeat.
         const STATE_LOG_EVERY_N_TICKS: u32 = 12;
+        // Grace for the popup's DailyAck after a daily UpdateContent
+        // write. The ack normally arrives within milliseconds ; with the
+        // 5 s tick cadence, 3 s means "no ack by the next tick" — then
+        // the unconfirmed update falls back to kill/respawn.
+        const DAILY_ACK_TIMEOUT: Duration = Duration::from_secs(3);
 
         let tick_delta_secs = TICK_INTERVAL.as_secs();
         let mut suspended_at: Option<SystemTime> = None;
@@ -1002,6 +1220,10 @@ mod win {
         // by fired_today, collision wanted, …) without a 5 s-cadence
         // spam. `None` = nothing observed yet, first tick seeds it.
         let mut last_daily_trace: Option<(bool, bool, bool, bool, bool, bool)> = None;
+        // In-flight daily UpdateContent : Some(...) between the pipe
+        // write and the popup's DailyAck (or its deadline). The stamp
+        // happens on the ack, never on the bare write.
+        let mut pending_daily_ack: Option<super::PendingDailyAck> = None;
 
         loop {
             match rx.recv_timeout(TICK_INTERVAL) {
@@ -1092,6 +1314,67 @@ mod win {
                     }) {
                         tracing::warn!(error = ?e, "write runtime.dat failed (reset pause)");
                     }
+                    // 5. Drop any in-flight daily ack : Reset never marks
+                    // the daily done, so a late ack from the popup being
+                    // closed must not stamp it either. The daily branch
+                    // re-fires on its own once the popup is gone.
+                    if pending_daily_ack.take().is_some() {
+                        tracing::info!("reset: dropped in-flight daily ack");
+                    }
+                }
+                Ok(TickCommand::DailyAck { pid }) => {
+                    match pending_daily_ack.take() {
+                        Some(p) if p.pid == pid => {
+                            let alive = last_popup_child
+                                .as_ref()
+                                .filter(|c| c.try_wait_exited().is_none())
+                                .map(|c| c.pid);
+                            if alive == Some(pid) {
+                                let now = time_authority::now_authoritative(config);
+                                tracing::info!(
+                                    pid,
+                                    "daily ack received - popup confirmed daily content, stamping fire"
+                                );
+                                stamp_daily_fire_success(
+                                    last_popup,
+                                    paused_secs,
+                                    popup_pending,
+                                    last_heartbeat,
+                                    fired,
+                                    daily_pause_fired_at,
+                                    daily_pause_fired_paliers_bits,
+                                    *daily_pause_skipped_today,
+                                    popup_pid,
+                                    pid,
+                                    now,
+                                    u64::from(config.daily_pause.duration_minutes) * 60,
+                                );
+                                // Daily content is confirmed on screen :
+                                // drain any lingering heads-up widget.
+                                drain_heads_up_widgets(last_widget_children);
+                            } else {
+                                // Applied, then the popup died before the
+                                // ack was processed. Don't stamp against a
+                                // dead child — the no-popup daily path
+                                // re-fires a fresh daily popup instead.
+                                tracing::warn!(
+                                    pid,
+                                    "daily ack received but popup already gone - not stamping"
+                                );
+                            }
+                        }
+                        Some(p) => {
+                            tracing::warn!(
+                                ack_pid = pid,
+                                expected_pid = p.pid,
+                                "daily ack pid mismatch - ignoring stale ack"
+                            );
+                            pending_daily_ack = Some(p);
+                        }
+                        None => {
+                            tracing::warn!(pid, "unsolicited daily ack - ignoring");
+                        }
+                    }
                 }
                 Ok(TickCommand::Reload) => {
                     tracing::info!("config reload triggered");
@@ -1181,9 +1464,26 @@ mod win {
                     if super::daily_window_changed(&old_daily, &config.daily_pause) {
                         *daily_pause_skipped_today = None;
                         *daily_pause_fired_paliers_bits = 0;
-                        tracing::info!(
-                            "reload: daily-pause window changed - clearing skipped marker + palier bits (fired-today untouched)"
-                        );
+                        let now_auth = time_authority::now_authoritative(config);
+                        let now_local_new =
+                            time_authority::in_configured_tz(config, now_auth);
+                        let new_fire_at =
+                            build_daily_pause_state(config, now_local_new, false, 0, None)
+                                .fire_at_today;
+                        if super::daily_rearm_on_window_change(
+                            *daily_pause_fired_at,
+                            new_fire_at,
+                            now_local_new,
+                        ) {
+                            *daily_pause_fired_at = None;
+                            tracing::info!(
+                                "reload: daily-pause window moved to a future time - re-arming today's fire (fired-at cleared)"
+                            );
+                        } else {
+                            tracing::info!(
+                                "reload: daily-pause window changed - clearing skipped marker + palier bits (fired-today untouched)"
+                            );
+                        }
                         let _ = runtime_dat::write(&runtime_dat::RuntimeState {
                             last_popup: *last_popup,
                             paused_secs: *paused_secs,
@@ -1629,11 +1929,20 @@ mod win {
                     let clamped_paused =
                         scheduler::clamp_paused_to_elapsed(*paused_secs, elapsed_since_last);
                     if clamped_paused != *paused_secs {
-                        tracing::warn!(
-                            paused_secs = *paused_secs,
-                            elapsed_since_last,
-                            "paused_secs above elapsed - clamping (corrupted state self-heal)"
-                        );
+                        // A FUTURE last_popup is the lunch-end anchor set
+                        // by stamp_daily_fire_success, not corruption :
+                        // elapsed saturates to 0 until lunch end, so idle
+                        // seconds accrued during the pause are expected to
+                        // clamp away silently (they must not push the
+                        // post-lunch interval ; only post-lunch idle
+                        // counts).
+                        if now >= *last_popup {
+                            tracing::warn!(
+                                paused_secs = *paused_secs,
+                                elapsed_since_last,
+                                "paused_secs above elapsed - clamping (corrupted state self-heal)"
+                            );
+                        }
                         *paused_secs = clamped_paused;
                     }
                     if was_idle != Some(is_idle_now) {
@@ -1712,7 +2021,7 @@ mod win {
                     // moved Config::disabled inside the interval branch).
                     let fired_local = daily_pause_fired_at
                         .map(|ts| time_authority::in_configured_tz(config, ts));
-                    let fired_today =
+                    let mut fired_today =
                         match super::resolve_daily_fired(fired_local, now_local.date_naive()) {
                             super::DailyFiredDecision::DayRolledOver => {
                                 // Reset the per-day markers ONCE. Clearing
@@ -1764,15 +2073,86 @@ mod win {
                     //     updated (formerly interval) popup lacks
                     //     PURRPAUSE_FROZEN_TZ — cosmetic-null today, the
                     //     popup body renders no TZ-dependent text.
+                    let alive_pid = last_popup_child
+                        .as_ref()
+                        .filter(|c| c.try_wait_exited().is_none())
+                        .map(|c| c.pid);
+                    // Resolve any in-flight daily ack BEFORE computing
+                    // daily_due / the collision predicate : while pending
+                    // nothing re-sends ; past the deadline the update is
+                    // unconfirmed and a real daily popup is kill/respawned
+                    // (fire_popup_daily stamps only on spawn success). A
+                    // successful respawn refreshes `fired_today` so the
+                    // decisions below run against the post-stamp state.
+                    let pending_tick = pending_daily_ack.as_ref().map(|p| {
+                        (
+                            p.pid,
+                            super::resolve_pending_daily_ack(p, now_authoritative, alive_pid),
+                        )
+                    });
+                    let had_pending_tick = pending_tick.is_some();
+                    if let Some((ack_pid, outcome)) = pending_tick {
+                        match outcome {
+                            super::PendingAckTick::Wait => {}
+                            super::PendingAckTick::AbandonChildGone => {
+                                tracing::info!(
+                                    pid = ack_pid,
+                                    "daily ack pending but popup gone - abandoning in-place update"
+                                );
+                                pending_daily_ack = None;
+                            }
+                            super::PendingAckTick::RespawnDeadline => {
+                                tracing::warn!(
+                                    pid = ack_pid,
+                                    "daily ack timeout - update unconfirmed, falling back to kill/respawn"
+                                );
+                                pending_daily_ack = None;
+                                if fire_popup_daily(
+                                    exe,
+                                    last_popup,
+                                    paused_secs,
+                                    popup_pending,
+                                    last_heartbeat,
+                                    fired,
+                                    last_popup_child,
+                                    last_widget_children,
+                                    &config.passcode_hash,
+                                    daily_pause_fired_at,
+                                    daily_pause_fired_paliers_bits,
+                                    *daily_pause_skipped_today,
+                                    popup_pid,
+                                    config.daily_pause.timezone.as_str(),
+                                    now_authoritative,
+                                    u64::from(config.daily_pause.duration_minutes) * 60,
+                                )
+                                .is_ok()
+                                {
+                                    fired_today = true;
+                                }
+                                // Err is traced inside fire_popup_daily ;
+                                // the collision path below re-evaluates on
+                                // this same tick (safe : spawn-first /
+                                // kill-on-success, and the Err arm handles
+                                // a double failure).
+                            }
+                        }
+                    }
+                    // A deadline respawn replaces last_popup_child :
+                    // refresh the liveness snapshot so the collision
+                    // inputs + trace below never reference the killed pid.
+                    let alive_pid = if had_pending_tick {
+                        last_popup_child
+                            .as_ref()
+                            .filter(|c| c.try_wait_exited().is_none())
+                            .map(|c| c.pid)
+                    } else {
+                        alive_pid
+                    };
                     let daily_due = daily_state.enabled
                         && !fired_today
                         && !daily_state.skipped_today
                         && now_local >= daily_state.fire_at_today
                         && now_local <= daily_state.grace_window_end;
-                    let alive_pid = last_popup_child
-                        .as_ref()
-                        .filter(|c| c.try_wait_exited().is_none())
-                        .map(|c| c.pid);
                     let collision_wants =
                         super::daily_collision_wants_update(&super::DailyCollisionInputs {
                             daily_due,
@@ -1780,6 +2160,7 @@ mod win {
                             popup_child_alive: alive_pid.is_some(),
                             current_popup_is_daily: alive_pid.is_some()
                                 && *popup_pid == alive_pid,
+                            ack_pending: pending_daily_ack.is_some(),
                         });
                     // Transition-only trace of the daily decision. The
                     // tuple deliberately EXCLUDES popup_pending (interval
@@ -1866,26 +2247,18 @@ mod win {
                             |pid, m| crate::ipc_popup::send_to_popup(pid, m),
                         ) {
                             Ok(UpdateOrSpawn::Updated) => {
+                                // Pipe write OK — but that is NOT proof the
+                                // popup applied the daily content. Stamp
+                                // nothing yet : await the popup's DailyAck,
+                                // or kill/respawn at the deadline.
                                 tracing::info!(
                                     pid = target_pid,
-                                    "daily collision: running popup updated in place (no respawn)"
+                                    "daily collision: update sent in place - awaiting popup ack"
                                 );
-                                stamp_daily_fire_success(
-                                    last_popup,
-                                    paused_secs,
-                                    popup_pending,
-                                    last_heartbeat,
-                                    fired,
-                                    daily_pause_fired_at,
-                                    daily_pause_fired_paliers_bits,
-                                    *daily_pause_skipped_today,
-                                    popup_pid,
-                                    target_pid,
-                                    now_authoritative,
-                                );
-                                // Daily content is now on screen : drain any
-                                // lingering heads-up widget.
-                                drain_heads_up_widgets(last_widget_children);
+                                pending_daily_ack = Some(super::PendingDailyAck {
+                                    pid: target_pid,
+                                    deadline: now_authoritative + DAILY_ACK_TIMEOUT,
+                                });
                             }
                             Ok(UpdateOrSpawn::Spawned(child)) => {
                                 let pid = child.pid;
@@ -1906,6 +2279,7 @@ mod win {
                                     popup_pid,
                                     pid,
                                     now_authoritative,
+                                    u64::from(dp.duration_minutes) * 60,
                                 );
                                 // New daily popup is up : drain any lingering
                                 // heads-up widget.
@@ -2025,6 +2399,7 @@ mod win {
                                 popup_pid,
                                 &config.daily_pause.timezone,
                                 now_authoritative,
+                                u64::from(config.daily_pause.duration_minutes) * 60,
                             ) {
                                 Ok(()) => {}
                                 Err(e) => {
@@ -2309,6 +2684,7 @@ mod win {
         popup_pid: &mut Option<u32>,
         tz_name: &str,
         now: SystemTime,
+        daily_duration_secs: u64,
     ) -> Result<()> {
         if let Some(exe_parent) = exe.parent() {
             kill_orphan_webview2_workers(&webview2_dir(exe_parent));
@@ -2348,6 +2724,7 @@ mod win {
                     popup_pid,
                     child.pid,
                     now,
+                    daily_duration_secs,
                 );
                 *last_popup_child = Some(child);
                 Ok(())
@@ -2381,8 +2758,13 @@ mod win {
         popup_pid: &mut Option<u32>,
         new_pid: u32,
         now: SystemTime,
+        daily_duration_secs: u64,
     ) {
-        *last_popup = now;
+        // Anchor the interval cycle at lunch END (see
+        // daily_lunch_end_anchor) — downstream duration_since(last_popup)
+        // all saturate to zero while the anchor is still in the future.
+        let lunch_end = super::daily_lunch_end_anchor(now, daily_duration_secs);
+        *last_popup = lunch_end;
         *paused_secs = 0;
         *popup_pending = true;
         *last_heartbeat = now;
@@ -2393,10 +2775,11 @@ mod win {
         tracing::info!(
             pid = new_pid,
             fired_at = ?now,
+            interval_anchor = ?lunch_end,
             "daily fire stamped - fired_today latched until midnight / rearm"
         );
         if let Err(e) = runtime_dat::write(&runtime_dat::RuntimeState {
-            last_popup: now,
+            last_popup: lunch_end,
             paused_secs: 0,
             popup_pending: true,
             last_heartbeat: now,
@@ -2543,6 +2926,9 @@ mod win {
                 }
                 Message::ResetPause => {
                     let _ = pipe_tx.send(TickCommand::ResetPause);
+                }
+                Message::DailyPauseApplied { pid } => {
+                    let _ = pipe_tx.send(TickCommand::DailyAck { pid });
                 }
                 Message::Shutdown => {
                     let _ = pipe_tx.send(TickCommand::Shutdown);
