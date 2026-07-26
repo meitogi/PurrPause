@@ -18,6 +18,13 @@
 // as a write client (GW+FR), so both the user-mode config UI and the
 // user-session input probe can signal without needing SYSTEM.
 
+// The protocol items below (PIPE_NAME, `Message` + parse/to_bytes, the client
+// `send`) are consumed only by the `#[cfg(windows)] mod win` server and the
+// Windows-only config UI / input probe. On Linux they compile and are
+// unit-tested, but have no non-test caller — silence the dead-code noise there
+// without weakening enforcement on the shipping Windows build.
+#![cfg_attr(not(windows), allow(dead_code))]
+
 pub const PIPE_NAME: &str = r"\\.\pipe\SystemHealthAgent-Signal";
 
 #[cfg(windows)]

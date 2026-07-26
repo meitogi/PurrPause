@@ -33,6 +33,7 @@ pub fn run() -> Result<()> {
 /// from `today` ? Called before building `DailyPauseState` so the
 /// caller can reset the palier bitmask + skipped-today marker when
 /// crossing midnight in the configured TZ.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(super) fn day_boundary_crossed(
     fired_local: chrono::DateTime<chrono_tz::Tz>,
     today: chrono::NaiveDate,
@@ -42,6 +43,7 @@ pub(super) fn day_boundary_crossed(
 
 /// Outcome of the per-tick "did the daily pause already fire today ?"
 /// decision, resolved from the persisted `daily_pause_fired_at`.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(super) enum DailyFiredDecision {
     /// No fire timestamp on record — not fired today, nothing to reset.
     NotFired,
@@ -58,6 +60,7 @@ pub(super) enum DailyFiredDecision {
 /// Classify the persisted daily-fire timestamp against today's local
 /// date. Pure so the day-rollover reset is unit-testable without the
 /// tick loop. Reuses [`day_boundary_crossed`] for the date comparison.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(super) fn resolve_daily_fired(
     fired_local: Option<chrono::DateTime<chrono_tz::Tz>>,
     today: chrono::NaiveDate,
@@ -72,6 +75,7 @@ pub(super) fn resolve_daily_fired(
 /// Cas D elapsed clamp : `min(elapsed_secs, duration_secs)` as `u32`.
 /// Extracted so the "dismiss immediately when elapsed >= duration"
 /// invariant is unit-testable without spawning a real popup.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(super) fn clamp_cas_d_elapsed(elapsed_secs: u64, duration_secs: u64) -> u32 {
     elapsed_secs.min(duration_secs) as u32
 }
@@ -83,6 +87,7 @@ pub(super) fn clamp_cas_d_elapsed(elapsed_secs: u64, duration_secs: u64) -> u32 
 /// window), but never `fired_today` : the pause already happened today
 /// and auto-refiring would risk a double lunch — the Rearm button owns
 /// the explicit re-fire.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(super) fn daily_window_changed(
     old: &crate::config::schema::DailyPauseConfig,
     new: &crate::config::schema::DailyPauseConfig,
@@ -95,6 +100,7 @@ pub(super) fn daily_window_changed(
 
 /// Inputs of the session-4 daily↔interval collision decision, resolved
 /// by the tick loop from scheduler state + the live child handle.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(super) struct DailyCollisionInputs {
     /// The daily pause should fire now : enabled, not fired / skipped
     /// today, and `now_local` inside `[fire_at, grace_window_end]`.
@@ -113,6 +119,7 @@ pub(super) struct DailyCollisionInputs {
 /// wait for the interval popup to be dismissed. When true, the tick
 /// loop sends `UpdateContent` over the popup's per-PID pipe (fallback :
 /// kill+respawn) instead of waiting.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(super) fn daily_collision_wants_update(i: &DailyCollisionInputs) -> bool {
     i.daily_due && i.popup_pending && i.popup_child_alive && !i.current_popup_is_daily
 }
