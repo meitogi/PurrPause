@@ -996,6 +996,12 @@ mod win {
         // new stamps) rather than snapping back to "assume active"
         // instantly.
         let mut input_stamp: Option<idle::InputStampState> = None;
+        // Daily-pause decision trace de-dup : the tuple of decision
+        // inputs/outcome is logged only when it CHANGES, so the daily
+        // branch leaves a diagnosable trail (window opened, suppressed
+        // by fired_today, collision wanted, …) without a 5 s-cadence
+        // spam. `None` = nothing observed yet, first tick seeds it.
+        let mut last_daily_trace: Option<(bool, bool, bool, bool, bool, bool)> = None;
 
         loop {
             match rx.recv_timeout(TICK_INTERVAL) {
@@ -1767,13 +1773,48 @@ mod win {
                         .as_ref()
                         .filter(|c| c.try_wait_exited().is_none())
                         .map(|c| c.pid);
-                    if super::daily_collision_wants_update(&super::DailyCollisionInputs {
+                    let collision_wants =
+                        super::daily_collision_wants_update(&super::DailyCollisionInputs {
+                            daily_due,
+                            popup_pending: *popup_pending,
+                            popup_child_alive: alive_pid.is_some(),
+                            current_popup_is_daily: alive_pid.is_some()
+                                && *popup_pid == alive_pid,
+                        });
+                    // Transition-only trace of the daily decision. The
+                    // tuple deliberately EXCLUDES popup_pending (interval
+                    // popups toggle it all day) but INCLUDES in_window so
+                    // the moment the daily target is reached prints one
+                    // line even when nothing fires — with fired_at, the
+                    // discriminator between "genuinely fired earlier
+                    // today" and a falsely-latched stamp.
+                    let in_window = daily_state.enabled
+                        && now_local >= daily_state.fire_at_today
+                        && now_local <= daily_state.grace_window_end;
+                    let daily_trace = (
+                        daily_state.enabled,
+                        in_window,
                         daily_due,
-                        popup_pending: *popup_pending,
-                        popup_child_alive: alive_pid.is_some(),
-                        current_popup_is_daily: alive_pid.is_some()
-                            && *popup_pid == alive_pid,
-                    }) {
+                        fired_today,
+                        daily_state.skipped_today,
+                        collision_wants,
+                    );
+                    if last_daily_trace != Some(daily_trace) {
+                        last_daily_trace = Some(daily_trace);
+                        tracing::info!(
+                            enabled = daily_state.enabled,
+                            in_window,
+                            daily_due,
+                            fired_today,
+                            fired_at = ?*daily_pause_fired_at,
+                            skipped_today = daily_state.skipped_today,
+                            popup_pending = *popup_pending,
+                            alive_pid = ?alive_pid,
+                            collision_wants_update = collision_wants,
+                            "daily decision changed"
+                        );
+                    }
+                    if collision_wants {
                         let target_pid =
                             alive_pid.expect("wants_update implies a live child");
                         let dp = &config.daily_pause;
@@ -2349,6 +2390,11 @@ mod win {
         *daily_pause_fired_paliers_bits = 0;
         *popup_pid = Some(new_pid);
         fired.clear();
+        tracing::info!(
+            pid = new_pid,
+            fired_at = ?now,
+            "daily fire stamped - fired_today latched until midnight / rearm"
+        );
         if let Err(e) = runtime_dat::write(&runtime_dat::RuntimeState {
             last_popup: now,
             paused_secs: 0,
