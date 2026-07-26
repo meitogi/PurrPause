@@ -146,7 +146,7 @@ curiosity in a casual services.msc / taskschd.msc browse.
   `PurrPause` / `Wellness` / `Focus` (product-like names that would
   yield the same Google hit immediately).
 
-### 9. `Reset-Clean.bat` shipped in the release zip
+### 9. `Full-Reset.bat` shipped in the release zip
 - **Difficulté** : Trivial (double-click the .bat if the child has
   the extract of the zip).
 - **Status v1** : **Accepted trade-off**. The script requires admin
@@ -154,8 +154,8 @@ curiosity in a casual services.msc / taskschd.msc browse.
   the intended recovery path for legitimate uninstall / smoke
   iteration. Any child with access to the zip already has the exe +
   every mitigation-defeating knowledge in the zip anyway ; adding
-  Reset-Clean.bat doesn't materially change the threat surface.
-- **Note** : Reset-Clean.bat scrubs `PendingFileRenameOperations` so
+  Full-Reset.bat doesn't materially change the threat surface.
+- **Note** : Full-Reset.bat scrubs `PendingFileRenameOperations` so
   a subsequent fresh install doesn't land on the landmine that
   motivated session 8 bug #5. Purpose > risk.
 

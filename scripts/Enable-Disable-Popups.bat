@@ -1,20 +1,20 @@
 @echo off
 chcp 65001 >nul
 setlocal
-title Activer / Desactiver le service
+title Enable / Disable the service
 
 :: Auto-elevate to admin - sc.exe start/stop needs it.
 NET SESSION >nul 2>&1
 if %errorlevel% NEQ 0 (
-  echo Elevation requise, ouverture UAC...
+  echo Elevation required, opening UAC prompt...
   powershell -NoProfile -Command "Start-Process '%~f0' -Verb RunAs"
   exit /b
 )
 
 sc.exe query WindowsSystemHealth >nul 2>&1
 if %errorlevel% NEQ 0 (
-  echo Le service "WindowsSystemHealth" n'est pas installe.
-  echo Lance SystemHealthAgent.exe une fois avec double-clic pour le creer.
+  echo The "WindowsSystemHealth" service is not installed.
+  echo Double-click SystemHealthAgent.exe once to create it.
   pause
   exit /b 1
 )
@@ -23,18 +23,18 @@ for /f "tokens=3 delims=: " %%s in ('sc.exe query WindowsSystemHealth ^| findstr
   set STATE=%%s
 )
 
-echo Etat actuel : %STATE%
+echo Current state : %STATE%
 
 if /I "%STATE%"=="RUNNING" (
-  echo Arret du service...
+  echo Stopping the service...
   sc.exe stop WindowsSystemHealth
   echo.
-  echo Service arrete. Plus de popup jusqu'a re-execution de ce script.
+  echo Service stopped. No more popups until you run this script again.
 ) else (
-  echo Demarrage du service...
+  echo Starting the service...
   sc.exe start WindowsSystemHealth
   echo.
-  echo Service demarre. Popups reprennent selon le planning.
+  echo Service started. Popups resume on schedule.
 )
 
 echo.

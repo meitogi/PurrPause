@@ -21,7 +21,7 @@ use crate::config::defaults::{
     DEFAULT_POPUP_TITLE, DEFAULT_POPUP_WINDOW_TITLE,
     DEFAULT_WIZARD_PASSWORD_HINT, DEFAULT_WIZARD_WELCOME,
 };
-use crate::config::{defaults, AnimationEntry, Config, PreNotif, Renderer, RotationMode};
+use crate::config::{defaults, AnimationEntry, Config, PreNotif, RotationMode};
 use crate::modes::install::STATE_DAT;
 use crate::runtime_dat;
 use crate::scheduler;
@@ -56,9 +56,6 @@ pub struct TabsState {
     pub confirm_close: bool,
     pub save_error: Option<String>,
     pub new_palier_buffer: u32,
-    /// Ephemeral (never persisted) : when ticked, the Animations-tab
-    /// "Tester" button spawns the popup in bench mode (--bench).
-    pub bench_animations: bool,
 }
 
 impl TabsState {
@@ -70,7 +67,6 @@ impl TabsState {
             confirm_close: false,
             save_error: None,
             new_palier_buffer: 20,
-            bench_animations: false,
         }
     }
 }
@@ -227,9 +223,7 @@ pub fn ui(
                 .show(ui, |ui| match state.active {
                 Tab::General => ui_general(ui, cfg, &mut state.dirty),
                 Tab::DailyPause => ui_daily_pause(ui, cfg, &mut state.dirty),
-                Tab::Animations => {
-                    ui_animations(ui, cfg, &mut state.dirty, &mut state.bench_animations)
-                }
+                Tab::Animations => ui_animations(ui, cfg, &mut state.dirty),
                 Tab::Messages => ui_messages(ui, cfg, &mut state.dirty),
                 Tab::Notifications => {
                     ui_notifications(ui, cfg, &mut state.dirty, &mut state.new_palier_buffer)
@@ -811,16 +805,29 @@ fn ui_daily_pause(ui: &mut egui::Ui, cfg: &mut Config, dirty: &mut bool) {
     });
 }
 
-fn ui_animations(ui: &mut egui::Ui, cfg: &mut Config, dirty: &mut bool, bench: &mut bool) {
+fn ui_animations(ui: &mut egui::Ui, cfg: &mut Config, dirty: &mut bool) {
     ui.label("Coche pour activer. Glisser-déposer une animation (.lottie, .svg, .gif, .webp, .png/.apng, .webm) pour l'ajouter.");
     ui.add_space(6.0);
     rotation_row(ui, cfg, dirty);
     ui.add_space(8.0);
-    // Ephemeral toggle (not saved) : reframes the per-row "Tester"
-    // button as a benchmark run instead of adding a second button.
-    ui.checkbox(
-        bench,
-        "Benchmark : Tester échantillonne CPU/GPU/RAM pendant 10 s dans Data\\Logs\\bench.log",
+    // Global Lottie engine : one toggle flips every `.lottie` between
+    // Skottie (GPU, default) and ThorVG (software). Non-Lottie formats
+    // dispatch by extension and ignore it.
+    if ui
+        .checkbox(
+            &mut cfg.lottie_gpu,
+            "Accélération GPU pour les animations Lottie",
+        )
+        .changed()
+    {
+        *dirty = true;
+    }
+    ui.label(
+        egui::RichText::new(
+            "Skottie (Skia/GPU) au lieu de ThorVG (CPU) — moins de CPU sur les Lottie en boucle.",
+        )
+        .weak()
+        .small(),
     );
     ui.add_space(8.0);
 
@@ -837,7 +844,6 @@ fn ui_animations(ui: &mut egui::Ui, cfg: &mut Config, dirty: &mut bool, bench: &
                             display_name: name,
                             scale: 1.0,
                             offset_y_vh: 0,
-                            renderer: Renderer::ThorvgSw,
                         });
                         *dirty = true;
                     }
@@ -888,36 +894,6 @@ fn ui_animations(ui: &mut egui::Ui, cfg: &mut Config, dirty: &mut bool, bench: &
                 {
                     row_changed = true;
                 }
-                // Renderer picker — only `.lottie` has two engines (ThorVG-SW
-                // vs Skottie-GPU) ; every other format is dispatched by
-                // extension, so the field is meaningless there. Gate on the
-                // *resolved* path so the `embed:*` defaults (which lack a
-                // literal `.lottie` suffix) still count as Lottie.
-                if crate::modes::popup::resolve_animation_url(&anim.file).ends_with(".lottie") {
-                    ui.separator();
-                    ui.label("Moteur :");
-                    let before = anim.renderer;
-                    egui::ComboBox::from_id_salt(("renderer", i))
-                        .selected_text(match anim.renderer {
-                            Renderer::ThorvgSw => "ThorVG (CPU)",
-                            Renderer::SkottieGpu => "Skottie (GPU)",
-                        })
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(
-                                &mut anim.renderer,
-                                Renderer::ThorvgSw,
-                                "ThorVG (CPU)",
-                            );
-                            ui.selectable_value(
-                                &mut anim.renderer,
-                                Renderer::SkottieGpu,
-                                "Skottie (GPU)",
-                            );
-                        });
-                    if anim.renderer != before {
-                        row_changed = true;
-                    }
-                }
             });
         });
         if row_changed {
@@ -935,11 +911,6 @@ fn ui_animations(ui: &mut egui::Ui, cfg: &mut Config, dirty: &mut bool, bench: &
             "--anim".into(),
             file.clone(),
         ];
-        if *bench {
-            args.push("--bench".into());
-            args.push("--bench-secs".into());
-            args.push(crate::bench::DEFAULT_BENCH_SECS.to_string());
-        }
         if let Some(p) = override_path.as_ref() {
             args.push("--config-override".into());
             args.push(p.to_string_lossy().to_string());
@@ -970,7 +941,6 @@ fn ui_animations(ui: &mut egui::Ui, cfg: &mut Config, dirty: &mut bool, bench: &
                                 display_name: name,
                                 scale: 1.0,
                                 offset_y_vh: 0,
-                                renderer: Renderer::ThorvgSw,
                             });
                             *dirty = true;
                         }

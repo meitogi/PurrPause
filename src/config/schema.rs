@@ -129,6 +129,13 @@ pub struct Config {
     #[serde(default = "d::animations")]
     pub animations: Vec<AnimationEntry>,
 
+    /// Global Lottie render engine : `true` = Skottie (Skia/CanvasKit, GPU,
+    /// the default) ; `false` = ThorVG (dotlottie-wc software rasterizer).
+    /// Applies to every `.lottie` — non-Lottie formats dispatch by extension
+    /// and ignore this. Exposed as a single checkbox in the Animations tab.
+    #[serde(default = "d::lottie_gpu")]
+    pub lottie_gpu: bool,
+
     #[serde(default = "d::rotation_mode")]
     pub rotation_mode: RotationMode,
 
@@ -219,11 +226,6 @@ pub struct AnimationEntry {
     /// Range clamped in the config UI to `-50..=50`.
     #[serde(default = "d::animation_offset_y_vh")]
     pub offset_y_vh: i8,
-    /// Which engine renders this animation. Only meaningful for `.lottie`
-    /// entries — every other format is dispatched purely by extension. Lets
-    /// the same `.lottie` be rendered by ThorVG (software) or Skottie (GPU).
-    #[serde(default = "d::animation_renderer")]
-    pub renderer: Renderer,
 }
 
 /// Render engine for a `.lottie` animation. Ignored for non-Lottie formats

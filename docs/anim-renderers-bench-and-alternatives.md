@@ -31,23 +31,23 @@ summed across the tree, so they can exceed 100.
 | Type | Renderer | CPU % | GPU % | Working set | **Private** | vs Lottie CPU |
 |---|---|---|---|---|---|---|
 | **WebM alpha** | `<video>` (native, HW decode) | **59.5** | 35.2 | 487 MB | **237 MB** | **−63 %** |
+| **Lottie (Skottie)** | Skia / CanvasKit (WASM, **GPU**) | **79.2** | **23.0** | 528 MB | 399 MB | **−50 %** |
 | **Rive** | `@rive-app/webgl2` (WASM, GPU) | **111.7** | 33.9 | 661 MB | 427 MB | **−30 %** |
 | GIF | `<img>` (native) | 117.4 | 36.7 | 989 MB | 311 MB | −26 % |
 | WebP | `<img>` (native) | 119.2 | 38.7 | 1011 MB | 332 MB | −25 % |
 | APNG | `<img>` (native) | 123.4 | 35.4 | 1017 MB | 333 MB | −22 % |
 | SVG (SMIL) | `<img>` (native) | 131.9 | 46.8 | 689 MB | 398 MB | −17 % |
-| **Lottie (Skottie)** | Skia / CanvasKit (WASM, **GPU**) | _pending_ | _pending_ | _pending_ | _pending_ | _pending_ |
 | **Lottie (ThorVG)** | dotLottie / ThorVG (WASM, **software**) | **158.7** | 40.4 | 633 MB | 332 MB | baseline |
 
-> **Skottie row — pending the session-4 three-way host smoke.** Skottie is
-> Skia's Lottie player, run on the GPU via CanvasKit/WebGL. It renders the
-> **same** `.lottie` fixture as the ThorVG-software baseline — selected per
-> entry via the `renderer` field — so its row is the direct GPU-vs-software
-> comparison for one identical animation. Back-fill `cpu_pct` / `gpu_pct` /
-> working-set / private from `bench.log` (`renderer=skottie-gpu` rows) once the
-> Parallels aarch64 smoke runs, and answer: does GPU-Lottie close the
-> Lottie→Rive CPU gap (159 % → 112 %) now that compositing is confirmed
-> hardware D3D11?
+> **Skottie — session-4 three-way host smoke verdict (Parallels aarch64).**
+> Skottie is Skia's Lottie player, run on the GPU via CanvasKit/WebGL, on the
+> **same** `.lottie` fixture as the ThorVG-software baseline. Measured **79.2 %
+> CPU** — it doesn't just close the Lottie→Rive gap (159 % → 112 %), it
+> **beats** Rive (108 % on this run) and posts the **lowest GPU %** of the whole
+> set (23 %) at a low 528 MB working set. GPU-Lottie is the decisive win, so it
+> is now the **default** engine, flipped app-wide by a single global toggle
+> (`Config::lottie_gpu`). Compositing confirmed hardware D3D11
+> (`ANGLE … Direct3D11`); `vendor/skottie/*` loads only on the Skottie run.
 
 Conditional loading verified: a Lottie popup fetches only
 `vendor/dotlottie-wc/*`, a Rive popup only `vendor/rive/*`, and the
@@ -58,24 +58,28 @@ img/video formats pull **zero** engine bytes (pure native elements).
 - **Lottie / ThorVG-software is the CPU hog** (159 %). Per-frame vector
   rasterisation on the CPU is exactly what saturates a core on a looping
   fullscreen animation. This is the problem the comparison set out to explain.
-- **Rive cuts CPU by ~30 %** at near-equal RAM, and is the **lowest GPU %**
-  of all — its WebGL2 pipeline is efficient, not GPU-hungry. Best **vector**
-  option.
+- **Rive cuts CPU by ~30 %** at near-equal RAM — its WebGL2 pipeline is
+  efficient, not GPU-hungry. A strong **vector** option, now edged out by
+  GPU-Lottie below.
 - **WebM alpha video wins outright**: −63 % CPU *and* the lowest RAM, because
   it rides the **hardware video decoder** — no per-frame CPU raster, no WASM.
   The clear choice *when the asset can be an alpha WebM*.
 - **Raster (GIF / WebP / APNG)** is cheaper on CPU than Lottie but costs
   **~1 GB working set** (every decoded frame held in memory) and carries
   quality limits (GIF = 1-bit alpha). Poor trade.
-- A **GPU-Lottie** renderer (Skottie / CanvasKit) is now **wired** (the
-  `renderer` field flips a `.lottie` between ThorVG-software and Skottie-GPU
-  on the same file) — its numbers land with the session-4 three-way host
-  smoke and back-fill the `skottie-gpu` row above. This closes the comparator:
-  it is the last engine, deliberately no third GPU spike beyond it.
+- **GPU-Lottie (Skottie / CanvasKit) is the vector winner**: **79 % CPU**
+  (−50 % vs ThorVG-software), **below Rive**, at the **lowest GPU %** (23 %)
+  and a low 528 MB working set. Moving the *same* `.lottie` off the CPU
+  rasteriser onto the GPU roughly halves its cost — so Skottie is now the
+  **default** Lottie engine (one global toggle, app-wide). This closes the
+  comparator: the last engine, and the best vector one.
 
 **Recommendation (inside the current WebView2 stack)** : prefer **alpha WebM**
-when the content allows it, else **Rive** for vector; avoid ThorVG-software
-Lottie for anything looping fullscreen; treat raster as a last resort on RAM.
+when the content allows it (lowest CPU + RAM). For Lottie / vector content,
+**GPU-Lottie (Skottie) is the default and the cheapest vector path** — it beats
+Rive on both CPU and GPU; keep **Rive** as the alternative. Avoid
+ThorVG-software Lottie for anything looping fullscreen; treat raster as a last
+resort on RAM.
 
 ## 2. Why the popup uses ~600 MB — and is it shared with Edge?
 

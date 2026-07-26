@@ -1,7 +1,7 @@
 @echo off
 chcp 65001 >nul
 setlocal
-title Nettoyer completement PurrPause
+title Fully uninstall PurrPause
 
 :: Auto-elevate to admin - the installed exe's --uninstall mode assumes
 :: it runs elevated (SCM delete + task delete + programdata rm all need
@@ -9,21 +9,26 @@ title Nettoyer completement PurrPause
 :: elevated context ; a double-clic on this .bat gets us there.
 NET SESSION >nul 2>&1
 if %errorlevel% NEQ 0 (
-  echo Elevation requise, ouverture UAC...
+  echo Elevation required, opening UAC prompt...
   powershell -NoProfile -Command "Start-Process '%~f0' -Verb RunAs"
   exit /b
 )
 
 echo.
-echo === PurrPause : nettoyage complet ===
+echo === PurrPause : full cleanup ===
 echo.
 
+:: This .bat lives in <root>\scripts\ ; the exe sits one level up. Resolve
+:: that parent to a canonical path (%~fI collapses the trailing "..").
+for %%I in ("%~dp0..") do set "ROOT=%%~fI"
+
 :: Locate the installed exe. Priority :
-::   1. Same folder as this .bat (the zip ships them together - normal case).
+::   1. One level up from this .bat (the zip ships scripts\ next to the exe
+::      - normal case).
 ::   2. Fall back to the SCM ImagePath registered under WindowsSystemHealth.
 ::   3. Fall back to the legacy manual teardown (sc + schtasks + rmdir) if
 ::      the exe can't be found anywhere.
-set "EXE=%~dp0SystemHealthAgent.exe"
+set "EXE=%ROOT%\SystemHealthAgent.exe"
 if not exist "%EXE%" (
   set "EXE="
   for /f "tokens=1,* delims=:" %%A in ('sc.exe qc WindowsSystemHealth 2^>nul ^| findstr /C:"BINARY_PATH_NAME"') do (
@@ -38,44 +43,44 @@ if not exist "%EXE%" (
 
 if defined EXE (
   if exist "%EXE%" (
-    echo Wrapper vers "%EXE%" --uninstall
+    echo Wrapping to "%EXE%" --uninstall
     "%EXE%" --uninstall
     exit /b %ERRORLEVEL%
   )
 )
 
-echo Exe introuvable - bascule sur le teardown manuel.
+echo Exe not found - falling back to the manual teardown.
 echo.
-choice /C ON /N /M "Continuer ? [O]ui / [N]on : "
+choice /C YN /N /M "Continue ? [Y]es / [N]o : "
 if errorlevel 2 (
-  echo Annule.
+  echo Cancelled.
   pause
   exit /b 1
 )
 
 echo.
-echo [1/3] Arret + suppression du service...
+echo [1/3] Stopping + deleting the service...
 sc.exe stop WindowsSystemHealth 2>nul
 sc.exe delete WindowsSystemHealth 2>nul
 
 echo.
-echo [2/3] Suppression de la tache planifiee...
+echo [2/3] Deleting the scheduled task...
 schtasks /delete /tn "\Microsoft\Windows\SystemHealth\HealthCheck" /f 2>nul
 
 echo.
-echo [3/3] Suppression du dossier de configuration...
+echo [3/3] Deleting the configuration folder...
 if exist "C:\ProgramData\DiagnosticsCache" (
   rmdir /S /Q "C:\ProgramData\DiagnosticsCache"
 )
 
 echo.
-echo === Termine ===
-echo Verifs :
+echo === Done ===
+echo Checks :
 sc.exe query WindowsSystemHealth 2>nul
-if %errorlevel% NEQ 0 echo   [OK] Service absent.
+if %errorlevel% NEQ 0 echo   [OK] Service gone.
 schtasks /query /tn "\Microsoft\Windows\SystemHealth\HealthCheck" 2>nul
-if %errorlevel% NEQ 0 echo   [OK] Tache absente.
-if not exist "C:\ProgramData\DiagnosticsCache" echo   [OK] Dossier config absent.
+if %errorlevel% NEQ 0 echo   [OK] Task gone.
+if not exist "C:\ProgramData\DiagnosticsCache" echo   [OK] Config folder gone.
 
 echo.
 pause

@@ -7,7 +7,7 @@
 //!   but we re-verify here as defense in depth — a direct
 //!   `SystemHealthAgent.exe --uninstall` from a shell must not bypass the
 //!   passcode.
-//! - `Nettoyer.bat` double-clic → self-elevates, locates the installed exe,
+//! - `Uninstall.bat` double-clic → self-elevates, locates the installed exe,
 //!   shells `--uninstall`. Same passcode gate applies.
 //!
 //! The teardown is 6 ordered steps :
@@ -95,7 +95,7 @@ mod win {
     use crate::modes::install::{self, DIAGNOSTICS_CACHE_DIR, SERVICE_NAME, STATE_DAT};
 
     pub(super) fn run() -> Result<()> {
-        // If state.dat is already gone, someone (Nettoyer.bat, a previous
+        // If state.dat is already gone, someone (Uninstall.bat, a previous
         // --uninstall run) already cleaned up. Show a friendly note and
         // exit instead of prompting for a passcode that doesn't exist.
         if !Path::new(STATE_DAT).exists() {
@@ -311,7 +311,7 @@ mod win {
         // when the service stopped). Log files are scheduled for
         // delete-on-reboot instead of unlinked immediately because
         // tracing_appender holds a handle to today's file.
-        // The .bat helpers (Activer-Desactiver.bat, Nettoyer.bat) are
+        // The .bat helpers (Enable-Disable-Popups.bat, Uninstall.bat) are
         // shipped in the zip alongside the exe — leaving them for the
         // user to delete since they aren't strictly "ours" post-extract.
         if let Some(exe) = exe.as_ref() {

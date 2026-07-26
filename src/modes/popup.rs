@@ -127,16 +127,16 @@ pub fn render_html(
         .replace("{{ RENDERER }}", renderer_token)
 }
 
-/// Resolve `(scale, offset_y_vh, renderer)` for the animation at
-/// `anim_file`. If the config has an `AnimationEntry` for that file, its
-/// per-entry values win. Otherwise fall back to `(1.0, 0, ThorvgSw)` — the
-/// CSS + baseline-engine defaults.
-pub fn stage_params(cfg: &Config, anim_file: &str) -> (f32, i8, Renderer) {
+/// Resolve `(scale, offset_y_vh)` for the animation at `anim_file`. If the
+/// config has an `AnimationEntry` for that file, its per-entry values win.
+/// Otherwise fall back to `(1.0, 0)` — the CSS defaults. The Lottie engine is
+/// a global choice (`Config::lottie_gpu`), not a per-entry one.
+pub fn stage_params(cfg: &Config, anim_file: &str) -> (f32, i8) {
     cfg.animations
         .iter()
         .find(|e| e.file == anim_file)
-        .map(|e| (e.scale, e.offset_y_vh, e.renderer))
-        .unwrap_or((1.0, 0, Renderer::ThorvgSw))
+        .map(|e| (e.scale, e.offset_y_vh))
+        .unwrap_or((1.0, 0))
 }
 
 #[cfg(windows)]
@@ -191,7 +191,10 @@ mod windows_impl {
         window_style,
     };
 
-    use super::{animation_pick, render_html, resolve_animation_url, stage_params, FALLBACK_ANIM_PATH};
+    use super::{
+        animation_pick, render_html, resolve_animation_url, stage_params, Renderer,
+        FALLBACK_ANIM_PATH,
+    };
 
     const ROTATION_DAT_FILENAME: &str = "rotation.dat";
 
@@ -469,11 +472,18 @@ mod windows_impl {
             FALLBACK_ANIM_PATH.to_string()
         };
 
-        // Resolve per-anim scale + offset + renderer. Present in the
-        // AnimationEntry list → use those. Absent (e.g. fallback anim or a
-        // testing-only override that isn't in the config) → defaults
-        // (1.0, 0, ThorVG-SW).
-        let (scale, offset_y_vh, renderer) = stage_params(&cfg, &anim_path);
+        // Resolve per-anim scale + offset. Present in the AnimationEntry list
+        // → use those. Absent (e.g. fallback anim or a testing-only override
+        // that isn't in the config) → CSS defaults (1.0, 0).
+        let (scale, offset_y_vh) = stage_params(&cfg, &anim_path);
+        // The Lottie engine is global: one `lottie_gpu` toggle flips every
+        // `.lottie` between Skottie (GPU, default) and ThorVG (software).
+        // Non-Lottie formats ignore this — they dispatch by extension.
+        let renderer = if cfg.lottie_gpu {
+            Renderer::SkottieGpu
+        } else {
+            Renderer::ThorvgSw
+        };
 
         // `anim_path` may be an opaque `embed:*` identifier (default
         // shipped assets) OR a real relative path (user-added). Map
@@ -888,10 +898,14 @@ mod windows_impl {
         // against a saturated renderer core.
         if let Some(secs) = bench_secs {
             let bench_proxy = event_loop.create_proxy();
-            let (anim_file, anim_ext) = crate::bench::split_anim_name(&anim_path);
-            // `renderer` (Copy) is the same value threaded into render_html —
-            // so the bench label matches what actually rendered (a `.lottie`
-            // run tagged skottie-gpu vs thorvg-sw per the entry's choice).
+            let (anim_file, anim_ext) =
+                crate::bench::split_anim_name(&resolve_animation_url(&anim_path));
+            // Split the *resolved* URL, not the raw `anim_path`: an `embed:*`
+            // id has no `.lottie` suffix, so splitting it yields an empty ext
+            // and `renderer_label` collapses to the thorvg-sw default even on
+            // a Skottie run. `renderer` (Copy) is the same value threaded into
+            // render_html, so the label matches what actually rendered
+            // (skottie-gpu vs thorvg-sw).
             std::thread::spawn(move || {
                 if let Err(e) = run_bench_sampler(secs, &anim_file, &anim_ext, renderer) {
                     tracing::warn!(error = ?e, "bench sampler failed");
@@ -1437,7 +1451,6 @@ mod tests {
             display_name: name.to_string(),
             scale: 1.0,
             offset_y_vh: 0,
-            renderer: Renderer::ThorvgSw,
         }
     }
 
@@ -1682,17 +1695,10 @@ mod tests {
             display_name: "Dance".to_string(),
             scale: 2.6,
             offset_y_vh: -11,
-            renderer: Renderer::SkottieGpu,
         });
-        assert_eq!(
-            stage_params(&cfg, "animations/dance.lottie"),
-            (2.6, -11, Renderer::SkottieGpu)
-        );
-        // Unknown file → CSS + baseline-engine defaults.
-        assert_eq!(
-            stage_params(&cfg, "animations/unknown.lottie"),
-            (1.0, 0, Renderer::ThorvgSw)
-        );
+        assert_eq!(stage_params(&cfg, "animations/dance.lottie"), (2.6, -11));
+        // Unknown file → CSS defaults.
+        assert_eq!(stage_params(&cfg, "animations/unknown.lottie"), (1.0, 0));
     }
 
     #[test]

@@ -478,7 +478,7 @@ mod tests {
 
     #[test]
     fn watchdog_bails_only_when_state_dat_missing_and_marker_set() {
-        // Legitimate uninstall path : parent ran Nettoyer.bat, marker
+        // Legitimate uninstall path : parent ran Uninstall.bat, marker
         // was set, state.dat teardown ran. Watchdog respects intent.
         assert!(should_watchdog_bail(false, true));
     }

@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use super::schema::{AnimationEntry, PreNotif, Renderer, RotationMode};
+use super::schema::{AnimationEntry, PreNotif, RotationMode};
 
 /// Empty by default — un-titled fullscreen borderless popup is
 /// cleaner in Alt-Tab / Task Manager (no visible label). The parent
@@ -106,11 +106,11 @@ pub mod d {
     pub fn animation_offset_y_vh() -> i8 {
         0
     }
-    /// Default render engine for a Lottie entry = ThorVG software rasterizer,
-    /// the historical baseline. Old `state.dat` files (pre-Skottie) have no
-    /// `renderer` key and deserialize to this.
-    pub fn animation_renderer() -> Renderer {
-        Renderer::ThorvgSw
+    /// Default global Lottie engine = Skottie (GPU). Measured ~2× cheaper on
+    /// CPU than the ThorVG software baseline on a looping fullscreen Lottie,
+    /// so it's the out-of-the-box choice; the Animations tab can flip it off.
+    pub const fn lottie_gpu() -> bool {
+        true
     }
     /// Default `false` = anti-tamper mode ON : `time_authority` queries
     /// NTP/HTTPS and falls back silently to `SystemTime::now()` if
@@ -172,7 +172,6 @@ pub mod d {
                 display_name: "Chat qui danse".to_string(),
                 scale: 1.5,
                 offset_y_vh: 0,
-                renderer: Renderer::ThorvgSw,
             },
             AnimationEntry {
                 file: "embed:sleep-cat".to_string(),
@@ -180,7 +179,6 @@ pub mod d {
                 display_name: "Chat qui dort".to_string(),
                 scale: 2.6,
                 offset_y_vh: -11,
-                renderer: Renderer::ThorvgSw,
             },
         ]
     }

@@ -41,12 +41,12 @@ Two supported paths :
   teardown : stops service, deletes SCM entry + Scheduled Task,
   wipes `C:\ProgramData\DiagnosticsCache\`, schedules exe self-delete
   on next boot.
-- **`Nettoyer.bat`** double-clic (shipped in the zip). Self-elevates,
-  runs the same teardown without the UI (useful if the Config UI
-  won't open).
+- **`scripts/Uninstall.bat`** double-clic (shipped in the zip under
+  `scripts/`). Self-elevates, runs the same teardown without the UI
+  (useful if the Config UI won't open).
 
-For recovery from a broken state, `Reset-Clean.bat` also ships in the
-zip and does the same teardown without a passcode gate (admin-only,
+For recovery from a broken state, `scripts/Full-Reset.bat` also ships in
+the zip and does the same teardown without a passcode gate (admin-only,
 intended for parents troubleshooting).
 
 ## Configuration overview

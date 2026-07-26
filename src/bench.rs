@@ -130,8 +130,9 @@ pub fn tsv_row(timestamp: &str, filename: &str, extension: &str, renderer: &str,
 
 /// Split an animation path/override into (file name, extension) for the
 /// log columns : `animations/dance-cat.lottie` -> ("dance-cat.lottie",
-/// "lottie"). `embed:` identifiers pass through resolve_animation_url
-/// before reaching the bench, so they arrive path-shaped already.
+/// "lottie"). Callers must pass the *resolved* URL (via
+/// `resolve_animation_url`), not a raw `embed:*` id — an `embed:*` id has no
+/// extension, which would mislabel a Lottie run as the thorvg-sw default.
 pub fn split_anim_name(anim: &str) -> (String, String) {
     let name = anim
         .rsplit(['/', '\\'])

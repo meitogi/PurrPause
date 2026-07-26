@@ -87,7 +87,6 @@ mod tests {
             display_name: "Chat qui danse".to_string(),
             scale: 1.5,
             offset_y_vh: -10,
-            renderer: Renderer::SkottieGpu,
         });
 
         let text = toml::to_string(&cfg).unwrap();
@@ -96,18 +95,26 @@ mod tests {
     }
 
     #[test]
-    fn animation_entry_defaults_renderer_when_absent() {
-        // Pre-Skottie state.dat has no `renderer` key — #[serde(default)]
-        // must fill in the ThorVG baseline so old configs still load.
+    fn lottie_gpu_defaults_on_and_ignores_legacy_renderer_key() {
+        // Fresh config → Skottie (GPU) is the out-of-the-box Lottie engine.
+        assert!(Config::default().lottie_gpu);
+        // A config predating the global flag has no `lottie_gpu` key —
+        // #[serde(default)] fills it in as `true`.
+        let cfg: Config = toml::from_str("interval_hours = 3.0\n").unwrap();
+        assert!(cfg.lottie_gpu);
+        // A pre-global-toggle state.dat may still carry a per-entry `renderer`
+        // key on an AnimationEntry. The field is gone; serde must ignore the
+        // stray key rather than fail to load.
         let legacy = r#"
             file = "embed:dance-cat"
             enabled = true
             display_name = "Chat qui danse"
             scale = 1.5
             offset_y_vh = 0
+            renderer = "SkottieGpu"
         "#;
         let e: AnimationEntry = toml::from_str(legacy).unwrap();
-        assert_eq!(e.renderer, Renderer::ThorvgSw);
+        assert_eq!(e.file, "embed:dance-cat");
     }
 
     #[test]

@@ -115,9 +115,11 @@ fn pack_target(target: &Target, version: &str, skip_build: bool) -> Result<()> {
         count += 1;
     }
 
-    // Optional convenience .bat scripts (Activer/Desactiver + Nettoyer + Reset-Clean).
-    // Silently skipped if missing so the pack still succeeds for a
-    // scripts-less checkout.
+    // Optional convenience .bat scripts (Enable-Disable-Popups + Uninstall + Full-Reset),
+    // grouped under a `scripts/` subfolder so the extracted root stays clean
+    // (exe + LICENSE + NOTICE at top, helpers tucked away). The .bat resolve
+    // the exe/Data one level up (`%~dp0..`) to match this layout. Silently
+    // skipped if missing so the pack still succeeds for a scripts-less checkout.
     let scripts_dir = PathBuf::from("scripts");
     if scripts_dir.is_dir() {
         for entry in fs::read_dir(&scripts_dir).context("read scripts/")? {
@@ -125,7 +127,7 @@ fn pack_target(target: &Target, version: &str, skip_build: bool) -> Result<()> {
             let path = entry.path();
             if path.extension().and_then(|s| s.to_str()) == Some("bat") {
                 let arc_name = format!(
-                    "{stage_name}/{}",
+                    "{stage_name}/scripts/{}",
                     path.file_name().and_then(|s| s.to_str()).unwrap()
                 );
                 add_file(&mut zip, &path, &arc_name, options)?;
