@@ -25,22 +25,23 @@ pub mod logs;
 pub mod session;
 
 use std::io::{self, BufReader, Cursor, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use chrono::{NaiveDate, Utc};
+use socket2::{Domain, Protocol, Socket, Type};
 use zip::write::SimpleFileOptions;
 use zip::ZipWriter;
 
-use crate::modes::config::lockout::{Lockout, LockoutState};
+use crate::modes::config::lockout::LockoutState;
 
 use assets::INDEX_HTML;
 use http::{parse_request, sse_data, write_sse_headers, Request, Response, SSE_PING};
 use logs::{history_files, tail_snapshot, today_path, LogDirs, LogFile, Tailer};
-use session::Sessions;
+use session::{IpThrottle, Sessions};
 
 /// Fixed LAN port for the console. Not configurable in v1.
 pub const REMOTE_LOG_PORT: u16 = 8787;
@@ -106,7 +107,10 @@ pub struct Ctx {
     cfg_path: PathBuf,
     dirs: LogDirs,
     sessions: Sessions,
-    lockout: Mutex<Lockout>,
+    /// Per-IP brute-force throttle with an escalation ladder. Replaces the
+    /// single shared `Lockout` (one spammer could otherwise lock out the real
+    /// parent). The config UI keeps its own separate `Lockout`.
+    throttle: IpThrottle,
     /// `http://<hostname>.local:<port>/` display value. Empty in the core;
     /// the service fills it from `GetComputerNameExW` in session 2.
     hostname: String,
@@ -126,7 +130,7 @@ impl Ctx {
             cfg_path,
             dirs,
             sessions: Sessions::new(),
-            lockout: Mutex::new(Lockout::new()),
+            throttle: IpThrottle::new(),
             hostname,
             trigger_pause,
         }
@@ -140,9 +144,15 @@ pub enum RouteOutcome {
     Stream(LogFile),
 }
 
-/// Pure request router. `now` drives the session/lockout clocks; `today`
-/// selects the dated log file.
-pub fn route(req: &Request, ctx: &Ctx, now: Instant, today: NaiveDate) -> RouteOutcome {
+/// Pure request router. `client_ip` keys the per-IP auth throttle; `now`
+/// drives the session/throttle clocks; `today` selects the dated log file.
+pub fn route(
+    req: &Request,
+    ctx: &Ctx,
+    client_ip: IpAddr,
+    now: Instant,
+    today: NaiveDate,
+) -> RouteOutcome {
     use RouteOutcome::{Resp, Stream};
 
     let authed = req
@@ -162,7 +172,7 @@ pub fn route(req: &Request, ctx: &Ctx, now: Instant, today: NaiveDate) -> RouteO
             Resp(Response::ok_json(body))
         }
 
-        ("POST", "/api/auth") => Resp(handle_auth(req, ctx, now)),
+        ("POST", "/api/auth") => Resp(handle_auth(req, ctx, client_ip, now)),
 
         ("GET", "/api/logs") => {
             if !authed {
@@ -219,10 +229,10 @@ struct AuthBody {
     pin: String,
 }
 
-/// Verify the pincode once and issue a session token. Consults `Lockout`
-/// *before* hashing so a throttled gate never pays the argon2 cost.
-fn handle_auth(req: &Request, ctx: &Ctx, now: Instant) -> Response {
-    if let LockoutState::Locked { .. } = ctx.lockout.lock().unwrap().check(now) {
+/// Verify the pincode once and issue a session token. Consults the per-IP
+/// throttle *before* hashing so a throttled gate never pays the argon2 cost.
+fn handle_auth(req: &Request, ctx: &Ctx, client_ip: IpAddr, now: Instant) -> Response {
+    if let LockoutState::Locked { .. } = ctx.throttle.check(client_ip, now) {
         return Response::json(429, "Too Many Requests", r#"{"error":"locked"}"#);
     }
 
@@ -236,11 +246,11 @@ fn handle_auth(req: &Request, ctx: &Ctx, now: Instant) -> Response {
     let ok = crate::password::verify(&body.pin, &cfg.passcode_hash).unwrap_or(false);
 
     if ok {
-        ctx.lockout.lock().unwrap().reset();
+        ctx.throttle.reset(client_ip);
         let token = ctx.sessions.issue(now);
         Response::ok_json(r#"{"authed":true}"#).with_cookie("session", &token)
     } else {
-        ctx.lockout.lock().unwrap().record_failure(now);
+        ctx.throttle.record_failure(client_ip, now);
         Response::unauthorized()
     }
 }
@@ -273,7 +283,14 @@ where
     F: Fn() + Send + Sync + 'static,
 {
     let ctx = Arc::new(Ctx::new(cfg_path, dirs, hostname, Box::new(trigger_pause)));
-    let listener = TcpListener::bind(("0.0.0.0", REMOTE_LOG_PORT))?;
+    // Build the listener via socket2 so SO_REUSEADDR is set before bind. std's
+    // TcpListener::bind sets it on Linux but not on Windows, where a live SSE
+    // tab leaves the port in TIME_WAIT across a quick service restart (10048).
+    let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
+    socket.set_reuse_address(true)?;
+    socket.bind(&SocketAddr::from(([0, 0, 0, 0], REMOTE_LOG_PORT)).into())?;
+    socket.listen(128)?;
+    let listener: TcpListener = socket.into();
     tracing::info!(port = REMOTE_LOG_PORT, "remote log console listening");
 
     for incoming in listener.incoming() {
@@ -293,13 +310,14 @@ where
 }
 
 fn handle_connection(stream: TcpStream, ctx: &Ctx) -> io::Result<()> {
+    let client_ip = stream.peer_addr()?.ip();
     let mut reader = BufReader::new(stream.try_clone()?);
     let req = parse_request(&mut reader)?;
     let mut writer = stream;
 
     let now = Instant::now();
     let today = Utc::now().date_naive();
-    match route(&req, ctx, now, today) {
+    match route(&req, ctx, client_ip, now, today) {
         RouteOutcome::Resp(resp) => resp.write_to(&mut writer)?,
         RouteOutcome::Stream(file) => stream_logs(ctx, file, today, &mut writer)?,
     }
@@ -401,7 +419,7 @@ mod tests {
     fn root_serves_index_html() {
         let (_t, d) = dirs();
         let ctx = test_ctx(PathBuf::from("x"), d, Arc::new(AtomicUsize::new(0)));
-        let r = resp(route(&request("GET", "/", &[], None, b""), &ctx, Instant::now(), today()));
+        let r = resp(route(&request("GET", "/", &[], None, b""), &ctx, ip(), Instant::now(), today()));
         assert_eq!(r.status, 200);
         assert!(String::from_utf8_lossy(&r.body).contains("<!DOCTYPE html>"));
     }
@@ -410,7 +428,7 @@ mod tests {
     fn session_reports_unauthed_and_logs_list() {
         let (_t, d) = dirs();
         let ctx = test_ctx(PathBuf::from("x"), d, Arc::new(AtomicUsize::new(0)));
-        let r = resp(route(&request("GET", "/api/session", &[], None, b""), &ctx, Instant::now(), today()));
+        let r = resp(route(&request("GET", "/api/session", &[], None, b""), &ctx, ip(), Instant::now(), today()));
         let v: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
         assert_eq!(v["authed"], false);
         assert_eq!(v["hostname"], "child.local:8787");
@@ -424,6 +442,7 @@ mod tests {
         let r = resp(route(
             &request("GET", "/api/logs", &[("file", "service")], None, b""),
             &ctx,
+            ip(),
             Instant::now(),
             today(),
         ));
@@ -440,6 +459,7 @@ mod tests {
         let r = resp(route(
             &request("GET", "/api/logs", &[("file", "service"), ("tail", "2")], Some(&tok), b""),
             &ctx,
+            ip(),
             now,
             today(),
         ));
@@ -457,6 +477,7 @@ mod tests {
         let r = resp(route(
             &request("GET", "/api/logs", &[("file", "install")], Some(&tok), b""),
             &ctx,
+            ip(),
             now,
             today(),
         ));
@@ -475,6 +496,7 @@ mod tests {
         let good = resp(route(
             &request("POST", "/api/auth", &[], None, br#"{"pin":"1234"}"#),
             &ctx,
+            ip(),
             now,
             today(),
         ));
@@ -484,6 +506,7 @@ mod tests {
         let bad = resp(route(
             &request("POST", "/api/auth", &[], None, br#"{"pin":"0000"}"#),
             &ctx,
+            ip(),
             now,
             today(),
         ));
@@ -504,6 +527,7 @@ mod tests {
             let r = resp(route(
                 &request("POST", "/api/auth", &[], None, br#"{"pin":"0000"}"#),
                 &ctx,
+                ip(),
                 now,
                 today(),
             ));
@@ -513,6 +537,7 @@ mod tests {
         let locked = resp(route(
             &request("POST", "/api/auth", &[], None, br#"{"pin":"1234"}"#),
             &ctx,
+            ip(),
             now,
             today(),
         ));
@@ -526,12 +551,12 @@ mod tests {
         let ctx = test_ctx(PathBuf::from("x"), d, Arc::clone(&counter));
         let now = Instant::now();
 
-        let unauth = resp(route(&request("POST", "/api/pause", &[], None, b""), &ctx, now, today()));
+        let unauth = resp(route(&request("POST", "/api/pause", &[], None, b""), &ctx, ip(), now, today()));
         assert_eq!(unauth.status, 401);
         assert_eq!(counter.load(Ordering::SeqCst), 0);
 
         let tok = ctx.sessions.issue(now);
-        let ok = resp(route(&request("POST", "/api/pause", &[], Some(&tok), b""), &ctx, now, today()));
+        let ok = resp(route(&request("POST", "/api/pause", &[], Some(&tok), b""), &ctx, ip(), now, today()));
         assert_eq!(ok.status, 200);
         assert_eq!(counter.load(Ordering::SeqCst), 1);
     }
@@ -545,7 +570,7 @@ mod tests {
         let now = Instant::now();
         let tok = ctx.sessions.issue(now);
 
-        let r = resp(route(&request("GET", "/api/download", &[], Some(&tok), b""), &ctx, now, today()));
+        let r = resp(route(&request("GET", "/api/download", &[], Some(&tok), b""), &ctx, ip(), now, today()));
         assert_eq!(r.status, 200);
 
         let archive = zip::ZipArchive::new(Cursor::new(r.body)).unwrap();
@@ -562,6 +587,7 @@ mod tests {
         let outcome = route(
             &request("GET", "/api/stream", &[("file", "widget")], Some(&tok), b""),
             &ctx,
+            ip(),
             now,
             today(),
         );
@@ -571,6 +597,7 @@ mod tests {
         let unauth = route(
             &request("GET", "/api/stream", &[("file", "widget")], None, b""),
             &ctx,
+            ip(),
             now,
             today(),
         );
@@ -581,11 +608,17 @@ mod tests {
     fn unknown_route_is_404() {
         let (_t, d) = dirs();
         let ctx = test_ctx(PathBuf::from("x"), d, Arc::new(AtomicUsize::new(0)));
-        let r = resp(route(&request("GET", "/nope", &[], None, b""), &ctx, Instant::now(), today()));
+        let r = resp(route(&request("GET", "/nope", &[], None, b""), &ctx, ip(), Instant::now(), today()));
         assert_eq!(r.status, 404);
     }
 
     fn today() -> NaiveDate {
         NaiveDate::from_ymd_opt(2026, 7, 25).unwrap()
+    }
+
+    /// Fixed client IP for router tests — the per-IP throttle keys on it, and a
+    /// single constant keeps all of a test's attempts on the same bucket.
+    fn ip() -> IpAddr {
+        IpAddr::from([127, 0, 0, 1])
     }
 }

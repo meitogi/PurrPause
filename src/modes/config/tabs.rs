@@ -56,10 +56,14 @@ pub struct TabsState {
     pub confirm_close: bool,
     pub save_error: Option<String>,
     pub new_palier_buffer: u32,
+    /// Value of `remote_logs_enabled` when the config UI opened. The Sécurité
+    /// tab compares the live toggle against it to warn that a service restart
+    /// is required (the accept loop is read once at service start, never live).
+    pub baseline_remote_logs_enabled: bool,
 }
 
 impl TabsState {
-    pub fn new() -> Self {
+    pub fn new(baseline_remote_logs_enabled: bool) -> Self {
         Self {
             active: Tab::General,
             dirty: false,
@@ -67,6 +71,7 @@ impl TabsState {
             confirm_close: false,
             save_error: None,
             new_palier_buffer: 20,
+            baseline_remote_logs_enabled,
         }
     }
 }
@@ -229,7 +234,14 @@ pub fn ui(
                     ui_notifications(ui, cfg, &mut state.dirty, &mut state.new_palier_buffer)
                 }
                 Tab::Security => {
-                    ui_security(ui, cfg, &mut state.dirty, &mut state.change_pwd, &mut trigger_uninstall);
+                    ui_security(
+                        ui,
+                        cfg,
+                        &mut state.dirty,
+                        &mut state.change_pwd,
+                        &mut trigger_uninstall,
+                        state.baseline_remote_logs_enabled,
+                    );
                 }
             });
         });
@@ -1247,6 +1259,7 @@ fn ui_security(
     dirty: &mut bool,
     change_pwd: &mut Option<ChangePwdDialog>,
     trigger_uninstall: &mut bool,
+    baseline_remote_logs_enabled: bool,
 ) {
 
     if ui
@@ -1261,6 +1274,26 @@ fn ui_security(
         .changed()
     {
         *dirty = true;
+    }
+    // The accept loop reads this flag once at service start, so a change only
+    // takes effect on restart. Warn while the live toggle differs from the
+    // value the config UI opened with (same orange framed idiom as the
+    // « Désactiver les intervals » box above).
+    if cfg.remote_logs_enabled != baseline_remote_logs_enabled {
+        egui::Frame::group(ui.style())
+            .fill(egui::Color32::from_rgba_premultiplied(60, 30, 20, 255))
+            .stroke(egui::Stroke::new(
+                1.5,
+                egui::Color32::from_rgb(220, 120, 60),
+            ))
+            .show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new(
+                        "⚠  Redémarrage du service requis pour appliquer ce changement.",
+                    )
+                    .strong(),
+                );
+            });
     }
     let url = format!("http://{}/", crate::remote::lan_host_port());
     ui.horizontal(|ui| {

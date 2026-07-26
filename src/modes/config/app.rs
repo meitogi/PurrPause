@@ -284,7 +284,7 @@ impl eframe::App for ConfigApp {
 
         match action {
             Some(Action::UnlockToTabs) | Some(Action::BackToTabs) => {
-                self.screen = Screen::Tabs(TabsState::new());
+                self.screen = Screen::Tabs(TabsState::new(self.cfg.remote_logs_enabled));
             }
             Some(Action::Close) => {
                 ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);

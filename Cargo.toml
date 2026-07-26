@@ -1,6 +1,6 @@
 [package]
 name = "purrpause"
-version = "1.11.0"
+version = "1.12.0"
 edition = "2021"
 license = "MIT"
 description = "Break-reminder overlay for Windows — camouflaged Windows Session Health Service"
@@ -55,6 +55,12 @@ zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2
 # PNG is needed (`png` feature) — skip jpeg/webp/gif to keep binary size
 # down.
 image = { version = "0.25.10", default-features = false, features = ["png"] }
+# Low-level socket construction for the LAN log console listener. Needed only
+# for SO_REUSEADDR: std::net::TcpListener::bind sets it on Linux but NOT on
+# Windows, so a quick service restart with a live SSE tab hits WSAEADDRINUSE
+# (10048) while port 8787 lingers in TIME_WAIT. Cross-platform (the listener
+# core compiles + is unit-tested on Linux), so it lives here, not the win block.
+socket2 = "0.6.5"
 
 # Windows-only deps — the actual UI + service layer. Gated so `cargo check`
 # on Linux doesn't pull GTK/WebKit through wry/eframe.
