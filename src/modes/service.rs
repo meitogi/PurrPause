@@ -40,6 +40,35 @@ pub(super) fn day_boundary_crossed(
     fired_local.date_naive() != today
 }
 
+/// Outcome of the per-tick "did the daily pause already fire today ?"
+/// decision, resolved from the persisted `daily_pause_fired_at`.
+pub(super) enum DailyFiredDecision {
+    /// No fire timestamp on record — not fired today, nothing to reset.
+    NotFired,
+    /// The stored fire happened today — `fired_today = true`.
+    FiredToday,
+    /// The stored fire is from a prior local date : the day rolled over.
+    /// The caller must clear the per-day markers — including
+    /// `daily_pause_fired_at` itself — so the reset runs ONCE, not every
+    /// tick (a stale timestamp left in place keeps re-clearing the palier
+    /// de-dup bitmask, which respawns the pre-notif countdown in a loop).
+    DayRolledOver,
+}
+
+/// Classify the persisted daily-fire timestamp against today's local
+/// date. Pure so the day-rollover reset is unit-testable without the
+/// tick loop. Reuses [`day_boundary_crossed`] for the date comparison.
+pub(super) fn resolve_daily_fired(
+    fired_local: Option<chrono::DateTime<chrono_tz::Tz>>,
+    today: chrono::NaiveDate,
+) -> DailyFiredDecision {
+    match fired_local {
+        None => DailyFiredDecision::NotFired,
+        Some(f) if day_boundary_crossed(f, today) => DailyFiredDecision::DayRolledOver,
+        Some(_) => DailyFiredDecision::FiredToday,
+    }
+}
+
 /// Cas D elapsed clamp : `min(elapsed_secs, duration_secs)` as `u32`.
 /// Extracted so the "dismiss immediately when elapsed >= duration"
 /// invariant is unit-testable without spawning a real popup.
@@ -106,6 +135,38 @@ mod tick_helper_tests {
         let fired = Paris.with_ymd_and_hms(2026, 7, 24, 9, 0, 0).unwrap();
         let today = NaiveDate::from_ymd_opt(2026, 7, 24).unwrap();
         assert!(!day_boundary_crossed(fired, today));
+    }
+
+    #[test]
+    fn resolve_daily_fired_none_is_not_fired() {
+        let today = NaiveDate::from_ymd_opt(2026, 7, 24).unwrap();
+        assert!(matches!(
+            resolve_daily_fired(None, today),
+            DailyFiredDecision::NotFired
+        ));
+    }
+
+    #[test]
+    fn resolve_daily_fired_same_day_is_fired_today() {
+        let fired = Paris.with_ymd_and_hms(2026, 7, 24, 12, 0, 0).unwrap();
+        let today = NaiveDate::from_ymd_opt(2026, 7, 24).unwrap();
+        assert!(matches!(
+            resolve_daily_fired(Some(fired), today),
+            DailyFiredDecision::FiredToday
+        ));
+    }
+
+    #[test]
+    fn resolve_daily_fired_prior_day_rolls_over() {
+        // The respawn-loop repro : yesterday's noon fire still on record
+        // while today is inside the pre-notif window. Must report
+        // DayRolledOver so the caller clears fired_at ONCE.
+        let fired = Paris.with_ymd_and_hms(2026, 7, 23, 12, 0, 0).unwrap();
+        let today = NaiveDate::from_ymd_opt(2026, 7, 24).unwrap();
+        assert!(matches!(
+            resolve_daily_fired(Some(fired), today),
+            DailyFiredDecision::DayRolledOver
+        ));
     }
 
     #[test]
@@ -1517,19 +1578,41 @@ mod win {
                     // clean. Kill-switch scoping : the scheduler already
                     // gates the daily branch on `enabled` alone (session 1
                     // moved Config::disabled inside the interval branch).
-                    let fired_today = match *daily_pause_fired_at {
-                        Some(ts) => {
-                            let fired_local = time_authority::in_configured_tz(config, ts);
-                            if super::day_boundary_crossed(fired_local, now_local.date_naive()) {
+                    let fired_local = daily_pause_fired_at
+                        .map(|ts| time_authority::in_configured_tz(config, ts));
+                    let fired_today =
+                        match super::resolve_daily_fired(fired_local, now_local.date_naive()) {
+                            super::DailyFiredDecision::DayRolledOver => {
+                                // Reset the per-day markers ONCE. Clearing
+                                // `daily_pause_fired_at` too is what stops the
+                                // reset re-firing every tick (a stale prior-day
+                                // timestamp otherwise keeps wiping the palier
+                                // de-dup bits, respawning the countdown widget
+                                // in a loop). Aligns with RearmDaily's clear.
                                 *daily_pause_fired_paliers_bits = 0;
                                 *daily_pause_skipped_today = None;
+                                *daily_pause_fired_at = None;
+                                if let Err(e) = runtime_dat::write(&runtime_dat::RuntimeState {
+                                    last_popup: *last_popup,
+                                    paused_secs: *paused_secs,
+                                    popup_pending: *popup_pending,
+                                    last_heartbeat: *last_heartbeat,
+                                    last_clean_shutdown_at: SystemTime::UNIX_EPOCH,
+                                    daily_pause_fired_at: None,
+                                    daily_pause_fired_paliers_bits: 0,
+                                    daily_pause_skipped_today: None,
+                                    popup_pid: *popup_pid,
+                                }) {
+                                    tracing::warn!(
+                                        error = ?e,
+                                        "write runtime.dat failed (daily day-boundary reset)"
+                                    );
+                                }
                                 false
-                            } else {
-                                true
                             }
-                        }
-                        None => false,
-                    };
+                            super::DailyFiredDecision::FiredToday => true,
+                            super::DailyFiredDecision::NotFired => false,
+                        };
                     let daily_state = build_daily_pause_state(
                         config,
                         now_local,
