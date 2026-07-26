@@ -997,17 +997,47 @@ mod win {
                     tracing::info!("config reload triggered");
                     let state_path = PathBuf::from(STATE_DAT);
                     let old_daily = config.daily_pause.clone();
+                    let old_interval_hours = config.interval_hours;
                     *config = config::load_or_default(&state_path);
                     tracing::info!(
                         count_active_time = config.count_active_time,
                         "reload: active-time accounting effective mode"
                     );
                     let now = SystemTime::now();
+                    // A changed general-pause interval restarts the cycle
+                    // from now : the user just set "every N", so the next
+                    // popup must fire exactly N after Save — not N offset
+                    // by the old last_popup + banked paused_secs, which
+                    // fires early/late and reads as a bug. Reset both so
+                    // the deadline (last_popup + interval + paused_secs)
+                    // collapses to now + interval.
+                    if config.interval_hours != old_interval_hours {
+                        tracing::info!(
+                            old_hours = old_interval_hours,
+                            new_hours = config.interval_hours,
+                            "reload: interval changed - restarting cycle (last_popup=now, paused_secs=0)",
+                        );
+                        *last_popup = now;
+                        *paused_secs = 0;
+                        *last_heartbeat = now;
+                        let _ = runtime_dat::write(&runtime_dat::RuntimeState {
+                            last_popup: *last_popup,
+                            paused_secs: 0,
+                            popup_pending: *popup_pending,
+                            last_heartbeat: *last_heartbeat,
+                            last_clean_shutdown_at: SystemTime::UNIX_EPOCH,
+                            daily_pause_fired_at: *daily_pause_fired_at,
+                            daily_pause_fired_paliers_bits: *daily_pause_fired_paliers_bits,
+                            daily_pause_skipped_today: *daily_pause_skipped_today,
+                            popup_pid: *popup_pid,
+                        });
+                    }
                     // If the user reduced interval_hours enough that
                     // `last_popup + new_interval` lands in the past
                     // (or within RELOAD_MIN_GRACE), bump last_popup
                     // forward so the next popup fires at now+2min
-                    // rather than instantly on Save.
+                    // rather than instantly on Save. No-op right after an
+                    // interval-change reset above (last_popup is now).
                     let clamped = scheduler::resolve_last_popup(
                         scheduler::ResolveInputs {
                             now,
