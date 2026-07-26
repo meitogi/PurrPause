@@ -21,6 +21,11 @@
 // Pure codecs / filters / predicates are Linux-testable ; only the
 // actual registry syscalls are `#[cfg(windows)]`.
 
+// Most of this module's surface is reached only through #[cfg(windows)]
+// callers, so it looks dead on the Linux dev build. Enforcement stays on
+// for the shipping Windows target.
+#![cfg_attr(not(windows), allow(dead_code))]
+
 use std::path::Path;
 
 use anyhow::Result;
@@ -74,12 +79,10 @@ pub fn filter_pending_rename_operations(
         .map(|p| p.to_string_lossy().to_lowercase())
         .collect();
     entries
-        .iter()
-        .cloned()
-        .filter(|(src, _dst)| {
+        .iter().filter(|&(src, _dst)| {
             let stripped = src.strip_prefix(r"\??\").unwrap_or(src).to_lowercase();
-            !exclude_lc.iter().any(|ex| stripped == *ex)
-        })
+            !exclude_lc.contains(&stripped)
+        }).cloned()
         .collect()
 }
 

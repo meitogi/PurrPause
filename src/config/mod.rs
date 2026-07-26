@@ -1,3 +1,8 @@
+// Most of this module's surface is reached only through #[cfg(windows)]
+// callers, so it looks dead on the Linux dev build. Enforcement stays on
+// for the shipping Windows target.
+#![cfg_attr(not(windows), allow(dead_code))]
+
 pub mod crypto;
 pub mod defaults;
 pub mod schema;

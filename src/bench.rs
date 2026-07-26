@@ -8,6 +8,11 @@
 // row formatting. The win32 sampling itself (Toolhelp / PDH / PSAPI)
 // is in `platform::win32::proc_sample`.
 
+// Most of this module's surface is reached only through #[cfg(windows)]
+// callers, so it looks dead on the Linux dev build. Enforcement stays on
+// for the shipping Windows target.
+#![cfg_attr(not(windows), allow(dead_code))]
+
 /// Column header of `Data\Logs\bench.log`. One row per sampled process
 /// per tick, plus one `role=total` aggregate row per tick.
 pub const TSV_HEADER: &str = "timestamp\tfilename\textension\trenderer\tpid\trole\tcpu_ms\tcpu_pct\tgpu_pct\tgpu_mem_bytes\tworkingset_bytes\tprivate_bytes";

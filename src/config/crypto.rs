@@ -7,6 +7,11 @@
 // Linux exercising the serde+file-IO pipeline. The devcontainer can't
 // exec .exe, and real host smoke does the actual DPAPI validation.
 
+// Most of this module's surface is reached only through #[cfg(windows)]
+// callers, so it looks dead on the Linux dev build. Enforcement stays on
+// for the shipping Windows target.
+#![cfg_attr(not(windows), allow(dead_code))]
+
 use anyhow::Result;
 
 #[cfg(windows)]

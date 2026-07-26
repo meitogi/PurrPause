@@ -6,6 +6,11 @@
 // (protects against brute-force + timing side-channels). Expiry
 // auto-resets the counter on the next `check`.
 
+// Most of this module's surface is reached only through #[cfg(windows)]
+// callers, so it looks dead on the Linux dev build. Enforcement stays on
+// for the shipping Windows target.
+#![cfg_attr(not(windows), allow(dead_code))]
+
 use std::time::{Duration, Instant};
 
 pub const MAX_ATTEMPTS: u8 = 3;

@@ -45,7 +45,7 @@ use crate::platform::argv::build_command_line;
 
 const NO_USER_SESSION: u32 = 0xFFFFFFFF;
 
-/// Message marker used by [`spawn_in_active_user_session`] when the OS
+/// Message marker used by [`spawn_in_active_user_session_with_env`] when the OS
 /// has no active console session. Matched by
 /// [`is_user_session_not_ready`] so callers can pick a benign log level
 /// during the boot window where the user hasn't finished logging in
@@ -136,7 +136,7 @@ impl crate::platform::ChildHandle for SpawnedChild {
     }
 }
 
-/// Production `Spawner` : wraps `spawn_in_active_user_session`. Zero
+/// Production `Spawner` : wraps `spawn_in_active_user_session_with_env`. Zero
 /// state ; passed as `&RealSpawner` at every call site so the trait dispatch
 /// stays statically monomorphized (no dyn overhead) and LTO absorbs it.
 pub(crate) struct RealSpawner;
@@ -154,10 +154,6 @@ impl crate::platform::Spawner for RealSpawner {
     ) -> Result<SpawnedChild> {
         spawn_in_active_user_session_with_env(exe, args, env)
     }
-}
-
-pub fn spawn_in_active_user_session(exe: &Path, args: &[&OsStr]) -> Result<SpawnedChild> {
-    spawn_in_active_user_session_with_env(exe, args, &[])
 }
 
 pub fn spawn_in_active_user_session_with_env(

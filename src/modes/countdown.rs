@@ -14,6 +14,11 @@
 // its `fired_paliers` set — the next palier boundary spawns a fresh
 // widget on its own schedule.
 
+// Most of this module's surface is reached only through #[cfg(windows)]
+// callers, so it looks dead on the Linux dev build. Enforcement stays on
+// for the shipping Windows target.
+#![cfg_attr(not(windows), allow(dead_code))]
+
 use crate::config::{Config, PreNotif};
 
 /// Substitutes `{mm}`, `{ss}`, `{total_min}` in the template. Unknown

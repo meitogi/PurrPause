@@ -179,7 +179,7 @@ fn utf16_z(s: &str) -> Vec<u8> {
 
 /// Pad `buf` to a 4-byte boundary by appending zero bytes.
 fn pad4(buf: &mut Vec<u8>) {
-    while buf.len() % 4 != 0 {
+    while !buf.len().is_multiple_of(4) {
         buf.push(0);
     }
 }

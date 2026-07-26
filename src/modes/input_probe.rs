@@ -1,5 +1,5 @@
 // User-session input probe. Spawned by the service via
-// `platform::win32::spawn_user::spawn_in_active_user_session`, runs
+// `platform::win32::spawn_user::spawn_in_active_user_session_with_env`, runs
 // as the console user, polls `GetLastInputInfo` in a loop, and pushes
 // the absolute tick of the last input to the SYSTEM service over the
 // existing named-pipe IPC (`Message::InputStamp`).

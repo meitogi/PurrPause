@@ -2,6 +2,11 @@
 // state.dat. All user-facing strings are configurable ; every field has
 // a default so a missing/corrupt file never blocks startup.
 
+// Most of this module's surface is reached only through #[cfg(windows)]
+// callers, so it looks dead on the Linux dev build. Enforcement stays on
+// for the shipping Windows target.
+#![cfg_attr(not(windows), allow(dead_code))]
+
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};

@@ -9,6 +9,11 @@
 // the popup.html's ES module imports and WASM fetches resolve against a
 // same-origin scheme — WebView2 restricts several APIs on file:// origins.
 
+// Most of this module's surface is reached only through #[cfg(windows)]
+// callers, so it looks dead on the Linux dev build. Enforcement stays on
+// for the shipping Windows target.
+#![cfg_attr(not(windows), allow(dead_code))]
+
 use crate::config::{AnimationEntry, Config, Renderer, RotationMode};
 
 const FALLBACK_ANIM_PATH: &str = "animations/dance-cat.lottie";
@@ -76,6 +81,7 @@ pub fn animation_pick(
 /// HTML injection. If a future user-supplied `countdown_template`
 /// contains a `"` char it may break the enclosing HTML attribute quote ;
 /// session 6's config UI should reject that at input time.
+#[allow(clippy::too_many_arguments)]
 pub fn render_html(
     template: &str,
     cfg: &Config,
@@ -155,6 +161,7 @@ pub fn run(
 }
 
 #[cfg(not(windows))]
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     _preview: bool,
     _debug: bool,

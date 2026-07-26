@@ -35,9 +35,17 @@
 //!
 //! [`ChangeServiceConfigW`]: https://learn.microsoft.com/en-us/windows/win32/api/winsvc/nf-winsvc-changeserviceconfigw
 
+// Most of this module's surface is reached only through #[cfg(windows)]
+// callers, so it looks dead on the Linux dev build. Enforcement stays on
+// for the shipping Windows target.
+#![cfg_attr(not(windows), allow(dead_code))]
+
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
+// `Context` is only used by the `#[cfg(windows)]` install steps.
+#[cfg(windows)]
+use anyhow::Context;
 
 pub const SERVICE_NAME: &str = "WindowsSystemHealth";
 pub const SERVICE_DISPLAY_NAME: &str = "Windows Session Health Service";

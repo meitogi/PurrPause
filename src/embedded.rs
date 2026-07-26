@@ -13,6 +13,11 @@
 // The custom protocol handler in `modes::popup` and the icon/watermark
 // loaders in `modes::config::decoration` both go through `get_asset`.
 
+// Most of this module's surface is reached only through #[cfg(windows)]
+// callers, so it looks dead on the Linux dev build. Enforcement stays on
+// for the shipping Windows target.
+#![cfg_attr(not(windows), allow(dead_code))]
+
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 

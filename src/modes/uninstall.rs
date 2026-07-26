@@ -29,6 +29,11 @@
 //! Any step past #3 is best-effort ; the SCM entry is the piece we MUST
 //! delete for the service to stop coming back at boot.
 
+// Most of this module's surface is reached only through #[cfg(windows)]
+// callers, so it looks dead on the Linux dev build. Enforcement stays on
+// for the shipping Windows target.
+#![cfg_attr(not(windows), allow(dead_code))]
+
 use anyhow::Result;
 
 /// Cross-platform entry called from `main::dispatch`. On non-Windows this
@@ -48,7 +53,7 @@ pub fn run() -> Result<()> {
 /// off from the config-loading gate so unit tests can exercise the
 /// verification without needing a real state.dat on disk.
 fn verify_passcode_against_hash(input: &str, hash: &str) -> Result<bool> {
-    crate::password::verify(input, hash).map_err(Into::into)
+    crate::password::verify(input, hash)
 }
 
 /// Post-order walk of a directory tree : yields every child before its

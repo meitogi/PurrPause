@@ -421,7 +421,7 @@ pub fn preview_minutes(
     };
     let delta = next.duration_since(now).unwrap_or(Duration::ZERO);
     // Ceil so "dans 0 min" never appears when the clamp actually holds.
-    (delta.as_secs() + 59) / 60
+    delta.as_secs().div_ceil(60)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -527,6 +527,7 @@ impl Default for DailyPauseState {
 /// interval branch — the daily-pause branch honors its own
 /// `DailyPauseState::enabled` flag. This mirrors the "Two orthogonal
 /// switches" decision in the ROLLOUT.
+#[allow(clippy::too_many_arguments)]
 pub fn next_event(
     now: SystemTime,
     config: &Config,

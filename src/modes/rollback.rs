@@ -9,6 +9,8 @@
 // The binary itself is never deleted — the user placed it, they own its
 // disposition.
 
+// `Path` is only used by the `#[cfg(windows)]` teardown steps.
+#[cfg(windows)]
 use std::path::Path;
 
 use anyhow::Result;

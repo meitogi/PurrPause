@@ -2,6 +2,11 @@
 // logic is pure Rust (no Win32 calls) so it lives outside `win32/` and
 // its unit tests run under `cargo test` on Linux.
 
+// Most of this module's surface is reached only through #[cfg(windows)]
+// callers, so it looks dead on the Linux dev build. Enforcement stays on
+// for the shipping Windows target.
+#![cfg_attr(not(windows), allow(dead_code))]
+
 use std::ffi::OsStr;
 use std::path::Path;
 
@@ -16,6 +21,7 @@ use std::path::Path;
 ///   - 2n backslashes then `"` → n backslashes + `"` starts/ends a quoted section
 ///   - 2n+1 backslashes then `"` → n backslashes + a literal `"`
 ///   - n backslashes NOT before `"` → n literal backslashes
+///
 /// Arguments containing space / tab / quote are wrapped in `"..."`.
 /// Empty arguments become `""`.
 pub fn build_command_line(exe: &Path, args: &[&OsStr]) -> Vec<u16> {

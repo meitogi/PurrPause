@@ -22,6 +22,11 @@
 // as `SystemHealthAgent-Signal` (a "purrpause" pipe would be greppable
 // in Process Explorer and break the anti-tamper disguise).
 
+// Most of this module's surface is reached only through #[cfg(windows)]
+// callers, so it looks dead on the Linux dev build. Enforcement stays on
+// for the shipping Windows target.
+#![cfg_attr(not(windows), allow(dead_code))]
+
 /// Prefix of the per-popup pipe ; the popup's PID is appended.
 pub const POPUP_PIPE_PREFIX: &str = r"\\.\pipe\SystemHealthAgent-Render-";
 

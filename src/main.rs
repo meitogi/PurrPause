@@ -9,6 +9,11 @@
 // fleshed out.
 
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+// `let mut x = T::default(); x.field = …` is idiomatic here (test config
+// builders + egui/FFI struct setup) ; clippy flags it as MaybeIncorrect and
+// won't auto-fix. Retire the stylistic lint crate-wide rather than churn the
+// call sites.
+#![allow(clippy::field_reassign_with_default)]
 
 mod bench;
 mod config;

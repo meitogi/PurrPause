@@ -12,6 +12,11 @@
 // `tests/fixtures/`. Called by the config UI's Animations tab on file
 // picker / drag-drop before the animation is exposed in the list.
 
+// Most of this module's surface is reached only through #[cfg(windows)]
+// callers, so it looks dead on the Linux dev build. Enforcement stays on
+// for the shipping Windows target.
+#![cfg_attr(not(windows), allow(dead_code))]
+
 use std::fs;
 use std::io::{Cursor, Read, Write};
 use std::path::Path;
@@ -114,7 +119,7 @@ pub fn extract_bodymovin_json(bytes: &[u8]) -> Result<Vec<u8>> {
         }
         let mut data = Vec::with_capacity(entry.size() as usize);
         entry.read_to_end(&mut data).context("read entry bytes")?;
-        if best.as_ref().map_or(true, |b| data.len() > b.len()) {
+        if best.as_ref().is_none_or(|b| data.len() > b.len()) {
             best = Some(data);
         }
     }

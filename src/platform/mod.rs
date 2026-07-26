@@ -1,3 +1,8 @@
+// Most of this module's surface is reached only through #[cfg(windows)]
+// callers, so it looks dead on the Linux dev build. Enforcement stays on
+// for the shipping Windows target.
+#![cfg_attr(not(windows), allow(dead_code))]
+
 pub mod argv;
 pub mod registry;
 
@@ -22,7 +27,7 @@ pub(crate) trait ChildHandle: Send + Sync {
     fn pid(&self) -> u32;
 }
 
-/// Factory for `ChildHandle` instances. `spawn_in_active_user_session`
+/// Factory for `ChildHandle` instances. `spawn_in_active_user_session_with_env`
 /// is the sole production impl (via [`crate::platform::win32::spawn_user::RealSpawner`]) ;
 /// unit tests inject a fake so the kill-previous state machine can be
 /// exercised without touching the Windows API.
@@ -98,6 +103,7 @@ pub(crate) enum UpdateOrSpawn<C> {
 /// (spawn-first, kill-on-success — a stale popup beats none at all).
 /// `send` is injected so Linux tests can fake the pipe ; the generic
 /// `M` keeps `platform/` free of an `ipc_popup` dependency.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn update_or_spawn_replacing_with_env<S: Spawner, M>(
     spawner: &S,
     exe: &Path,
