@@ -19,6 +19,7 @@ mod lottie_sanitize;
 mod modes;
 mod password;
 mod platform;
+mod remote;
 mod runtime_dat;
 mod scheduler;
 mod signals;
