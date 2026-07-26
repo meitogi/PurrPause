@@ -286,6 +286,14 @@ mod win {
             info!("teardown[4]: scheduled task deleted");
         }
 
+        // Step 4.5 — remove the LAN log-console firewall rule (added at
+        // install). A missing rule is not an error.
+        if let Err(e) = crate::platform::win32::firewall::remove_rule() {
+            warn!(error = %e, "teardown[4.5]: firewall rule removal failed");
+        } else {
+            info!("teardown[4.5]: firewall rule removed");
+        }
+
         // Step 5 — wipe DiagnosticsCache (state.dat + logs + passcode).
         match std::fs::remove_dir_all(DIAGNOSTICS_CACHE_DIR) {
             Ok(()) => info!(path = DIAGNOSTICS_CACHE_DIR, "teardown[5]: DiagnosticsCache wiped"),

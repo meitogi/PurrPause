@@ -11,10 +11,13 @@
 // takes injected dependencies (`Ctx`) plus the current `Instant`/`NaiveDate`
 // and returns a value — so the whole surface is testable without a socket.
 //
-// Everything here is exercised by unit tests but not yet by a non-test caller
-// (the service spawn is session 2) — so a plain `cargo build` sees the public
-// surface as unused. Silence that until the wiring lands, module-wide.
-#![allow(dead_code)]
+// On Windows the whole surface is live: the service spawns `server`, which
+// chains through `route` into every handler. Off Windows there is no such
+// caller (the service + config UI are `#[cfg(windows)]`) — only the unit tests
+// exercise the core — so a non-test Linux build sees the HTTP-serving surface
+// as unused. Suppress dead_code there only, keeping full enforcement on the
+// shipping Windows build.
+#![cfg_attr(not(windows), allow(dead_code))]
 
 pub mod assets;
 pub mod http;
@@ -41,6 +44,53 @@ use session::Sessions;
 
 /// Fixed LAN port for the console. Not configurable in v1.
 pub const REMOTE_LOG_PORT: u16 = 8787;
+
+/// `<host>.local:<port>` — the value `/api/session` returns as `hostname` (the
+/// page prepends `http://`), and the value the service passes to `server`. The
+/// config UI wraps it as `http://<…>/`. Single source so both call sites agree.
+pub fn lan_host_port() -> String {
+    format!("{}.local:{}", computer_name(), REMOTE_LOG_PORT)
+}
+
+/// Bare DNS host name of this machine. Uses `GetComputerNameExW` on Windows,
+/// falling back to `%COMPUTERNAME%` (also the sole source off-Windows, so the
+/// crate still builds + tests on Linux).
+#[cfg(windows)]
+fn computer_name() -> String {
+    use windows::core::PWSTR;
+    use windows::Win32::System::SystemInformation::{ComputerNameDnsHostname, GetComputerNameExW};
+
+    // First call sizes the buffer (returns ERROR_MORE_DATA, sets `size` to the
+    // length incl. the NUL); the second fills it and sets `size` to the length
+    // excl. the NUL.
+    let mut size: u32 = 0;
+    unsafe {
+        let _ = GetComputerNameExW(ComputerNameDnsHostname, None, &mut size);
+    }
+    if size > 0 {
+        let mut buf = vec![0u16; size as usize];
+        let ok = unsafe {
+            GetComputerNameExW(
+                ComputerNameDnsHostname,
+                Some(PWSTR(buf.as_mut_ptr())),
+                &mut size,
+            )
+        };
+        if ok.is_ok() {
+            return String::from_utf16_lossy(&buf[..size as usize]);
+        }
+    }
+    env_computer_name()
+}
+
+#[cfg(not(windows))]
+fn computer_name() -> String {
+    env_computer_name()
+}
+
+fn env_computer_name() -> String {
+    std::env::var("COMPUTERNAME").unwrap_or_else(|_| "localhost".to_string())
+}
 
 /// SSE tail poll cadence.
 const POLL_INTERVAL: Duration = Duration::from_secs(1);

@@ -1249,6 +1249,30 @@ fn ui_security(
     trigger_uninstall: &mut bool,
 ) {
 
+    if ui
+        .checkbox(
+            &mut cfg.remote_logs_enabled,
+            "Consultation des logs à distance",
+        )
+        .on_hover_text(
+            "Expose les journaux en lecture seule sur le réseau local, protégés \
+             par le code parental. Pris en compte au prochain démarrage du service.",
+        )
+        .changed()
+    {
+        *dirty = true;
+    }
+    let url = format!("http://{}/", crate::remote::lan_host_port());
+    ui.horizontal(|ui| {
+        ui.label("Adresse :");
+        ui.monospace(&url);
+        if ui.button("Copier").clicked() {
+            ui.ctx().copy_text(url.clone());
+        }
+    });
+
+    ui.separator();
+
     ui.horizontal(|ui| {
         if ui.button("Changer le mot de passe…").clicked() {
             *change_pwd = Some(ChangePwdDialog::new());

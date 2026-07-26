@@ -1,6 +1,7 @@
 pub mod acl;
 pub mod busy_detector;
 pub mod dpapi;
+pub mod firewall;
 pub mod fullscreen_detect;
 pub mod gamepad;
 pub mod hidden_attrs;

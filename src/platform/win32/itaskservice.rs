@@ -75,7 +75,10 @@ pub fn update_watchdog_action(exe_path: &Path) -> Result<()> {
     register_watchdog(exe_path)
 }
 
-fn with_com<F, R>(body: F) -> Result<R>
+/// Run `body` between a paired `CoInitializeEx` / `CoUninitialize`, tolerating
+/// a thread whose COM apartment was already initialized elsewhere. Shared with
+/// the firewall module (`super::firewall`) — the second COM consumer.
+pub(crate) fn with_com<F, R>(body: F) -> Result<R>
 where
     F: FnOnce() -> Result<R>,
 {

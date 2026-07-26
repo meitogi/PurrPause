@@ -180,6 +180,13 @@ pub struct Config {
     #[serde(default)]
     pub passcode_hash: String,
 
+    /// When `true`, the service exposes the read-only LAN log console on
+    /// `http://<host>.local:8787/`. Default `false` (off until the parent
+    /// opts in). Read once at service start — toggling it takes effect at
+    /// the next service start, not on live `Reload`.
+    #[serde(default = "d::remote_logs_enabled")]
+    pub remote_logs_enabled: bool,
+
     #[serde(default)]
     pub disabled: bool,
 

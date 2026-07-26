@@ -119,6 +119,11 @@ pub mod d {
     pub const fn use_system_clock() -> bool {
         false
     }
+    /// Remote LAN log console off by default — the parent enables it in the
+    /// Sécurité tab. Server OFF until opted in.
+    pub const fn remote_logs_enabled() -> bool {
+        false
+    }
     pub const fn daily_pause_enabled() -> bool {
         true
     }

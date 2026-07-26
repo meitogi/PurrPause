@@ -334,7 +334,10 @@ mod win {
 
     use crate::config::{self, Config};
     use crate::ipc::{self, Message};
-    use crate::modes::install::{webview2_dir, DIAGNOSTICS_CACHE_DIR, SERVICE_NAME, STATE_DAT};
+    use crate::modes::install::{
+        logs_dir, webview2_dir, DIAGNOSTICS_CACHE_DIR, SERVICE_NAME, STATE_DAT,
+    };
+    use crate::remote::logs::LogDirs;
     use crate::platform::win32::proc_kill::{is_pid_alive, kill_orphan_webview2_workers};
     use crate::platform::win32::spawn_user::{RealSpawner, SpawnedChild};
     use crate::platform::win32::{gamepad, idle, power_notify};
@@ -617,6 +620,38 @@ mod win {
 
         let notify_running_flag = Arc::new(AtomicBool::new(true));
         let notify_thread = spawn_notify(tx.clone(), notify_running_flag.clone());
+
+        // Remote LAN log console. Read-only HTTP/1.1 + SSE (src/remote), bound
+        // to 0.0.0.0:8787, reachable at http://<host>.local:8787/. Gated on the
+        // config flag, read once here — toggling it takes effect at the next
+        // service start (the blocking accept loop is never torn down live). The
+        // pause button pushes TickCommand::Trigger through the same channel the
+        // pipe uses, keeping TickCommand private to this module.
+        if config.remote_logs_enabled {
+            let cfg_path = state_path.clone();
+            let log_dirs = {
+                let logs = env::current_exe()
+                    .ok()
+                    .and_then(|p| p.parent().map(logs_dir))
+                    .unwrap_or_default();
+                LogDirs {
+                    diagnostics: PathBuf::from(DIAGNOSTICS_CACHE_DIR),
+                    logs,
+                }
+            };
+            let host = crate::remote::lan_host_port();
+            let trigger = {
+                let tx = tx.clone();
+                move || {
+                    let _ = tx.send(TickCommand::Trigger);
+                }
+            };
+            thread::spawn(move || {
+                if let Err(e) = crate::remote::server(cfg_path, log_dirs, host, trigger) {
+                    tracing::error!(error = %e, "remote log server exited");
+                }
+            });
+        }
 
         // Background wall-time sync loop. NTP UDP first, HTTPS Date-header
         // fallback. On success sleep 6h ; on failure sleep 10min (short

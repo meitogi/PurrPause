@@ -266,6 +266,15 @@ fn fresh_install(current_exe: &Path) -> Result<()> {
     register_service(current_exe).context("step 7: register service")?;
     tracing::info!("step 7: service registered");
 
+    // Step 7.5 : inbound firewall rule for the LAN log console (TCP 8787,
+    // Private+Domain, exe-scoped). Non-fatal — the console is opt-in (config
+    // default off), so a missing rule only means it's unreachable until added
+    // manually; it must not abort an otherwise-good install.
+    match crate::platform::win32::firewall::add_rule(current_exe) {
+        Ok(()) => tracing::info!("step 7.5: firewall rule added"),
+        Err(e) => tracing::warn!(error = %e, "step 7.5: firewall rule not added"),
+    }
+
     // Step 8 : block on first-run wizard — SKIP if state.dat already
     // has a passcode. This handles the "PathUpdate failed → FreshInstall
     // fallback" recovery path : the parent already went through the
