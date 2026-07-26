@@ -117,6 +117,11 @@ pub struct Ctx {
     /// Resets the next interval pause (preserving the noon pause) — the
     /// service builds this from `mpsc::Sender<TickCommand>`.
     trigger_pause: Box<dyn Fn() + Send + Sync>,
+    /// Resets the interval cycle, closes any open popup and dismisses any
+    /// heads-up widget — without showing a popup and without marking the
+    /// daily pause done. Built from `mpsc::Sender<TickCommand>` like
+    /// `trigger_pause`.
+    reset_pause: Box<dyn Fn() + Send + Sync>,
 }
 
 impl Ctx {
@@ -125,6 +130,7 @@ impl Ctx {
         dirs: LogDirs,
         hostname: String,
         trigger_pause: Box<dyn Fn() + Send + Sync>,
+        reset_pause: Box<dyn Fn() + Send + Sync>,
     ) -> Self {
         Ctx {
             cfg_path,
@@ -133,6 +139,7 @@ impl Ctx {
             throttle: IpThrottle::new(),
             hostname,
             trigger_pause,
+            reset_pause,
         }
     }
 }
@@ -221,6 +228,14 @@ pub fn route(
             Resp(Response::ok_json(r#"{"ok":true}"#))
         }
 
+        ("POST", "/api/reset") => {
+            if !authed {
+                return Resp(Response::unauthorized());
+            }
+            (ctx.reset_pause)();
+            Resp(Response::ok_json(r#"{"ok":true}"#))
+        }
+
         _ => Resp(Response::not_found()),
     }
 }
@@ -306,11 +321,24 @@ fn build_zip(dirs: &LogDirs, today: NaiveDate, scope: DownloadScope) -> io::Resu
 /// Bind `0.0.0.0:REMOTE_LOG_PORT` and serve thread-per-connection. Cross-
 /// platform (std::net), so it compiles + could be smoke-tested on Linux, but
 /// it is not spawned anywhere yet — session 2 calls this from the service.
-pub fn server<F>(cfg_path: PathBuf, dirs: LogDirs, hostname: String, trigger_pause: F) -> io::Result<()>
+pub fn server<F, G>(
+    cfg_path: PathBuf,
+    dirs: LogDirs,
+    hostname: String,
+    trigger_pause: F,
+    reset_pause: G,
+) -> io::Result<()>
 where
     F: Fn() + Send + Sync + 'static,
+    G: Fn() + Send + Sync + 'static,
 {
-    let ctx = Arc::new(Ctx::new(cfg_path, dirs, hostname, Box::new(trigger_pause)));
+    let ctx = Arc::new(Ctx::new(
+        cfg_path,
+        dirs,
+        hostname,
+        Box::new(trigger_pause),
+        Box::new(reset_pause),
+    ));
     // Build the listener via socket2 so SO_REUSEADDR is set before bind. std's
     // TcpListener::bind sets it on Linux but not on Windows, where a live SSE
     // tab leaves the port in TIME_WAIT across a quick service restart (10048).
@@ -398,6 +426,26 @@ mod tests {
             "child.local:8787".to_string(),
             Box::new(move || {
                 counter.fetch_add(1, Ordering::SeqCst);
+            }),
+            Box::new(|| {}),
+        )
+    }
+
+    fn test_ctx_with_reset(
+        cfg_path: PathBuf,
+        dirs: LogDirs,
+        trigger_counter: Arc<AtomicUsize>,
+        reset_counter: Arc<AtomicUsize>,
+    ) -> Ctx {
+        Ctx::new(
+            cfg_path,
+            dirs,
+            "child.local:8787".to_string(),
+            Box::new(move || {
+                trigger_counter.fetch_add(1, Ordering::SeqCst);
+            }),
+            Box::new(move || {
+                reset_counter.fetch_add(1, Ordering::SeqCst);
             }),
         )
     }
@@ -589,6 +637,26 @@ mod tests {
         let ok = resp(route(&request("POST", "/api/pause", &[], Some(&tok), b""), &ctx, ip(), now, today()));
         assert_eq!(ok.status, 200);
         assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn reset_fires_closure_only_when_authed() {
+        let (_t, d) = dirs();
+        let trigger = Arc::new(AtomicUsize::new(0));
+        let reset = Arc::new(AtomicUsize::new(0));
+        let ctx = test_ctx_with_reset(PathBuf::from("x"), d, Arc::clone(&trigger), Arc::clone(&reset));
+        let now = Instant::now();
+
+        let unauth = resp(route(&request("POST", "/api/reset", &[], None, b""), &ctx, ip(), now, today()));
+        assert_eq!(unauth.status, 401);
+        assert_eq!(reset.load(Ordering::SeqCst), 0);
+
+        let tok = ctx.sessions.issue(now);
+        let ok = resp(route(&request("POST", "/api/reset", &[], Some(&tok), b""), &ctx, ip(), now, today()));
+        assert_eq!(ok.status, 200);
+        assert_eq!(reset.load(Ordering::SeqCst), 1);
+        // Reset must not fire the interval-trigger closure.
+        assert_eq!(trigger.load(Ordering::SeqCst), 0);
     }
 
     #[test]

@@ -10,6 +10,7 @@
 //        + 1 flag byte (bit0 audio,
 //          bit1 smtc — 0x00..=0x03)  InputStamp
 //   0x05                             RearmDailyPause
+//   0x06                             ResetPause
 //
 // Pipe name blends into native Windows-service pipe conventions
 // (`SystemEventsBroker-*`, `TrustedInstaller-Rpc`, ...). Explicit SDDL
@@ -53,6 +54,11 @@ pub enum Message {
     /// state the running service holds (a bare runtime.dat edit would be
     /// ignored until the next service boot).
     RearmDailyPause,
+    /// Reset the interval cycle, close any open popup and dismiss any
+    /// heads-up (countdown) widget — without showing a popup and without
+    /// marking the daily (noon) pause done. Sent from the remote console's
+    /// "Réinitialiser" button.
+    ResetPause,
 }
 
 impl Message {
@@ -72,6 +78,7 @@ impl Message {
                 })
             }
             [0x05] => Some(Message::RearmDailyPause),
+            [0x06] => Some(Message::ResetPause),
             _ => None,
         }
     }
@@ -91,6 +98,7 @@ impl Message {
                 v
             }
             Message::RearmDailyPause => vec![0x05],
+            Message::ResetPause => vec![0x06],
         }
     }
 }
@@ -518,6 +526,11 @@ mod tests {
     }
 
     #[test]
+    fn parse_reset_pause_byte() {
+        assert_eq!(Message::parse(&[0x06]), Some(Message::ResetPause));
+    }
+
+    #[test]
     fn parse_empty_returns_none() {
         assert_eq!(Message::parse(&[]), None);
     }
@@ -602,6 +615,7 @@ mod tests {
             Message::Reload,
             Message::Shutdown,
             Message::RearmDailyPause,
+            Message::ResetPause,
         ] {
             let bytes = m.to_bytes();
             assert_eq!(bytes.len(), 1, "{m:?} must encode to 1 byte");
@@ -637,6 +651,11 @@ mod tests {
     #[test]
     fn client_wire_shape_shutdown_is_0x03() {
         assert_eq!(Message::Shutdown.to_bytes(), vec![0x03]);
+    }
+
+    #[test]
+    fn client_wire_shape_reset_is_0x06() {
+        assert_eq!(Message::ResetPause.to_bytes(), vec![0x06]);
     }
 
     #[test]

@@ -383,6 +383,7 @@ mod win {
         Reload,
         Shutdown,
         RearmDaily,
+        ResetPause,
     }
 
     define_windows_service!(ffi_service_main, service_main);
@@ -646,8 +647,14 @@ mod win {
                     let _ = tx.send(TickCommand::Trigger);
                 }
             };
+            let reset = {
+                let tx = tx.clone();
+                move || {
+                    let _ = tx.send(TickCommand::ResetPause);
+                }
+            };
             thread::spawn(move || {
-                if let Err(e) = crate::remote::server(cfg_path, log_dirs, host, trigger) {
+                if let Err(e) = crate::remote::server(cfg_path, log_dirs, host, trigger, reset) {
                     tracing::error!(error = %e, "remote log server exited");
                 }
             });
@@ -806,6 +813,7 @@ mod win {
                 &mut last_heartbeat,
                 &mut fired,
                 &mut last_popup_child,
+                &mut last_widget_children,
                 &config.passcode_hash,
                 daily_pause_fired_at,
                 daily_pause_fired_paliers_bits,
@@ -998,6 +1006,7 @@ mod win {
                         last_heartbeat,
                         fired,
                         last_popup_child,
+                        last_widget_children,
                         &config.passcode_hash,
                         *daily_pause_fired_at,
                         *daily_pause_fired_paliers_bits,
@@ -1026,6 +1035,49 @@ mod win {
                         popup_pid: *popup_pid,
                     }) {
                         tracing::warn!(error = ?e, "write runtime.dat failed (rearm daily)");
+                    }
+                }
+                Ok(TickCommand::ResetPause) => {
+                    tracing::info!("ResetPause received - resetting interval, closing popup, dismissing heads-up");
+                    // 1. Reset the interval cycle WITHOUT showing a popup :
+                    // the fire_popup mutations minus the spawn and minus
+                    // popup_pending = true. The daily-pause bookkeeping is
+                    // deliberately left untouched (Reset never marks it done).
+                    *last_popup = SystemTime::now();
+                    *paused_secs = 0;
+                    fired.clear();
+                    // 2. Close any open popup : prefer a clean Dismiss (exit 0),
+                    // fall back to terminate (also exit 0). Either way the
+                    // exit-0 detector reconciles popup_pending on the next tick.
+                    if *popup_pending {
+                        if let Some(child) = last_popup_child.as_ref() {
+                            if crate::ipc_popup::send_to_popup(
+                                child.pid,
+                                &crate::ipc_popup::PopupMessage::Dismiss,
+                            )
+                            .is_err()
+                            {
+                                child.terminate();
+                            }
+                        }
+                    }
+                    // 3. Dismiss any heads-up (countdown) widget.
+                    drain_heads_up_widgets(last_widget_children);
+                    // 4. Persist. Preserve the daily-pause fields : a Reset that
+                    // closes an in-progress *daily* popup does NOT mark it done,
+                    // so the daily branch may re-fire (matches "just reset").
+                    if let Err(e) = runtime_dat::write(&runtime_dat::RuntimeState {
+                        last_popup: *last_popup,
+                        paused_secs: *paused_secs,
+                        popup_pending: *popup_pending,
+                        last_heartbeat: *last_heartbeat,
+                        last_clean_shutdown_at: SystemTime::UNIX_EPOCH,
+                        daily_pause_fired_at: *daily_pause_fired_at,
+                        daily_pause_fired_paliers_bits: *daily_pause_fired_paliers_bits,
+                        daily_pause_skipped_today: *daily_pause_skipped_today,
+                        popup_pid: *popup_pid,
+                    }) {
+                        tracing::warn!(error = ?e, "write runtime.dat failed (reset pause)");
                     }
                 }
                 Ok(TickCommand::Reload) => {
@@ -1365,6 +1417,7 @@ mod win {
                                 last_heartbeat,
                                 fired,
                                 last_popup_child,
+                                last_widget_children,
                                 &config.passcode_hash,
                                 *daily_pause_fired_at,
                                 *daily_pause_fired_paliers_bits,
@@ -1475,6 +1528,7 @@ mod win {
                             last_heartbeat,
                             fired,
                             last_popup_child,
+                            last_widget_children,
                             &config.passcode_hash,
                             *daily_pause_fired_at,
                             *daily_pause_fired_paliers_bits,
@@ -1781,6 +1835,9 @@ mod win {
                                     target_pid,
                                     now_authoritative,
                                 );
+                                // Daily content is now on screen : drain any
+                                // lingering heads-up widget.
+                                drain_heads_up_widgets(last_widget_children);
                             }
                             Ok(UpdateOrSpawn::Spawned(child)) => {
                                 let pid = child.pid;
@@ -1802,6 +1859,9 @@ mod win {
                                     pid,
                                     now_authoritative,
                                 );
+                                // New daily popup is up : drain any lingering
+                                // heads-up widget.
+                                drain_heads_up_widgets(last_widget_children);
                             }
                             Err(e) => {
                                 // Both the pipe AND the fallback spawn
@@ -1872,6 +1932,7 @@ mod win {
                                 last_heartbeat,
                                 fired,
                                 last_popup_child,
+                                last_widget_children,
                                 &config.passcode_hash,
                                 *daily_pause_fired_at,
                                 *daily_pause_fired_paliers_bits,
@@ -1908,6 +1969,7 @@ mod win {
                                 last_heartbeat,
                                 fired,
                                 last_popup_child,
+                                last_widget_children,
                                 &config.passcode_hash,
                                 daily_pause_fired_at,
                                 daily_pause_fired_paliers_bits,
@@ -1973,6 +2035,17 @@ mod win {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// Terminate every lingering heads-up (countdown) widget child. Called
+    /// whenever a pause popup appears (the countdown counts down *to* that
+    /// popup, so once it shows the heads-up is obsolete) and by the Reset
+    /// action. `spawn_replacing_keyed` only ever replaces the same-palier
+    /// predecessor, so nothing else drains the whole map.
+    fn drain_heads_up_widgets(children: &mut HashMap<u32, SpawnedChild>) {
+        for (_, w) in children.drain() {
+            w.terminate();
+        }
+    }
+
     fn fire_popup(
         exe: &Path,
         last_popup: &mut SystemTime,
@@ -1981,6 +2054,7 @@ mod win {
         last_heartbeat: &mut SystemTime,
         fired: &mut std::collections::HashSet<u32>,
         last_popup_child: &mut Option<SpawnedChild>,
+        last_widget_children: &mut HashMap<u32, SpawnedChild>,
         passcode_hash: &str,
         daily_pause_fired_at: Option<SystemTime>,
         daily_pause_fired_paliers_bits: u8,
@@ -2026,6 +2100,9 @@ mod win {
                 *popup_pending = true;
                 *last_heartbeat = now;
                 fired.clear();
+                // The popup is now up : any "pause dans X min" heads-up widget
+                // is obsolete and must not linger behind it.
+                drain_heads_up_widgets(last_widget_children);
                 if let Err(e) = runtime_dat::write(&runtime_dat::RuntimeState {
                     last_popup: now,
                     paused_secs: 0,
@@ -2176,6 +2253,7 @@ mod win {
         last_heartbeat: &mut SystemTime,
         fired: &mut std::collections::HashSet<u32>,
         last_popup_child: &mut Option<SpawnedChild>,
+        last_widget_children: &mut HashMap<u32, SpawnedChild>,
         passcode_hash: &str,
         daily_pause_fired_at: &mut Option<SystemTime>,
         daily_pause_fired_paliers_bits: &mut u8,
@@ -2208,6 +2286,8 @@ mod win {
         match spawn_replacing_with_env(&RealSpawner, exe, &args, &env, last_popup_child) {
             Ok(child) => {
                 tracing::info!(pid = child.pid, "daily-pause popup child spawned");
+                // The daily popup is up : drain any lingering heads-up widget.
+                drain_heads_up_widgets(last_widget_children);
                 stamp_daily_fire_success(
                     last_popup,
                     paused_secs,
@@ -2407,6 +2487,9 @@ mod win {
                 }
                 Message::RearmDailyPause => {
                     let _ = pipe_tx.send(TickCommand::RearmDaily);
+                }
+                Message::ResetPause => {
+                    let _ = pipe_tx.send(TickCommand::ResetPause);
                 }
                 Message::Shutdown => {
                     let _ = pipe_tx.send(TickCommand::Shutdown);

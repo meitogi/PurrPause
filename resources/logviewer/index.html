@@ -24,6 +24,8 @@
         "Télécharger tous les logs" -> GET /api/download?scope=all (zip);
         "Télécharger les 2 derniers jours" -> GET /api/download?scope=window.
         "Déclencher une pause" -> POST /api/pause.
+        "Réinitialiser" -> POST /api/reset (reset interval + close popup +
+        dismiss heads-up ; no popup shown, daily pause left untouched).
     ============================================================================
   -->
   <style>
@@ -200,6 +202,7 @@
         <button id="downloadAllBtn" class="ghost">Télécharger tous les logs</button>
         <button id="downloadWindowBtn" class="ghost">Télécharger les 2 derniers jours</button>
         <button id="pauseBtn" class="ghost">Déclencher une pause</button>
+        <button id="resetBtn" class="ghost">Réinitialiser</button>
       </div>
     </header>
     <nav class="tabs" id="tabs"></nav>
@@ -354,6 +357,15 @@
         const res = await fetch("/api/pause", { method: "POST" });
         if (res.status === 401) { show("login"); return; }
         toast(res.ok ? "Pause déclenchée." : "Échec du déclenchement.", res.ok ? "ok" : "err");
+      } catch (e) {
+        toast("Erreur réseau.", "err");
+      }
+    });
+    el("resetBtn").addEventListener("click", async () => {
+      try {
+        const res = await fetch("/api/reset", { method: "POST" });
+        if (res.status === 401) { show("login"); return; }
+        toast(res.ok ? "Réinitialisé." : "Échec de la réinitialisation.", res.ok ? "ok" : "err");
       } catch (e) {
         toast("Erreur réseau.", "err");
       }
